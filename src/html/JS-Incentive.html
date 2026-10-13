@@ -1,0 +1,622 @@
+<script>
+// ============================================================
+// INCENTIVE MODULE (Ramvir, Oct 2026)
+// ============================================================
+// Replaces the manual "PEs Incentive_Jul'2026.xlsx" workflow — that sheet
+// pasted a fresh "July Data" export every month and ran COUNTIFS/SUMPRODUCT
+// formulas by hand. Every field it needed (PE, Manager, vehicle weight,
+// offer price, trader payment, vehicle type) already lives on
+// rewire_master_data, so this calculates straight from real DMS data —
+// nobody re-types a monthly export again.
+//
+// Policy (rewire_incentive_policy) is versioned by effective_from so an
+// Admin can change rates going forward without altering an already-
+// calculated/verified/paid month — recalculating always picks whichever
+// policy version was effective at the start of the month being computed.
+//
+// Confirmed with Ramvir (Oct 2026) before building:
+//  - cod_deduction_amount = ₹22,000 (the sheet's actual working formula,
+//    not its own Terms & Conditions text which says ₹18,000) — admin-
+//    editable here.
+//  - Manager's Vehicle Purchase Incentive uses the Policy sheet's OWN
+//    Manager rate table (150+/175+/200+ unit tiers), not the
+//    Manager_IncentiveCalculation sheet's formula, which had copy-pasted
+//    the PE sheet's 9/12 breakpoints by mistake. The 150/175/200 labels
+//    are interpreted as tier breakpoints the same shape as PE's 9/12 —
+//    tier3 if count>=200, tier2 if count>=175, else tier1 — the source
+//    sheet itself never spelled out the exact comparison, so this is a
+//    best-match interpretation flagged for Ramvir to correct if wrong.
+//  - 2W/3W (val_vehicle_type = "L (2W)") get a flat ₹100/vehicle instead
+//    of the weight/₹-per-kg slab table, which only ever applied to
+//    M-category (4W) vehicles.
+//  - CoD-trading incentive is 4W/M-category only — never on 2W/3W or
+//    Commercial Vehicles (N category).
+//  - The weight-slab RATE for each ₹/kg bucket is chosen by the COUNT OF
+//    VEHICLES WITHIN THAT SAME BUCKET (matching the sheet's own L/M
+//    columns, e.g. 20-25/kg's rate depends on how many vehicles fell in
+//    20-25/kg specifically) — the sheet's K column (<=20/kg) had this
+//    hardcoded to a flat 300 instead of following the same pattern, which
+//    looks like an uncaught copy-paste bug; this implementation applies
+//    the consistent tier-by-own-bucket-count rule to all buckets.
+// ------------------------------------------------------------
+
+let incentivePolicyCache = null;
+let incentiveRecordsCache = [];
+let incentiveSelectedMonth = '';
+// 'pending' = everything not yet Paid (Pending Verification + Manager
+// Verified); 'paid' = settled rows, moved out of the working queue into
+// their own history tab (Ramvir, Oct 2026).
+let incentiveActiveTab = 'pending';
+
+// First day of the previous calendar month, 'YYYY-MM' — incentive is a
+// look-back payout ("disbursed by 25th of every subsequent month" per the
+// sheet's own Terms & Conditions), so that's almost always what someone
+// opening this screen wants to see first.
+function defaultIncentiveMonth() {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() - 1);
+  return d.toISOString().slice(0, 7);
+}
+
+async function getActiveIncentivePolicy(asOfDateStr) {
+  const { data, error } = await sb.from('rewire_incentive_policy')
+    .select('*').lte('effective_from', asOfDateStr).order('effective_from', { ascending: false }).limit(1).maybeSingle();
+  if (error) { console.error(error); return null; }
+  if (!data) return null;
+  return Object.assign({ id: data.id, effective_from: data.effective_from }, data.payload);
+}
+
+function incentiveTierFor(count, tierBreaks) {
+  if (count >= tierBreaks.tier3_min) return 'tier3';
+  if (count >= tierBreaks.tier2_min) return 'tier2';
+  return 'tier1';
+}
+
+// Pure calculation — no DB writes. Given one person's vehicles for the
+// month and the active policy, returns every number the UI/record needs.
+// Also returns `vehicleDetails` — one row per vehicle with its own
+// bucket/rate/amount — so the UI can let someone click the Vehicles / CoD
+// Units count and see exactly which vehicles made up that number.
+function computePersonIncentive(role, vehicles, policy) {
+  const rates = role === 'PE' ? policy.pe_rates : policy.mgr_rates;
+  const tierBreaks = role === 'PE' ? policy.pe_tier_breaks : policy.mgr_tier_breaks;
+  const slabEligible = new Set(policy.slab_eligible_vehicle_types || ['M (Cars)']);
+  const codEligible = new Set(policy.cod_eligible_vehicle_types || ['M (Cars)']);
+  const twoWheelerTypes = new Set(policy.two_wheeler_vehicle_types || ['L (2W)']);
+  const twoWheelerRate = policy.two_wheeler_flat_rate || 0;
+  const deduction = policy.cod_deduction_amount || 0;
+
+  const buckets = { '<=20': 0, '20-25': 0, '25-30': 0, '>30': 0 };
+  let twoWheelerCount = 0;
+  let codUnitCount = 0;
+
+  // First pass — classify every vehicle and keep its raw facts for the
+  // detail popup. Rates/amounts get filled in on the second pass below,
+  // once each bucket's count-based tier is known.
+  const details = vehicles.map(v => {
+    const vType = v.val_vehicle_type || '';
+    const traderPayment = parseFloat(v.ud_trader_payment) || 0;
+    const isTraderCod = traderPayment > 0;
+    const isCod = codEligible.has(vType) && isTraderCod;
+    if (isCod) codUnitCount++;
+
+    const row = {
+      id: v.id, lead_no: v.lead_no || '', customer_name: v.customer_name || '',
+      vehicle_type: vType, weight: parseFloat(v.ud_vehicle_weight_kg) || 0,
+      price: parseFloat(v.ud_total_offer_price) || 0, trader_payment: traderPayment,
+      is_cod: isCod, bucket: null, per_kg: null, amount: 0,
+    };
+
+    if (twoWheelerTypes.has(vType)) { twoWheelerCount++; row.bucket = '2W/3W (flat)'; return row; }
+    if (!slabEligible.has(vType)) { row.bucket = 'Not Eligible'; return row; } // CV / Other
+
+    if (!row.weight) { row.bucket = 'No Weight'; return row; } // can't bucket without a weighbridge weight
+    const netPrice = isTraderCod ? (row.price - deduction) : row.price;
+    const perKg = netPrice / row.weight;
+    row.per_kg = Math.round(perKg * 100) / 100;
+    if (perKg <= 20) { buckets['<=20']++; row.bucket = '<=20'; }
+    else if (perKg <= 25) { buckets['20-25']++; row.bucket = '20-25'; }
+    else if (perKg <= 30) { buckets['25-30']++; row.bucket = '25-30'; }
+    else { buckets['>30']++; row.bucket = '>30'; }
+    return row;
+  });
+
+  let vehicleIncentive = 0;
+  const slabBreakdown = {};
+  const bucketRate = {};
+  Object.entries(buckets).forEach(([bucket, count]) => {
+    const tier = incentiveTierFor(count, tierBreaks);
+    const rate = (rates[bucket] && rates[bucket][tier]) || 0;
+    const amount = count * rate;
+    vehicleIncentive += amount;
+    slabBreakdown[bucket] = { count, tier, rate, amount };
+    bucketRate[bucket] = rate;
+  });
+  const twoWheelerAmount = twoWheelerCount * twoWheelerRate;
+  vehicleIncentive += twoWheelerAmount;
+  slabBreakdown['2W/3W (flat)'] = { count: twoWheelerCount, tier: '—', rate: twoWheelerRate, amount: twoWheelerAmount };
+
+  // Second pass — now that each bucket's tier/rate is settled, stamp the
+  // per-unit rate onto every vehicle that belongs to it.
+  details.forEach(row => {
+    if (row.bucket === '2W/3W (flat)') row.amount = twoWheelerRate;
+    else if (bucketRate[row.bucket] !== undefined) row.amount = bucketRate[row.bucket];
+  });
+
+  const codBaseCalc = codUnitCount <= policy.cod_base_units
+    ? codUnitCount * policy.cod_base_rate
+    : (policy.cod_base_units * policy.cod_base_rate) + ((codUnitCount - policy.cod_base_units) * policy.cod_excess_rate);
+  const codIncentive = role === 'PE' ? codBaseCalc : codBaseCalc * (policy.cod_manager_pct || 0.25);
+
+  return {
+    vehicleCount: vehicles.length,
+    slabBreakdown,
+    vehicleIncentive,
+    codUnitCount,
+    codIncentive: Math.round(codIncentive),
+    total: Math.round(vehicleIncentive + codIncentive),
+    vehicleDetails: details,
+  };
+}
+
+// Fetches every Complete/delivered vehicle for the month, groups by PE and
+// by Manager (using each lead's OWN pe_id/manager_id — a snapshot of who
+// actually handled it, not whoever that person currently reports to), runs
+// computePersonIncentive() for each, and upserts into
+// rewire_incentive_records. Paid rows are never touched — recalculating a
+// month only refreshes rows still at Pending Verification / Manager
+// Verified, so a settled payout can't silently move underneath anyone.
+async function calculateIncentiveForMonth(monthStr) {
+  const periodStart = monthStr + '-01';
+  const periodEndExclusive = new Date(monthStr + '-01T00:00:00Z');
+  periodEndExclusive.setUTCMonth(periodEndExclusive.getUTCMonth() + 1);
+  const periodEndStr = periodEndExclusive.toISOString().slice(0, 10);
+
+  const policy = await getActiveIncentivePolicy(periodStart);
+  if (!policy) { notify('No Incentive Policy found. Set one up first.', { icon: 'error' }); return; }
+
+  const rows = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select('id, pe_id, manager_id, val_vehicle_type, ud_vehicle_weight_kg, ud_total_offer_price, ud_trader_payment, ud_filled_on')
+    .eq('ud_status', 'Complete')
+    .gte('ud_filled_on', periodStart).lt('ud_filled_on', periodEndStr)
+    .range(from, to));
+
+  // (Ramvir, Oct 2026) — manager attribution lock. If a Manager has since
+  // left and their PEs were reassigned to a new Manager (manager_id on the
+  // lead updated), a plain live lookup of r.manager_id below would shift
+  // this month's ALREADY-CALCULATED vehicles onto the new Manager the next
+  // time this runs — wrong, since the new Manager didn't do that work.
+  // Fix: once a vehicle has been credited to a Manager in an existing
+  // record for this period (any status, including Paid), it stays locked
+  // to that same Manager on every future recalculation, regardless of
+  // what the lead's manager_id says now. Only a vehicle that was NEVER
+  // part of a prior calculation for this period (e.g. newly Delivered
+  // since the last run) falls through to the live manager_id — which is
+  // exactly the vehicles a newly-assigned Manager should be credited for.
+  const { data: existingMgrRecsForLock } = await sb.from('rewire_incentive_records')
+    .select('person_id, vehicle_details').eq('period_month', periodStart).eq('role', 'Manager');
+  const lockedManagerByVehicle = {};
+  (existingMgrRecsForLock || []).forEach(rec => {
+    (rec.vehicle_details || []).forEach(vd => { if (vd && vd.id) lockedManagerByVehicle[vd.id] = rec.person_id; });
+  });
+
+  const byPe = {}, byMgr = {};
+  rows.forEach(r => {
+    if (r.pe_id) (byPe[r.pe_id] = byPe[r.pe_id] || []).push(r);
+    // A manager who personally bought the vehicle (pe_id === manager_id)
+    // is already credited for it under their own PE row above — counting
+    // it again under their Manager row would double-pay the same vehicle
+    // and also throws up a confusing "ghost" Manager record (e.g. a
+    // manager with no real team showing up in the list over a single
+    // self-purchase). Only genuine team vehicles count toward Manager
+    // incentive.
+    const effectiveManagerId = lockedManagerByVehicle[r.id] || r.manager_id;
+    if (effectiveManagerId && effectiveManagerId !== r.pe_id) (byMgr[effectiveManagerId] = byMgr[effectiveManagerId] || []).push(r);
+  });
+
+  const jobs = [
+    ...Object.entries(byPe).map(([personId, vehicles]) => ({ role: 'PE', personId, vehicles })),
+    ...Object.entries(byMgr).map(([personId, vehicles]) => ({ role: 'Manager', personId, vehicles })),
+  ];
+
+  let computedCount = 0, skippedPaid = 0;
+  for (const job of jobs) {
+    const result = computePersonIncentive(job.role, job.vehicles, policy);
+    const { data: existing } = await sb.from('rewire_incentive_records')
+      .select('id, status, manual_adjustment').eq('period_month', periodStart)
+      .eq('role', job.role).eq('person_id', job.personId).maybeSingle();
+    if (existing && existing.status === 'Paid') { skippedPaid++; continue; }
+
+    const manualAdj = existing ? (existing.manual_adjustment || 0) : 0;
+    const payload = {
+      period_month: periodStart, role: job.role, person_id: job.personId,
+      vehicle_count_total: result.vehicleCount, slab_breakdown: result.slabBreakdown,
+      vehicle_details: result.vehicleDetails,
+      vehicle_incentive_amount: result.vehicleIncentive, cod_unit_count: result.codUnitCount,
+      cod_incentive_amount: result.codIncentive, calculated_total: result.total,
+      manual_adjustment: manualAdj, final_amount: result.total + manualAdj,
+      status: 'Pending Verification', verified_by: null, verified_on: null,
+      policy_id: policy.id, calculated_by: currentProfile.id, calculated_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    if (existing) await sb.from('rewire_incentive_records').update(payload).eq('id', existing.id);
+    else await sb.from('rewire_incentive_records').insert(payload);
+    computedCount++;
+  }
+
+  // Clean up stale Manager rows left over from a previous calculation of
+  // this month — e.g. someone who used to show up only because of a
+  // since-excluded self-purchase, and has no genuine team vehicles this
+  // month at all. Never touches anything already Paid.
+  const { data: existingMgrRows } = await sb.from('rewire_incentive_records')
+    .select('id, person_id, status').eq('period_month', periodStart).eq('role', 'Manager');
+  const staleIds = (existingMgrRows || [])
+    .filter(rec => rec.status !== 'Paid' && !byMgr[rec.person_id]).map(rec => rec.id);
+  if (staleIds.length) await sb.from('rewire_incentive_records').delete().in('id', staleIds);
+
+  notify(`Calculated ${computedCount} record(s) for ${monthStr}.` + (skippedPaid ? ` ${skippedPaid} already-Paid record(s) left untouched.` : '') + (staleIds.length ? ` Removed ${staleIds.length} stale record(s).` : ''));
+}
+
+// allActiveUsers only holds currently-active staff, so a PE/Manager who has
+// since left the company resolved to their raw UUID instead of a name.
+// This cache is filled on demand via lookupProfileNames() (JS-Payments.html),
+// which queries rewire_user_profiles with no `active` filter, so left
+// employees' names still resolve correctly for past months' records.
+let incentiveProfileNameCache = {};
+async function ensureIncentiveNamesLoaded(ids) {
+  const missing = Array.from(new Set((ids || []).filter(id => id && !incentiveProfileNameCache[id])));
+  if (!missing.length) return;
+  const byId = await lookupProfileNames(missing);
+  Object.assign(incentiveProfileNameCache, byId);
+}
+function incentiveNameFor(personId) {
+  if (incentiveProfileNameCache[personId]) return incentiveProfileNameCache[personId];
+  const u = (allActiveUsers || []).find(u => u.id === personId);
+  return u ? u.name : personId;
+}
+
+function incentiveCanSeeAllRoles() {
+  return currentProfile && (currentProfile.role === 'Admin' || currentProfile.role === 'Accounts');
+}
+
+async function renderIncentiveSection() {
+  if (!incentiveSelectedMonth) incentiveSelectedMonth = defaultIncentiveMonth();
+  const monthInput = document.getElementById('incentiveMonthInput');
+  if (monthInput) monthInput.value = incentiveSelectedMonth;
+
+  const calcBtn = document.getElementById('incentiveCalcBtn');
+  const policyBtn = document.getElementById('incentivePolicyBtn');
+  const canManage = currentProfile && (currentProfile.role === 'Admin' || currentProfile.role === 'Accounts');
+  if (calcBtn) calcBtn.style.display = canManage ? '' : 'none';
+  // Policy button — Admin can edit; Manager/Accounts can now also open it
+  // (Ramvir, Oct 2026) but read-only ("View Policy"), so they can see the
+  // rates/tiers without being able to change them.
+  const canViewPolicy = currentProfile && ['Admin', 'Manager', 'Accounts'].includes(currentProfile.role);
+  if (policyBtn) {
+    policyBtn.style.display = canViewPolicy ? '' : 'none';
+    policyBtn.innerHTML = currentProfile && currentProfile.role === 'Admin'
+      ? '<i class="ti ti-settings" aria-hidden="true" style="font-size:14px;"></i> Edit Policy'
+      : '<i class="ti ti-eye" aria-hidden="true" style="font-size:14px;"></i> View Policy';
+  }
+
+  await loadIncentiveRecordsForMonth();
+}
+
+async function loadIncentiveRecordsForMonth() {
+  const periodStart = incentiveSelectedMonth + '-01';
+  let query = sb.from('rewire_incentive_records').select('*').eq('period_month', periodStart);
+
+  if (currentProfile.role === 'PE') {
+    query = query.eq('role', 'PE').eq('person_id', currentProfile.id);
+  } else if (currentProfile.role === 'Manager') {
+    const teamIds = (allActiveUsers || []).filter(u => u.manager_id === currentProfile.id).map(u => u.id);
+    teamIds.push(currentProfile.id); // their own Manager-level row too
+    query = query.in('person_id', teamIds);
+  }
+  // Admin/Accounts: no extra filter — see everyone.
+
+  const { data, error } = await query;
+  if (error) { console.error(error); notify('Error loading incentive records: ' + error.message, { icon: 'error' }); return; }
+
+  const idsNeeded = [];
+  (data || []).forEach(r => { idsNeeded.push(r.person_id); if (r.verified_by) idsNeeded.push(r.verified_by); if (r.paid_by) idsNeeded.push(r.paid_by); });
+  await ensureIncentiveNamesLoaded(idsNeeded);
+
+  incentiveRecordsCache = (data || []).sort((a, b) => {
+    if (a.role !== b.role) return a.role === 'Manager' ? -1 : 1;
+    return incentiveNameFor(a.person_id).localeCompare(incentiveNameFor(b.person_id));
+  });
+  renderIncentiveTable();
+}
+
+function onIncentiveMonthChange(v) {
+  incentiveSelectedMonth = v;
+  loadIncentiveRecordsForMonth();
+}
+
+function showIncentiveTab(tab) {
+  incentiveActiveTab = tab;
+  const pendingBtn = document.getElementById('incentivetabnav-pending');
+  const paidBtn = document.getElementById('incentivetabnav-paid');
+  if (pendingBtn) pendingBtn.className = 'btn ' + (tab === 'pending' ? 'btn-primary' : 'btn-outline');
+  if (paidBtn) paidBtn.className = 'btn ' + (tab === 'paid' ? 'btn-primary' : 'btn-outline');
+  renderIncentiveTable();
+}
+
+// Month-total summary cards above the table (Ramvir, Oct 2026) — always
+// reflects the WHOLE month's records (both Pending and Paid, regardless of
+// which sub-tab is active), scoped the same way the table itself already
+// is (own row for PE, team for Manager, everyone for Admin/Accounts via
+// loadIncentiveRecordsForMonth()'s role filter).
+function renderIncentiveSummaryCards() {
+  const wrap = document.getElementById('incentiveSummaryCards');
+  if (!wrap) return;
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  const rows = incentiveRecordsCache;
+  // Total Vehicles / CoD Units must come from PE-role rows only — every
+  // vehicle gets counted in BOTH its PE's vehicle_count_total AND its
+  // Manager's vehicle_count_total (one row per role, same vehicle), so
+  // summing across all rows double-counts (e.g. 705 actual vehicles for
+  // Sept showed as 1430 here — almost exactly 2×, matching Dashboard's
+  // "Total Purchase Summary" which counts each vehicle once). Final Amount
+  // / Paid are correctly summed across BOTH roles though, since those are
+  // genuinely separate payouts to two different people for the same
+  // vehicle, not a double-count of one number.
+  const peRowsOnly = rows.filter(r => r.role === 'PE');
+  const totalVehicles = peRowsOnly.reduce((s, r) => s + (Number(r.vehicle_count_total) || 0), 0);
+  const totalCodUnits = peRowsOnly.reduce((s, r) => s + (Number(r.cod_unit_count) || 0), 0);
+  const totalFinal = rows.reduce((s, r) => s + (Number(r.final_amount) || 0), 0);
+  const totalPaid = rows.filter(r => r.status === 'Paid').reduce((s, r) => s + (Number(r.final_amount) || 0), 0);
+  set('incPerfVehicles', totalVehicles);
+  set('incPerfCod', totalCodUnits);
+  set('incPerfTotal', '₹' + totalFinal.toLocaleString('en-IN'));
+  set('incPerfPaid', '₹' + totalPaid.toLocaleString('en-IN'));
+}
+
+function renderIncentiveTable() {
+  renderIncentiveSummaryCards();
+  const tbody = document.getElementById('tbodyIncentive');
+  if (!tbody) return;
+  const visibleRows = incentiveRecordsCache.filter(r => incentiveActiveTab === 'paid' ? r.status === 'Paid' : r.status !== 'Paid');
+  if (!visibleRows.length) {
+    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">${incentiveActiveTab === 'paid' ? 'No paid records yet for this month.' : 'No incentive calculated for this month yet.'}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = visibleRows.map(r => {
+    const statusColor = r.status === 'Paid' ? '#16a34a' : r.status === 'Manager Verified' ? '#1d4ed8' : '#d97706';
+    const canVerify = r.status === 'Pending Verification' && (currentProfile.role === 'Manager' || currentProfile.role === 'Admin');
+    const canPay = r.status === 'Manager Verified' && (currentProfile.role === 'Accounts' || currentProfile.role === 'Admin');
+    let actionHtml = `<button class="ab ab-form" onclick="openIncentiveDetail('${r.id}')"><i class="ti ti-eye" style="font-size:11px;" aria-hidden="true"></i> View</button>`;
+    const vLink = r.vehicle_count_total ? `<a href="javascript:void(0)" onclick="openIncentiveVehicleDetail('${r.id}','all')" style="text-decoration:underline;cursor:pointer;">${r.vehicle_count_total}</a>` : r.vehicle_count_total;
+    const codLink = r.cod_unit_count ? `<a href="javascript:void(0)" onclick="openIncentiveVehicleDetail('${r.id}','cod')" style="text-decoration:underline;cursor:pointer;">${r.cod_unit_count}</a>` : r.cod_unit_count;
+    return `<tr>
+      <td style="font-weight:500;">${incentiveNameFor(r.person_id)}</td>
+      <td>${r.role}</td>
+      <td>${vLink}</td>
+      <td>₹${Number(r.vehicle_incentive_amount).toLocaleString('en-IN')}</td>
+      <td>${codLink}</td>
+      <td>₹${Number(r.cod_incentive_amount).toLocaleString('en-IN')}</td>
+      <td>${r.manual_adjustment ? (r.manual_adjustment > 0 ? '+' : '') + '₹' + Number(r.manual_adjustment).toLocaleString('en-IN') : '—'}</td>
+      <td style="font-weight:700;">₹${Number(r.final_amount).toLocaleString('en-IN')}</td>
+      <td><span style="font-weight:700;color:${statusColor};">${r.status}</span></td>
+      <td>${actionHtml}</td>
+    </tr>`;
+  }).join('');
+}
+
+// Single detail modal reused for viewing the breakdown, Manager's
+// verify + manual adjustment, and Accounts' mark-paid — which controls
+// show depends on the record's current status and the viewer's role.
+let incentiveDetailRecordId = null;
+function openIncentiveDetail(recordId) {
+  const r = incentiveRecordsCache.find(x => x.id === recordId);
+  if (!r) return;
+  incentiveDetailRecordId = recordId;
+  document.getElementById('incentiveDetailSub').textContent = `${incentiveNameFor(r.person_id)} (${r.role}) — ${incentiveSelectedMonth}`;
+
+  const rows = Object.entries(r.slab_breakdown || {}).map(([bucket, b]) =>
+    `<tr><td>${bucket}</td><td>${b.count}</td><td>${b.tier === '—' ? '—' : b.tier}</td><td>₹${b.rate}</td><td>₹${Number(b.amount).toLocaleString('en-IN')}</td></tr>`).join('');
+  document.getElementById('incentiveBreakdownBody').innerHTML = rows || '<tr><td colspan="5" style="text-align:center;color:var(--color-text-tertiary);">No vehicles.</td></tr>';
+  document.getElementById('incentiveCodSummary').textContent = `CoD units: ${r.cod_unit_count} → CoD incentive ₹${Number(r.cod_incentive_amount).toLocaleString('en-IN')}`;
+  document.getElementById('incentiveCalcTotal').textContent = '₹' + Number(r.calculated_total).toLocaleString('en-IN');
+
+  const adjInput = document.getElementById('incentiveAdjustAmount');
+  const adjRemarks = document.getElementById('incentiveAdjustRemarks');
+  adjInput.value = r.manual_adjustment || '';
+  adjRemarks.value = r.manual_adjustment_remarks || '';
+  const canEditAdj = r.status !== 'Paid' && (currentProfile.role === 'Manager' || currentProfile.role === 'Admin');
+  adjInput.disabled = !canEditAdj;
+  adjRemarks.disabled = !canEditAdj;
+
+  const verifyBtn = document.getElementById('incentiveVerifyBtn');
+  const payBtn = document.getElementById('incentivePayBtn');
+  const payRefWrap = document.getElementById('incentivePayRefWrap');
+  verifyBtn.style.display = (r.status === 'Pending Verification' && (currentProfile.role === 'Manager' || currentProfile.role === 'Admin')) ? '' : 'none';
+  payBtn.style.display = (r.status === 'Manager Verified' && (currentProfile.role === 'Accounts' || currentProfile.role === 'Admin')) ? '' : 'none';
+  payRefWrap.style.display = payBtn.style.display;
+  document.getElementById('incentivePayRef').value = r.payment_reference || '';
+
+  const statusLine = document.getElementById('incentiveStatusLine');
+  statusLine.textContent = r.status + (r.verified_by ? ` · Verified by ${incentiveNameFor(r.verified_by)}` : '') + (r.paid_by ? ` · Paid by ${incentiveNameFor(r.paid_by)}` : '');
+
+  document.getElementById('incentiveDetailModal').style.display = 'flex';
+}
+
+// Vehicle-level breakdown behind the Vehicles / CoD Units count cells —
+// filterMode 'all' shows every vehicle attributed to this person+role this
+// month, 'cod' narrows to only the ones counted toward CoD incentive.
+function openIncentiveVehicleDetail(recordId, filterMode) {
+  const r = incentiveRecordsCache.find(x => x.id === recordId);
+  if (!r) return;
+  let rows = r.vehicle_details || [];
+  if (filterMode === 'cod') rows = rows.filter(v => v.is_cod);
+  document.getElementById('incentiveVehicleDetailTitle').textContent =
+    (filterMode === 'cod' ? 'CoD Units' : 'Vehicles') + ' — ' + incentiveNameFor(r.person_id) + ' (' + r.role + ', ' + incentiveSelectedMonth + ')';
+  document.getElementById('incentiveVehicleDetailBody').innerHTML = rows.length ? rows.map(v => `<tr>
+      <td>${v.lead_no || '—'}</td>
+      <td>${v.customer_name || '—'}</td>
+      <td>${v.vehicle_type || '—'}</td>
+      <td>${v.weight || '—'}</td>
+      <td>₹${Number(v.price || 0).toLocaleString('en-IN')}</td>
+      <td>${v.trader_payment ? '₹' + Number(v.trader_payment).toLocaleString('en-IN') : '—'}</td>
+      <td>${v.per_kg !== null && v.per_kg !== undefined ? v.per_kg : '—'}</td>
+      <td>${v.bucket || '—'}</td>
+      <td>${v.is_cod ? 'Yes' : '—'}</td>
+      <td>₹${Number(v.amount || 0).toLocaleString('en-IN')}</td>
+    </tr>`).join('')
+    : `<tr><td colspan="10" style="text-align:center;color:var(--color-text-tertiary);padding:16px;">${r.vehicle_details ? 'No vehicles in this filter.' : 'Detail not available for this record — click "Calculate This Month" again to refresh it.'}</td></tr>`;
+  document.getElementById('incentiveVehicleDetailModal').style.display = 'flex';
+}
+
+async function submitIncentiveVerify() {
+  if (!incentiveDetailRecordId) return;
+  const adj = parseFloat(document.getElementById('incentiveAdjustAmount').value) || 0;
+  const remarks = document.getElementById('incentiveAdjustRemarks').value.trim();
+  const r = incentiveRecordsCache.find(x => x.id === incentiveDetailRecordId);
+  if (!r) return;
+  const { error } = await sb.from('rewire_incentive_records').update({
+    manual_adjustment: adj, manual_adjustment_remarks: remarks || null,
+    final_amount: r.calculated_total + adj,
+    status: 'Manager Verified', verified_by: currentProfile.id, verified_on: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }).eq('id', incentiveDetailRecordId);
+  if (error) { notify('Error verifying: ' + error.message, { icon: 'error' }); return; }
+  notify('Verified. Visible to Accounts for payment now.');
+  closeModal('incentiveDetailModal');
+  await loadIncentiveRecordsForMonth();
+}
+
+async function submitIncentivePay() {
+  if (!incentiveDetailRecordId) return;
+  const ref = document.getElementById('incentivePayRef').value.trim();
+  if (!ref) { notify('Enter a payment reference / UTR number.', { icon: 'error', title: 'Missing field' }); return; }
+  const { error } = await sb.from('rewire_incentive_records').update({
+    status: 'Paid', paid_by: currentProfile.id, paid_on: new Date().toISOString(),
+    payment_reference: ref, updated_at: new Date().toISOString(),
+  }).eq('id', incentiveDetailRecordId);
+  if (error) { notify('Error marking paid: ' + error.message, { icon: 'error' }); return; }
+  notify('Marked Paid.');
+  closeModal('incentiveDetailModal');
+  await loadIncentiveRecordsForMonth();
+}
+
+// Exports whichever rows are currently in view (Pending/Paid tab + Month
+// filter), but only once Manager has verified them — a row still at
+// "Pending Verification" isn't confirmed yet, so it's left out of the
+// export Accounts would use to actually process payment.
+function exportIncentiveExcel() {
+  const visibleRows = incentiveRecordsCache.filter(r => incentiveActiveTab === 'paid' ? r.status === 'Paid' : r.status !== 'Paid');
+  const exportable = visibleRows.filter(r => r.status === 'Manager Verified' || r.status === 'Paid');
+  if (!exportable.length) { notify('No Manager-Verified or Paid rows to export in this view.', { icon: 'info' }); return; }
+  const rows = exportable.map(r => ({
+    'Name': incentiveNameFor(r.person_id), 'Role': r.role, 'Month': incentiveSelectedMonth,
+    'Vehicles': r.vehicle_count_total, 'Vehicle Incentive': Number(r.vehicle_incentive_amount) || 0,
+    'CoD Units': r.cod_unit_count, 'CoD Incentive': Number(r.cod_incentive_amount) || 0,
+    'Adjustment': Number(r.manual_adjustment) || 0, 'Final Amount': Number(r.final_amount) || 0,
+    'Status': r.status, 'Payment Reference': r.payment_reference || '',
+  }));
+  downloadXlsx(`Incentive_${incentiveSelectedMonth}_${incentiveActiveTab}.xlsx`, rows, 'Incentive');
+}
+
+async function triggerIncentiveCalculate() {
+  if (!incentiveSelectedMonth) return;
+  await calculateIncentiveForMonth(incentiveSelectedMonth);
+  await loadIncentiveRecordsForMonth();
+}
+
+// ------------------------------------------------------------
+// POLICY EDITOR (Admin only)
+// ------------------------------------------------------------
+async function openIncentivePolicyModal() {
+  const policy = await getActiveIncentivePolicy(new Date().toISOString().slice(0, 10));
+  if (!policy) { notify('No policy found.', { icon: 'error' }); return; }
+  incentivePolicyCache = policy;
+
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+  set('incPolCodDeduction', policy.cod_deduction_amount);
+  set('incPolTwoWheelerRate', policy.two_wheeler_flat_rate);
+  set('incPolCodBaseUnits', policy.cod_base_units);
+  set('incPolCodBaseRate', policy.cod_base_rate);
+  set('incPolCodExcessRate', policy.cod_excess_rate);
+  set('incPolCodMgrPct', Math.round((policy.cod_manager_pct || 0) * 100));
+  set('incPolPeTier2Min', policy.pe_tier_breaks.tier2_min);
+  set('incPolPeTier3Min', policy.pe_tier_breaks.tier3_min);
+  set('incPolMgrTier2Min', policy.mgr_tier_breaks.tier2_min);
+  set('incPolMgrTier3Min', policy.mgr_tier_breaks.tier3_min);
+  // Maps each ₹/kg bucket to the short id suffix used in the Policy modal's
+  // input ids below (incPolPe_20_*, incPolPe_25_*, incPolPe_30_*) — kept as
+  // an explicit lookup rather than deriving it from the bucket string so
+  // the two never drift apart again (an earlier version derived "20_25"
+  // from "20-25" here but the modal markup used plain "25", a silent
+  // mismatch that would have made every edit to those 2 buckets a no-op).
+  const INCENTIVE_BUCKET_ID = { '<=20': '20', '20-25': '25', '25-30': '30' };
+  ['<=20', '20-25', '25-30'].forEach(bucket => {
+    const idSuffix = INCENTIVE_BUCKET_ID[bucket];
+    ['tier1', 'tier2', 'tier3'].forEach(t => {
+      set(`incPolPe_${idSuffix}_${t}`, policy.pe_rates[bucket][t]);
+      set(`incPolMgr_${idSuffix}_${t}`, policy.mgr_rates[bucket][t]);
+    });
+  });
+  set('incPolEffectiveFrom', new Date().toISOString().slice(0, 10));
+
+  // Manager/Accounts (Ramvir, Oct 2026) can open this to see the rates, but
+  // not change them — only Admin edits. Disable every input/select inside
+  // the modal body and hide the Save button rather than maintaining a
+  // separate read-only markup.
+  const isAdmin = currentProfile && currentProfile.role === 'Admin';
+  const modalEl = document.getElementById('incentivePolicyModal');
+  modalEl.querySelectorAll('.modal-body input, .modal-body select').forEach(el => { el.disabled = !isAdmin; });
+  document.getElementById('incentivePolicyModalTitle').textContent = isAdmin ? 'Edit Incentive Policy' : 'Incentive Policy (View Only)';
+  document.getElementById('incentivePolicyModalSub').textContent = isAdmin ? "Saves as a new version — doesn't change already-calculated months" : 'Only Admin can change these rates.';
+  document.getElementById('incentivePolicySaveBtn').style.display = isAdmin ? '' : 'none';
+  document.getElementById('incentivePolicyCancelBtn').textContent = isAdmin ? 'Cancel' : 'Close';
+
+  modalEl.style.display = 'flex';
+}
+
+async function submitIncentivePolicy() {
+  const get = (id) => document.getElementById(id).value;
+  const effectiveFrom = get('incPolEffectiveFrom');
+  if (!effectiveFrom) { notify('Set an effective-from date.', { icon: 'error', title: 'Missing field' }); return; }
+
+  const INCENTIVE_BUCKET_ID = { '<=20': '20', '20-25': '25', '25-30': '30' };
+  const bucketRates = (prefix) => {
+    const out = {};
+    ['<=20', '20-25', '25-30'].forEach(bucket => {
+      const idSuffix = INCENTIVE_BUCKET_ID[bucket];
+      out[bucket] = {
+        tier1: parseFloat(get(`incPol${prefix}_${idSuffix}_tier1`)) || 0,
+        tier2: parseFloat(get(`incPol${prefix}_${idSuffix}_tier2`)) || 0,
+        tier3: parseFloat(get(`incPol${prefix}_${idSuffix}_tier3`)) || 0,
+      };
+    });
+    out['>30'] = { tier1: 0, tier2: 0, tier3: 0 };
+    return out;
+  };
+
+  const payload = {
+    cod_deduction_amount: parseFloat(get('incPolCodDeduction')) || 0,
+    two_wheeler_flat_rate: parseFloat(get('incPolTwoWheelerRate')) || 0,
+    two_wheeler_vehicle_types: incentivePolicyCache.two_wheeler_vehicle_types || ['L (2W)'],
+    slab_eligible_vehicle_types: incentivePolicyCache.slab_eligible_vehicle_types || ['M (Cars)'],
+    cod_eligible_vehicle_types: incentivePolicyCache.cod_eligible_vehicle_types || ['M (Cars)'],
+    pe_tier_breaks: { tier2_min: parseInt(get('incPolPeTier2Min')) || 0, tier3_min: parseInt(get('incPolPeTier3Min')) || 0 },
+    mgr_tier_breaks: { tier2_min: parseInt(get('incPolMgrTier2Min')) || 0, tier3_min: parseInt(get('incPolMgrTier3Min')) || 0 },
+    pe_rates: bucketRates('Pe'),
+    mgr_rates: bucketRates('Mgr'),
+    cod_base_units: parseInt(get('incPolCodBaseUnits')) || 0,
+    cod_base_rate: parseFloat(get('incPolCodBaseRate')) || 0,
+    cod_excess_rate: parseFloat(get('incPolCodExcessRate')) || 0,
+    cod_manager_pct: (parseFloat(get('incPolCodMgrPct')) || 0) / 100,
+  };
+
+  const { error } = await sb.from('rewire_incentive_policy').insert({
+    effective_from: effectiveFrom, payload, notes: 'Edited via Settings by ' + (currentProfile.name || currentProfile.id),
+    created_by: currentProfile.id,
+  });
+  if (error) { notify('Error saving policy: ' + error.message, { icon: 'error' }); return; }
+  notify(`New policy version saved, effective from ${effectiveFrom}. Months calculated before that date are unaffected.`);
+  closeModal('incentivePolicyModal');
+}
+</script>

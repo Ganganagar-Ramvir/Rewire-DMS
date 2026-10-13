@@ -1,0 +1,919 @@
+<script>
+// ============================================================
+// COD TRADING MODULE (Ramvir, Oct 2026)
+// ============================================================
+// CoD Trading (Module 2): buying/selling CoD certificates as a
+// dealer-trading business (rewire_cod_trades, rewire_cod_dealers,
+// rewire_cod_orders, rewire_cod_payments, rewire_cod_payment_items).
+// Extracted out of JS-Tracking.html into its own file, mirroring the
+// JS-Incentive.html/JS-Conveyance.html pattern, so this module's code
+// is physically separate from Module 1 (COD/CVS entry,
+// rewire_cod_cvs) and stops getting mixed up with it. These two
+// modules have NO relationship to each other — do not merge them
+// back together or share functions between this file and
+// JS-Tracking.html's COD/CVS entry code.
+// ============================================================
+
+let codTradesCache = [];
+let codTradesSearchTerm = '';
+let traderCodLeadsCache = null;
+
+// "Trader-COD Leads" = Trader Keeping COD leads whose vehicle payment is DONE
+// (has Payments-Archive rows and nothing left open in Payments) - Ramvir, Oct 2026.
+let traderCodAllCache = null;
+async function loadTraderCodAll() {
+  if (traderCodAllCache) return traderCodAllCache;
+  const rows = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, val_vehicle_number, customer_name, val_make, val_model_variant,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)`)
+    .ilike('pn_deal_type', 'Trader Keeping COD%')
+    .not('val_vehicle_number', 'is', null)
+    .range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const archived = new Set((await fetchAllRows((from, to) => sb.from('rewire_payments_archive').select('lead_id').range(from, to))
+    .catch(err => { console.error(err); return []; })).map(r => r.lead_id));
+  const open = new Set((await fetchAllRows((from, to) => sb.from('rewire_payments').select('lead_id').range(from, to))
+    .catch(err => { console.error(err); return []; })).map(r => r.lead_id));
+  traderCodAllCache = (rows || [])
+    .map(r => ({ ...r, norm: (r.val_vehicle_number || '').toUpperCase().replace(/[^A-Z0-9]/g, ''), paid: archived.has(r.id) && !open.has(r.id) }))
+    .filter(r => r.norm);
+  return traderCodAllCache;
+}
+async function buildTraderCodLeadIndex() {
+  if (traderCodLeadsCache) return traderCodLeadsCache;
+  traderCodLeadsCache = (await loadTraderCodAll()).filter(l => l.paid);
+  return traderCodLeadsCache;
+}
+
+// Vehicle number of a trade row — stored value, else parsed from the CD No
+// (COD + year/serial digits + vehicle no., e.g. COD2026065RJ14GG4209).
+function codVehicleOf(t) {
+  const v = t.vehicle_number || String(t.cd_no || '').replace(/^COD[0-9]+/, '');
+  return String(v).toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+function matchCodTradeVehicle(cdNo, vehicleIndex) {
+  if (!cdNo) return null;
+  const norm = String(cdNo).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  let best = null;
+  for (const v of vehicleIndex) {
+    if (v.norm && norm.endsWith(v.norm) && (!best || v.norm.length > best.norm.length)) best = v;
+  }
+  return best;
+}
+
+function parseTradeDateTime(val) {
+  if (!val) return null;
+  const s = String(val).trim();
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})(?:,?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    const [, dd, mm, yyyy, hh, min, sec] = m;
+    const d = new Date(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh || 0), Number(min || 0), Number(sec || 0));
+    if (!isNaN(d)) return d.toISOString();
+  }
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const days = Math.floor(Number(s));
+    const frac = Number(s) - days;
+    const d = new Date(Math.round((days - 25569) * 86400 * 1000 + frac * 86400 * 1000));
+    if (!isNaN(d)) return d.toISOString();
+  }
+  const d2 = new Date(s);
+  return isNaN(d2) ? null : d2.toISOString();
+}
+
+function codCategoryGroup(t) {
+  const cat = (t.category || '').toUpperCase();
+  if (cat === 'HGV') return 'CV CoD - HGV';
+  if (cat === 'LGV') return 'CV CoD - LGV';
+  if (cat === '2WN') return '2W CoD';
+  if (['LMV', 'LPV', 'MPV', 'HPV'].includes(cat)) {
+    const vehNo = (t.vehicle_number || '').toUpperCase();
+    return vehNo.startsWith('RJ') ? 'PV CoD - Rajasthan' : 'PV CoD - Non Rajasthan';
+  }
+  return cat || 'Unknown';
+}
+
+let codDealersCache = [];
+async function loadCodDealers() {
+  codDealersCache = await fetchAllRows((from, to) => sb.from('rewire_cod_dealers')
+    .select('*').order('name').range(from, to))
+    .catch(err => { console.error(err); return []; });
+}
+function populateCodDealerSelects() {
+  // assignDealerSelect is now a hidden input fed by the searchable
+  // Dealer picker below (filterAssignDealerOptions/selectAssignDealer),
+  // not a plain <select> — left out of this list on purpose.
+  const opts = '<option value="">Select…</option>' + codDealersCache.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+  ['codOrderDealerSelect', 'codPaymentDealerSelect'].forEach(id => {
+    const sel = document.getElementById(id);
+    if (sel) { const prev = sel.value; sel.innerHTML = opts; if (prev) sel.value = prev; }
+  });
+}
+// Searchable Dealer picker for the "Who Bought This CoD?" modal (Ramvir,
+// Oct 2026) — same partner-search-wrap/ps-dropdown pattern used for Scrap
+// Buyer elsewhere (filterSsBuyerOptions/selectSsBuyer), so dealers with
+// long lists are typeable instead of scrolling a plain <select>.
+function filterAssignDealerOptions(v) {
+  openPSD('assignDealerDropdown');
+  const q = (v || '').toUpperCase().trim();
+  const pool = q
+    ? codDealersCache.filter(d => d.name.toUpperCase().includes(q) || (d.contact_name || '').toUpperCase().includes(q))
+    : codDealersCache.slice(0, 20);
+  document.getElementById('assignDealerList').innerHTML = pool.length
+    ? pool.slice(0, 20).map(d => `<div class="ps-item" onclick="selectAssignDealer('${d.id}')">
+        <div class="ps-item-name">${d.name}</div>
+        <div class="ps-item-loc">${d.contact_name || ''}${d.mobile ? ' · ' + d.mobile : ''}</div>
+      </div>`).join('')
+    : '<div class="ps-item" style="color:var(--color-text-tertiary);font-size:12px;">No matching dealer — use "+ Add New Dealer" above</div>';
+}
+function selectAssignDealer(dealerId) {
+  const d = codDealersCache.find(x => x.id === dealerId);
+  if (!d) return;
+  document.getElementById('assignDealerSelect').value = dealerId;
+  document.getElementById('assignDealerInput').value = d.name;
+  document.getElementById('assignDealerDropdown').classList.remove('open');
+}
+function onAssignToTypeChange() {
+  const isCustomer = document.getElementById('assignToType').value === 'customer';
+  document.getElementById('assignDealerBlock').style.display = isCustomer ? 'none' : '';
+  document.getElementById('assignCustomerBlock').style.display = isCustomer ? '' : 'none';
+}
+function openAddCodDealerModal() {
+  ['codDealerName', 'codDealerContact', 'codDealerMobile', 'codDealerGst'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  openModal('addCodDealerModal');
+}
+async function submitAddCodDealer() {
+  const name = document.getElementById('codDealerName').value.trim();
+  if (!name) { notify('Dealer / Company name is required.', { icon: 'error', title: 'Missing field' }); return; }
+  const { error } = await sb.from('rewire_cod_dealers').insert({
+    name,
+    contact_name: document.getElementById('codDealerContact').value.trim() || null,
+    mobile: document.getElementById('codDealerMobile').value.trim() || null,
+    gst_number: document.getElementById('codDealerGst').value.trim() || null,
+    created_by: currentProfile.id,
+  });
+  if (error) { notify('Error adding dealer: ' + error.message, { icon: 'error' }); return; }
+  notify('CoD Dealer added.');
+  closeModal('addCodDealerModal');
+  await loadCodDealers();
+  populateCodDealerSelects();
+}
+
+let assignDealerTradeId = null;
+function onAssignPaymentStatusChange() {
+  const rec = document.getElementById('assignDealerPaymentStatus').value === 'Received';
+  document.getElementById('assignPaymentModeField').style.display = rec ? '' : 'none';
+  if (!rec) document.getElementById('assignPaymentMode').value = '';
+}
+function openAssignDealerModal(tradeId, cdNo) {
+  assignDealerTradeId = tradeId;
+  document.getElementById('assignDealerModalSub').textContent = cdNo || '—';
+  populateCodDealerSelects();
+  const existing = codTradesCache.find(t => t.id === tradeId);
+  // Default to Customer if the row already has a customer_name snapshot
+  // (no dealer_id), else Dealer — matches whichever path was used before,
+  // so re-opening "Edit" on a row doesn't silently flip its type.
+  const isExistingCustomer = !!(existing && existing.customer_name && !existing.dealer_id);
+  document.getElementById('assignToType').value = isExistingCustomer ? 'customer' : 'dealer';
+  const existingDealer = existing && existing.dealer_id ? codDealersCache.find(d => d.id === existing.dealer_id) : null;
+  document.getElementById('assignDealerSelect').value = existing ? (existing.dealer_id || '') : '';
+  document.getElementById('assignDealerInput').value = existingDealer ? existingDealer.name : '';
+  document.getElementById('assignCustomerName').value = existing ? (existing.customer_name || '') : '';
+  document.getElementById('assignCustomerMobile').value = existing ? (existing.customer_mobile || '') : '';
+  document.getElementById('assignDealerPaymentStatus').value = existing ? (existing.dealer_payment_status || 'Pending') : 'Pending';
+  document.getElementById('assignPaymentMode').value = existing ? (existing.dealer_payment_mode || '') : '';
+  onAssignPaymentStatusChange();
+  document.getElementById('assignCodAmount').value = existing && existing.cod_sold_amount != null ? existing.cod_sold_amount : '';
+  onAssignToTypeChange();
+  openModal('assignCodDealerModal');
+}
+async function submitAssignCodDealer() {
+  if (!assignDealerTradeId) return;
+  const isCustomer = document.getElementById('assignToType').value === 'customer';
+  const paymentStatus = document.getElementById('assignDealerPaymentStatus').value || 'Pending';
+  const amtRaw = document.getElementById('assignCodAmount').value;
+  if (amtRaw === '' || isNaN(Number(amtRaw)) || Number(amtRaw) < 0) { notify('Enter the CoD amount.', { icon: 'error', title: 'Missing field' }); return; }
+  const codAmount = Number(amtRaw);
+  const payMode = paymentStatus === 'Received' ? document.getElementById('assignPaymentMode').value : '';
+  if (paymentStatus === 'Received' && !payMode) { notify('Select the Payment Mode.', { icon: 'error', title: 'Missing field' }); return; }
+  let payload;
+  if (isCustomer) {
+    const customerName = document.getElementById('assignCustomerName').value.trim();
+    if (!customerName) { notify('Enter the Customer\'s name.', { icon: 'error', title: 'Missing field' }); return; }
+    payload = {
+      dealer_id: null,
+      customer_name: customerName,
+      customer_mobile: document.getElementById('assignCustomerMobile').value.trim() || null,
+      dealer_payment_status: paymentStatus, cod_sold_amount: codAmount, dealer_payment_mode: payMode || null,
+      dealer_assigned_by: currentProfile.id, dealer_assigned_on: new Date().toISOString(),
+    };
+  } else {
+    const dealerId = document.getElementById('assignDealerSelect').value;
+    if (!dealerId) { notify('Select a Dealer.', { icon: 'error', title: 'Missing field' }); return; }
+    payload = {
+      dealer_id: dealerId, customer_name: null, customer_mobile: null,
+      dealer_payment_status: paymentStatus, cod_sold_amount: codAmount, dealer_payment_mode: payMode || null,
+      dealer_assigned_by: currentProfile.id, dealer_assigned_on: new Date().toISOString(),
+    };
+  }
+  const { error } = await sb.from('rewire_cod_trades').update(payload).eq('id', assignDealerTradeId);
+  if (error) { notify('Error assigning: ' + error.message, { icon: 'error' }); return; }
+  notify(isCustomer ? 'Saved.' : 'Saved.');
+  closeModal('assignCodDealerModal');
+  assignDealerTradeId = null;
+  await renderCodTradesSection();
+}
+
+let codOrdersCache = [];
+async function loadCodOrders() {
+  codOrdersCache = await fetchAllRows((from, to) => sb.from('rewire_cod_orders')
+    .select(`*, dealer:rewire_cod_dealers(id,name)`).order('order_date', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+}
+function openCodOrderModal() {
+  populateCodDealerSelects();
+  document.getElementById('codOrderDealerSelect').value = '';
+  document.getElementById('codOrderCategory').value = '';
+  document.getElementById('codOrderPrice').value = '';
+  document.getElementById('codOrderDate').value = new Date().toISOString().slice(0, 10);
+  openModal('codOrderModal');
+}
+async function submitCodOrder() {
+  const dealerId = document.getElementById('codOrderDealerSelect').value;
+  const category = document.getElementById('codOrderCategory').value;
+  const price = Number(document.getElementById('codOrderPrice').value);
+  if (!dealerId || !category || !price) { notify('Dealer, Category and Price are all required.', { icon: 'error', title: 'Missing field' }); return; }
+  const { error } = await sb.from('rewire_cod_orders').insert({
+    dealer_id: dealerId, category, quantity: 1, price_without_gst: price,
+    order_date: document.getElementById('codOrderDate').value || new Date().toISOString().slice(0, 10),
+    created_by: currentProfile.id,
+  });
+  if (error) { notify('Error saving CoD Order: ' + error.message, { icon: 'error' }); return; }
+  notify('CoD Order saved.');
+  closeModal('codOrderModal');
+  await renderCodDashboardSection();
+}
+
+let codPaymentsCache = [];
+async function loadCodPayments() {
+  codPaymentsCache = await fetchAllRows((from, to) => sb.from('rewire_cod_payments')
+    .select(`*, dealer:rewire_cod_dealers(id,name), rewire_cod_payment_items(trade_id)`)
+    .order('payment_date', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+}
+function openCodPaymentModal() {
+  populateCodDealerSelects();
+  document.getElementById('codPaymentDealerSelect').value = '';
+  document.getElementById('codPaymentAmount').value = '';
+  document.getElementById('codPaymentMode').value = '';
+  document.getElementById('codPaymentDate').value = new Date().toISOString().slice(0, 10);
+  document.getElementById('codPaymentRemarks').value = '';
+  document.getElementById('codPaymentCdList').innerHTML = '<span style="color:var(--color-text-tertiary);">Select a Dealer first…</span>';
+  openModal('codPaymentModal');
+}
+function onCodPaymentDealerChange() {
+  const dealerId = document.getElementById('codPaymentDealerSelect').value;
+  const listEl = document.getElementById('codPaymentCdList');
+  if (!dealerId) { listEl.innerHTML = '<span style="color:var(--color-text-tertiary);">Select a Dealer first…</span>'; return; }
+  const rows = codTradesCache.filter(t => t.trade_type === 'SELL' && t.dealer_id === dealerId && t.dealer_payment_status !== 'Received');
+  if (!rows.length) { listEl.innerHTML = '<span style="color:var(--color-text-tertiary);">No pending-payment CoDs sold to this Dealer.</span>'; return; }
+  listEl.innerHTML = rows.map(t => `<label style="display:flex;align-items:center;gap:6px;padding:3px 0;">
+    <input type="checkbox" class="cod-pay-cd-cb" value="${t.id}" /> ${t.cd_no} — ₹${Number(t.traded_price || 0).toLocaleString('en-IN')}
+  </label>`).join('');
+}
+async function submitCodPayment() {
+  const dealerId = document.getElementById('codPaymentDealerSelect').value;
+  const amount = Number(document.getElementById('codPaymentAmount').value);
+  const mode = document.getElementById('codPaymentMode').value;
+  if (!dealerId || !amount || !mode) { notify('Dealer, Amount and Payment Mode are all required.', { icon: 'error', title: 'Missing field' }); return; }
+  const checkedIds = Array.from(document.querySelectorAll('.cod-pay-cd-cb:checked')).map(cb => cb.value);
+  const { data: payRow, error } = await sb.from('rewire_cod_payments').insert({
+    dealer_id: dealerId, amount, payment_mode: mode,
+    payment_date: document.getElementById('codPaymentDate').value || new Date().toISOString().slice(0, 10),
+    remarks: document.getElementById('codPaymentRemarks').value.trim() || null,
+    created_by: currentProfile.id,
+  }).select().single();
+  if (error) { notify('Error saving payment: ' + error.message, { icon: 'error' }); return; }
+  if (checkedIds.length) {
+    await sb.from('rewire_cod_payment_items').insert(checkedIds.map(tid => ({ payment_id: payRow.id, trade_id: tid })));
+    await sb.from('rewire_cod_trades').update({ dealer_payment_status: 'Received' }).in('id', checkedIds);
+  }
+  notify('Payment recorded.');
+  closeModal('codPaymentModal');
+  await renderCodTradesSection();
+  await renderCodDashboardSection();
+}
+
+async function renderCodDashboardSection() {
+  await Promise.all([
+    loadCodDealers(),
+    (async () => { if (!codTradesCache.length) await renderCodTradesSection(); })(),
+    loadCodOrders(),
+    loadCodPayments(),
+  ]);
+  renderCodSummaryTable();
+  renderDealerSummaryTable();
+  renderCodOrdersTable();
+  renderCodPaymentsTable();
+}
+
+const COD_CATEGORY_GROUPS = ['PV CoD - Rajasthan', 'PV CoD - Non Rajasthan', 'CV CoD - LGV', 'CV CoD - HGV', '2W CoD'];
+
+function renderCodSummaryTable() {
+  const buys = codTradesCache.filter(t => t.trade_type === 'BUY');
+  const soldCdNos = new Set(codTradesCache.filter(t => t.trade_type === 'SELL').map(t => t.cd_no));
+  const stockRows = buys.filter(t => !soldCdNos.has(t.cd_no));
+  const now = new Date();
+
+  const tbody = document.getElementById('tbodyCodSummary');
+  tbody.innerHTML = COD_CATEGORY_GROUPS.map(group => {
+    const rowsInGroup = stockRows.filter(t => codCategoryGroup(t) === group);
+    const stockCount = rowsInGroup.length;
+    const ages = rowsInGroup.map(t => t.trade_date ? Math.floor((now - new Date(t.trade_date)) / 86400000) : 0);
+    const avgAge = ages.length ? Math.round(ages.reduce((a, b) => a + b, 0) / ages.length) : 0;
+    const oldestAge = ages.length ? Math.max(...ages) : 0;
+    const confirmedOrders = codOrdersCache.filter(o => o.category === group && o.status === 'Open').reduce((s, o) => s + Number(o.quantity || 0), 0);
+    const freeStock = Math.max(0, stockCount - confirmedOrders);
+    return `<tr>
+      <td style="font-weight:500;">${group}</td>
+      <td>${stockCount}</td>
+      <td>${confirmedOrders}</td>
+      <td>${freeStock}</td>
+      <td>${ages.length ? avgAge + ' days' : '—'}</td>
+      <td>${ages.length ? oldestAge + ' days' : '—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// Dealer deposit model (Ramvir, Oct 2026): a Dealer's deposits are Payment
+// entries; every CoD sold to them is deducted at the amount entered when
+// selling (cod_sold_amount; falls back to traded_price for old rows).
+// A sale settled directly at assign time (status Received, no deposit item
+// linked) is not charged against the deposit.
+function codSaleAmount(t) {
+  const v = (t.cod_sold_amount != null && t.cod_sold_amount !== '') ? t.cod_sold_amount : t.traded_price;
+  return Number(v || 0);
+}
+function codSaleChargesDealer(t) {
+  if (t.dealer_payment_status !== 'Received') return true;
+  return codPaymentsCache.some(p => (p.rewire_cod_payment_items || []).some(i => i.trade_id === t.id));
+}
+function codFmtBalance(b) {
+  return b < 0 ? 'Advance ₹' + Math.abs(b).toLocaleString('en-IN') : '₹' + b.toLocaleString('en-IN');
+}
+function renderDealerSummaryTable() {
+  const onlyPending = (document.getElementById('codOnlyPendingToggle') || {}).checked;
+  const search = ((document.getElementById('searchCodDealers') || {}).value || '').toLowerCase();
+  const sells = codTradesCache.filter(t => t.trade_type === 'SELL' && t.dealer_id);
+
+  let rows = codDealersCache.map(d => {
+    const sales = sells.filter(t => t.dealer_id === d.id && codSaleChargesDealer(t)).reduce((s, t) => s + codSaleAmount(t), 0);
+    const payment = codPaymentsCache.filter(p => p.dealer_id === d.id).reduce((s, p) => s + Number(p.amount || 0), 0);
+    return { dealer: d, sales, payment, balance: sales - payment };
+  }).filter(r => r.sales > 0 || r.payment > 0);
+  if (onlyPending) rows = rows.filter(r => r.balance > 0);
+  if (search) rows = rows.filter(r => r.dealer.name.toLowerCase().includes(search));
+  rows.sort((a, b) => b.balance - a.balance);
+
+  const tbody = document.getElementById('tbodyCodDealerSummary');
+  tbody.innerHTML = rows.length ? rows.map(r => `<tr>
+    <td style="font-weight:500;">${r.dealer.name}</td>
+    <td>₹${r.sales.toLocaleString('en-IN')}</td>
+    <td>₹${r.payment.toLocaleString('en-IN')}</td>
+    <td style="color:${r.balance > 0 ? '#dc2626' : '#059669'};font-weight:600;">${codFmtBalance(r.balance)}</td>
+    <td><button class="btn btn-outline" style="font-size:11px;padding:4px 10px;" onclick="showCodDealerLedger('${r.dealer.id}')">View Ledger</button></td>
+  </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No Dealer sales/payments recorded yet.</td></tr>';
+}
+
+function showCodDealerLedger(dealerId) {
+  const dealer = codDealersCache.find(d => d.id === dealerId);
+  if (!dealer) return;
+  const entries = [];
+  codTradesCache.filter(t => t.trade_type === 'SELL' && t.dealer_id === dealerId && codSaleChargesDealer(t)).forEach(t => {
+    entries.push({ date: t.dealer_assigned_on || t.trade_date, type: 'Sale (deducted)', label: t.cd_no, amount: codSaleAmount(t) });
+  });
+  codPaymentsCache.filter(p => p.dealer_id === dealerId).forEach(p => {
+    entries.push({ date: p.payment_date, type: 'Deposit / Payment', label: p.payment_mode + (p.remarks ? ' — ' + p.remarks : ''), amount: -Number(p.amount || 0) });
+  });
+  entries.sort((a, b) => new Date(a.date) - new Date(b.date));
+  let running = 0;
+  const rowsHtml = entries.map(e => {
+    running += e.amount;
+    return `<tr>
+      <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${e.date ? new Date(e.date).toLocaleDateString() : '—'}</td>
+      <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${e.type}</td>
+      <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${e.label || '—'}</td>
+      <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;${e.amount < 0 ? 'color:#059669;' : ''}">${e.amount < 0 ? '-' : ''}₹${Math.abs(e.amount).toLocaleString('en-IN')}</td>
+      <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;font-weight:600;">${codFmtBalance(running)}</td>
+    </tr>`;
+  }).join('');
+  const html = `<div style="max-height:420px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px;text-align:left;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead style="position:sticky;top:0;background:#f8fafc;"><tr>
+        <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Date</th>
+        <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Type</th>
+        <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Details</th>
+        <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Amount</th>
+        <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Running Balance (Advance = deposit left)</th>
+      </tr></thead>
+      <tbody>${rowsHtml || '<tr><td colspan="5" style="padding:16px;text-align:center;color:#94a3b8;">No entries yet.</td></tr>'}</tbody>
+    </table></div>`;
+  Swal.fire({ title: 'Ledger — ' + dealer.name, html, width: 760, confirmButtonText: 'Close', confirmButtonColor: '#1d4ed8' });
+}
+
+function renderCodOrdersTable() {
+  const tbody = document.getElementById('tbodyCodOrders');
+  tbody.innerHTML = codOrdersCache.length ? codOrdersCache.map(o => `<tr>
+    <td style="font-weight:500;">${o.dealer ? o.dealer.name : '—'}</td>
+    <td>${o.category}</td>
+    <td>₹${Number(o.price_without_gst || 0).toLocaleString('en-IN')}</td>
+    <td>${o.order_date ? new Date(o.order_date).toLocaleDateString() : '—'}</td>
+    <td><span class="badge ${o.status === 'Open' ? 'badge-q' : 'badge-na'}">${o.status}</span></td>
+  </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No CoD Orders yet.</td></tr>';
+}
+
+function exportCodSummaryReportExcel() {
+  const buys = codTradesCache.filter(t => t.trade_type === 'BUY');
+  const soldCdNos = new Set(codTradesCache.filter(t => t.trade_type === 'SELL').map(t => t.cd_no));
+  const stockRows = buys.filter(t => !soldCdNos.has(t.cd_no));
+  const now = new Date();
+  const rows = COD_CATEGORY_GROUPS.map(group => {
+    const rowsInGroup = stockRows.filter(t => codCategoryGroup(t) === group);
+    const ages = rowsInGroup.map(t => t.trade_date ? Math.floor((now - new Date(t.trade_date)) / 86400000) : 0);
+    const confirmedOrders = codOrdersCache.filter(o => o.category === group && o.status === 'Open').length;
+    return {
+      'CoD Category': group,
+      'Stock (Unsold)': rowsInGroup.length,
+      'Confirmed Orders': confirmedOrders,
+      'Free Stock': Math.max(0, rowsInGroup.length - confirmedOrders),
+      'Avg Age (days)': ages.length ? Math.round(ages.reduce((a, b) => a + b, 0) / ages.length) : '',
+      'Oldest (days)': ages.length ? Math.max(...ages) : '',
+    };
+  });
+  downloadXlsxMulti('rewire-dms-cod-summary-report.xlsx', [{ name: 'CoD Summary', rows }]);
+}
+function exportCodDealerSummaryExcel() {
+  const sells = codTradesCache.filter(t => t.trade_type === 'SELL' && t.dealer_id);
+  const rows = codDealersCache.map(d => {
+    const sales = sells.filter(t => t.dealer_id === d.id && codSaleChargesDealer(t)).reduce((s, t) => s + codSaleAmount(t), 0);
+    const payment = codPaymentsCache.filter(p => p.dealer_id === d.id).reduce((s, p) => s + Number(p.amount || 0), 0);
+    return { Dealer: d.name, 'Total Sales (₹)': sales, 'Total Payment (₹)': payment, 'Balance (₹)': sales - payment };
+  }).filter(r => r['Total Sales (₹)'] > 0 || r['Total Payment (₹)'] > 0).sort((a, b) => b['Balance (₹)'] - a['Balance (₹)']);
+  if (!rows.length) { notify('No Dealer activity to export.', { icon: 'info' }); return; }
+  downloadXlsxMulti('rewire-dms-cod-dealer-summary.xlsx', [{ name: 'Dealer Summary', rows }]);
+}
+function exportCodOrdersExcel() {
+  if (!codOrdersCache.length) { notify('No CoD Orders to export.', { icon: 'info' }); return; }
+  const rows = codOrdersCache.map(o => ({
+    Dealer: o.dealer ? o.dealer.name : '', 'CoD Category': o.category,
+    'Price without GST (₹)': Number(o.price_without_gst || 0),
+    'Order Date': o.order_date ? new Date(o.order_date).toLocaleDateString() : '', Status: o.status,
+  }));
+  downloadXlsxMulti('rewire-dms-cod-orders.xlsx', [{ name: 'CoD Orders', rows }]);
+}
+function exportCodPaymentsExcel() {
+  if (!codPaymentsCache.length) { notify('No payment entries to export.', { icon: 'info' }); return; }
+  const rows = codPaymentsCache.map(p => ({
+    Dealer: p.dealer ? p.dealer.name : '', 'Amount (₹)': Number(p.amount || 0), 'Payment Mode': p.payment_mode,
+    'Payment Date': p.payment_date ? new Date(p.payment_date).toLocaleDateString() : '',
+    'CoDs Covered': (p.rewire_cod_payment_items || []).length, Remarks: p.remarks || '',
+  }));
+  downloadXlsxMulti('rewire-dms-cod-payments.xlsx', [{ name: 'Payment Entries', rows }]);
+}
+
+function renderCodPaymentsTable() {
+  const tbody = document.getElementById('tbodyCodPayments');
+  tbody.innerHTML = codPaymentsCache.length ? codPaymentsCache.map(p => `<tr>
+    <td style="font-weight:500;">${p.dealer ? p.dealer.name : '—'}</td>
+    <td>₹${Number(p.amount || 0).toLocaleString('en-IN')}</td>
+    <td>${p.payment_mode}</td>
+    <td>${p.payment_date ? new Date(p.payment_date).toLocaleDateString() : '—'}</td>
+    <td>${(p.rewire_cod_payment_items || []).length}</td>
+    <td>${p.remarks || '—'}</td>
+  </tr>`).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No payment entries yet.</td></tr>';
+}
+
+async function renderCodTradesSection() {
+  const allLeads = await loadTraderCodAll();
+  const paidLeads = await buildTraderCodLeadIndex();
+  await loadCodDealers();
+  const trades = await fetchAllRows((from, to) => sb.from('rewire_cod_trades')
+    .select(`*, dealer:rewire_cod_dealers(id,name)`).order('trade_date', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+
+  const leadById = {};
+  allLeads.forEach(l => { leadById[l.id] = l; });
+  codTradesCache = (trades || []).map(t => ({ ...t, _lead: t.lead_id ? leadById[t.lead_id] : null }));
+
+  // Purchased / Sold / Stock now count EVERY uploaded trade (by vehicle no.),
+  // whether or not it matches a Trader-COD lead in this system (Ramvir, Oct
+  // 2026: "chahe hamare system me ho ya na ho"). Matched rows still show the
+  // lead's details; unmatched ones show "Not Matched".
+  const leadByNorm = {};
+  allLeads.forEach(l => { if (l.norm) leadByNorm[l.norm] = l; });
+  const buyV = {}, sellV = {};
+  codTradesCache.forEach(t => {
+    const k = codVehicleOf(t); if (!k) return;
+    const m = t.trade_type === 'BUY' ? buyV : sellV;
+    if (!m[k] || new Date(t.trade_date || 0) > new Date(m[k].trade_date || 0)) m[k] = t;
+  });
+  const mkRow = k => ({ lead: (buyV[k] && buyV[k]._lead) || (sellV[k] && sellV[k]._lead) || leadByNorm[k] || null, buy: buyV[k] || null, sell: sellV[k] || null });
+  const purchasedIds = new Set(codTradesCache.filter(t => t.trade_type === 'BUY' && t.lead_id).map(t => t.lead_id));
+  codKpiSets = {
+    total: paidLeads,
+    purchased: Object.keys(buyV).map(mkRow),
+    sold: Object.keys(sellV).map(mkRow),
+    pending: paidLeads.filter(l => !purchasedIds.has(l.id)),
+    stock: Object.keys(buyV).filter(k => !sellV[k]).map(mkRow),
+    soldnotassign: codTradesCache.filter(t => t.trade_type === 'SELL' && !t.dealer_id && !t.customer_name),
+  };
+  const setK = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n; };
+  setK('ctKpiTotal', codKpiSets.total.length);
+  setK('ctKpiPurchased', codKpiSets.purchased.length);
+  setK('ctKpiSold', codKpiSets.sold.length);
+  setK('ctKpiPending', codKpiSets.pending.length);
+  setK('ctKpiStock', codKpiSets.stock.length);
+  setK('ctKpiSoldNotAssign', codKpiSets.soldnotassign.length);
+  showCodKpiDetail(codKpiActive || 'total');
+}
+
+// KPI card click -> detail table below the cards (Ramvir, Oct 2026)
+let codKpiSets = {}, codKpiActive = null, codKpiRows = [];
+const COD_KPI_TITLES = { total: 'Trader-COD Leads (payment done)', purchased: 'COD Purchased', sold: 'Sold', pending: 'Purchase Pending', stock: 'COD Stock', soldnotassign: 'COD Sold but Not Assign' };
+function showCodKpiDetail(key) {
+  codKpiActive = key;
+  Object.keys(COD_KPI_TITLES).forEach(k => { const c = document.getElementById('ctCard-' + k); if (c) c.style.outline = k === key ? '2px solid #2563eb' : ''; });
+  renderCodKpiDetail();
+}
+// Builds the rows for the active card (+ search + trade-date range) and draws the one table on this tab.
+function codKpiBuildRows() {
+  const key = codKpiActive || 'total';
+  const q = ((document.getElementById('ctDetailSearch') || {}).value || '').trim().toLowerCase();
+  const dFrom = (document.getElementById('ctDateFrom') || {}).value || '', dTo = (document.getElementById('ctDateTo') || {}).value || '';
+  const istDay = v => v ? new Date(new Date(v).getTime() + 330 * 60000).toISOString().slice(0, 10) : '';
+  const buyOf = {}, sellOf = {};
+  codTradesCache.forEach(t => { if (!t.lead_id) return; if (t.trade_type === 'BUY') buyOf[t.lead_id] = t; else if (t.trade_type === 'SELL') sellOf[t.lead_id] = t; });
+  let rows;
+  if (key === 'soldnotassign') rows = (codKpiSets[key] || []).map(t => ({ lead: t._lead, buy: null, sell: t }));
+  else if (key === 'purchased' || key === 'sold' || key === 'stock') rows = (codKpiSets[key] || []).slice();
+  else rows = (codKpiSets[key] || []).map(l => ({ lead: l, buy: buyOf[l.id] || null, sell: sellOf[l.id] || null }));
+  const dateOf = r => key === 'sold' || key === 'soldnotassign' ? (r.sell && r.sell.trade_date) : (key === 'pending' ? null : (key === 'total' ? ((r.buy && r.buy.trade_date) || (r.sell && r.sell.trade_date)) : (r.buy && r.buy.trade_date)));
+  rows = rows.filter(r => {
+    if (q) {
+      const hay = [r.lead && r.lead.lead_no, r.lead && r.lead.val_vehicle_number, r.lead && r.lead.customer_name, r.buy && r.buy.cd_no, r.sell && r.sell.cd_no, r.sell && r.sell.vehicle_number].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    if (dFrom || dTo) {
+      if (key === 'pending') return true;
+      const d = istDay(dateOf(r));
+      if (!d || (dFrom && d < dFrom) || (dTo && d > dTo)) return false;
+    }
+    return true;
+  });
+  return rows;
+}
+const codMoney = v => v != null && v !== '' ? '₹' + Number(v).toLocaleString('en-IN') : '—';
+const codDate = v => v ? new Date(v).toLocaleDateString('en-GB') : '—';
+function codSoldTo(s) { return s ? (s.dealer ? s.dealer.name : (s.customer_name || '—')) : '—'; }
+function renderCodKpiDetail() {
+  const key = codKpiActive || 'total';
+  const rows = codKpiRows = codKpiBuildRows();
+  const titleEl = document.getElementById('ctDetailTitle'); if (titleEl) titleEl.textContent = COD_KPI_TITLES[key];
+  const cnt = document.getElementById('ctDetailCount'); if (cnt) cnt.textContent = rows.length + ' row(s)';
+  const head = document.getElementById('ctDetailHead'), body = document.getElementById('ctDetailBody');
+  if (!head || !body) return;
+  head.innerHTML = '<tr><th>Lead No.</th><th>Vehicle No.</th><th>Customer</th><th>Make / Model</th><th>PE</th><th>Manager</th><th>CD No. (Buy)</th><th>Buy Price</th><th>Buy Date</th><th>CD No. (Sell)</th><th>Sell Price</th><th>Sell Date</th><th>Sold To</th><th>CoD Amount</th><th>Payment</th><th>Mode</th><th>Action</th></tr>';
+  body.innerHTML = rows.length ? rows.map(r => {
+    const l = r.lead || {}, b = r.buy, s = r.sell;
+    const veh = l.val_vehicle_number || (s && s.vehicle_number) || '—';
+    const act = s ? `<button class="btn btn-outline" style="font-size:11px;padding:4px 10px;" onclick="openAssignDealerModal('${s.id}','${(s.cd_no || '').replace(/'/g, "\\'")}')">Sold to</button>` : '';
+    return `<tr><td>${l.lead_no || '<span style="color:#dc2626;">Not Matched</span>'}</td><td>${veh}</td><td>${l.customer_name || '—'}</td><td>${((l.val_make || '') + ' ' + (l.val_model_variant || '')).trim() || (s && s.make) || '—'}</td><td>${l.pe ? l.pe.name : '—'}</td><td>${l.manager ? l.manager.name : '—'}</td>
+      <td>${b ? b.cd_no : '—'}</td><td>${b ? codMoney(b.traded_price) : '—'}</td><td>${b ? codDate(b.trade_date) : '—'}</td>
+      <td>${s ? s.cd_no : '—'}</td><td>${s ? codMoney(s.traded_price) : '—'}</td><td>${s ? codDate(s.trade_date) : '—'}</td><td>${codSoldTo(s)}</td><td>${s ? codMoney(s.cod_sold_amount) : '—'}</td><td>${s ? (s.dealer_payment_status || 'Pending') : '—'}</td><td>${s && s.dealer_payment_mode ? s.dealer_payment_mode : '—'}</td><td>${act}</td></tr>`;
+  }).join('') : '<tr><td colspan="17" style="text-align:center;padding:24px;color:var(--color-text-tertiary);">No rows.</td></tr>';
+}
+function exportCodKpiDetail() {
+  if (!codKpiRows.length) { notify('No rows to export.', { icon: 'info' }); return; }
+  const key = codKpiActive || 'total';
+  const rows = codKpiRows.map(r => { const l = r.lead || {}, b = r.buy, s = r.sell; return {
+    'Lead No.': l.lead_no || 'Not Matched', 'Vehicle No.': l.val_vehicle_number || (s && s.vehicle_number) || '', 'Customer': l.customer_name || '',
+    'Make': l.val_make || (s && s.make) || '', 'Model': l.val_model_variant || '', 'PE': l.pe ? l.pe.name : '', 'Manager': l.manager ? l.manager.name : '',
+    'CD No. (Buy)': b ? b.cd_no : '', 'Buy Price': b ? b.traded_price : '', 'Buy Date': b && b.trade_date ? codDate(b.trade_date) : '',
+    'CD No. (Sell)': s ? s.cd_no : '', 'Sell Price': s ? s.traded_price : '', 'Sell Date': s && s.trade_date ? codDate(s.trade_date) : '',
+    'Sold To': s ? (codSoldTo(s) === '—' ? '' : codSoldTo(s)) : '', 'CoD Amount': s && s.cod_sold_amount != null ? Number(s.cod_sold_amount) : '',
+    'Payment Status': s ? (s.dealer_payment_status || 'Pending') : '', 'Payment Mode': s && s.dealer_payment_mode ? s.dealer_payment_mode : '' }; });
+  downloadXlsxMulti('rewire-dms-cod-' + key + '.xlsx', [{ name: COD_KPI_TITLES[key].slice(0, 30), rows }]);
+}
+function clearCodTradesFilters() {
+  ['ctDetailSearch', 'ctDateFrom', 'ctDateTo'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  renderCodKpiDetail();
+}
+
+async function buildCodTradesReportData(filterByDate) {
+  const leadsIndex = await buildTraderCodLeadIndex();
+  const trades = await fetchAllRows((from, to) => (filterByDate
+    ? applyReportDateFilter(sb.from('rewire_cod_trades').select('*'), 'trade_date')
+    : sb.from('rewire_cod_trades').select('*')
+  ).range(from, to))
+    .catch(err => { notify('Export failed: ' + err.message, { icon: 'error' }); return null; });
+  if (trades === null) return null;
+  const buyByLead = {}, sellByLead = {};
+  trades.forEach(t => {
+    if (!t.lead_id) return;
+    if (t.trade_type === 'BUY') buyByLead[t.lead_id] = t;
+    else if (t.trade_type === 'SELL') sellByLead[t.lead_id] = t;
+  });
+  return { leadsIndex, buyByLead, sellByLead };
+}
+
+async function exportCodTradesVsPurchasedReport() {
+  const data = await buildCodTradesReportData(false);
+  if (!data) return;
+  const { leadsIndex, buyByLead, sellByLead } = data;
+  if (!leadsIndex.length) { notify('No Trader-COD leads to export.', { icon: 'info' }); return; }
+  const details = leadsIndex.map(l => {
+    const buy = buyByLead[l.id], sell = sellByLead[l.id];
+    return {
+      'Lead No.': l.lead_no, 'Customer': l.customer_name || '', 'Vehicle No.': l.val_vehicle_number,
+      'Make': l.val_make || '', 'Model': l.val_model_variant || '',
+      'PE': l.pe ? l.pe.name : '', 'Manager': l.manager ? l.manager.name : '',
+      'Purchase Status': buy ? 'Purchased' : 'Pending',
+      'CD No. (Buy)': buy ? buy.cd_no : '', 'Buy Price': buy ? buy.traded_price : '', 'Buy Date': buy ? buy.trade_date : '',
+      'Sold Status': sell ? 'Sold' : (buy ? 'In Stock' : '—'),
+      'CD No. (Sell)': sell ? sell.cd_no : '', 'Sell Price': sell ? sell.traded_price : '', 'Sell Date': sell ? sell.trade_date : '',
+    };
+  });
+  const purchasedCount = Object.keys(buyByLead).length;
+  const soldCount = Object.keys(sellByLead).length;
+  const summary = [{
+    'Total Trader-COD Leads': leadsIndex.length, 'COD Purchased': purchasedCount, 'Sold': soldCount,
+    'COD Stock (Purchased - Sold)': Math.max(purchasedCount - soldCount, 0),
+    'Purchase Pending': Math.max(leadsIndex.length - purchasedCount, 0),
+  }];
+  downloadXlsxMulti('rewire-dms-cod-vs-purchased-report.xlsx', [{ name: 'Summary', rows: summary }, { name: 'Details', rows: details }]);
+}
+
+async function exportCodStockReport() {
+  const data = await buildCodTradesReportData(false);
+  if (!data) return;
+  const { leadsIndex, buyByLead, sellByLead } = data;
+  const stockRows = leadsIndex.filter(l => buyByLead[l.id] && !sellByLead[l.id]);
+  if (!stockRows.length) { notify('No COD stock currently on hand.', { icon: 'info' }); return; }
+  const details = stockRows.map(l => {
+    const buy = buyByLead[l.id];
+    const buyDate = buy.trade_date ? new Date(buy.trade_date) : null;
+    const daysInStock = buyDate && !isNaN(buyDate) ? Math.floor((Date.now() - buyDate.getTime()) / 86400000) : '';
+    return {
+      'Lead No.': l.lead_no, 'Customer': l.customer_name || '', 'Vehicle No.': l.val_vehicle_number,
+      'Make': l.val_make || '', 'Model': l.val_model_variant || '',
+      'CD No.': buy.cd_no, 'Buy Price': buy.traded_price, 'Buy Date': buy.trade_date, 'Days in Stock': daysInStock,
+      'PE': l.pe ? l.pe.name : '', 'Manager': l.manager ? l.manager.name : '',
+    };
+  });
+  const summary = [{ 'COD Stock (Purchased, Not Yet Sold)': stockRows.length }];
+  downloadXlsxMulti('rewire-dms-cod-stock-report.xlsx', [{ name: 'Summary', rows: summary }, { name: 'Stock Details', rows: details }]);
+}
+
+async function exportCodPurchasePendingReport() {
+  const data = await buildCodTradesReportData(false);
+  if (!data) return;
+  const { leadsIndex, buyByLead } = data;
+  const pendingRows = leadsIndex.filter(l => !buyByLead[l.id]);
+  if (!pendingRows.length) { notify('No COD purchases pending.', { icon: 'info' }); return; }
+  const details = pendingRows.map(l => ({
+    'Lead No.': l.lead_no, 'Customer': l.customer_name || '', 'Vehicle No.': l.val_vehicle_number,
+    'Make': l.val_make || '', 'Model': l.val_model_variant || '',
+    'PE': l.pe ? l.pe.name : '', 'Manager': l.manager ? l.manager.name : '',
+  }));
+  const summary = [{ 'COD Purchase Pending': pendingRows.length }];
+  downloadXlsxMulti('rewire-dms-cod-purchase-pending-report.xlsx', [{ name: 'Summary', rows: summary }, { name: 'Pending Details', rows: details }]);
+}
+
+const CODTRADES_COLUMNS = [
+  { key: 'cd_no', label: 'CD No.', get: t => t.cd_no || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: t => t.vehicle_number || '' },
+  { key: 'dms_lead_no', label: 'DMS Lead No.', get: t => t._lead ? t._lead.lead_no : 'Not Matched' },
+  { key: 'category', label: 'Category', get: t => t.category || '' },
+  { key: 'category_group', label: 'CoD Category', get: t => codCategoryGroup(t) },
+  { key: 'make', label: 'Make', get: t => t.make || '' },
+  { key: 'trade_type', label: 'Trade Type', get: t => t.trade_type || '' },
+  { key: 'traded_price', label: 'Traded Price (₹)', get: t => t.traded_price != null && t.traded_price !== '' ? Number(t.traded_price) : '' },
+  { key: 'trade_date', label: 'Trade Date', get: t => t.trade_date ? new Date(t.trade_date).toLocaleString() : '' },
+  { key: 'payment_status', label: 'DigiELV Status', get: t => t.payment_status || '' },
+  { key: 'utr_no', label: 'UTR No.', get: t => t.utr_no || '' },
+  { key: 'dealer', label: 'Dealer / Customer (Sold To)', get: t => t.dealer ? t.dealer.name : (t.customer_name ? t.customer_name + ' (Customer)' : '') },
+  { key: 'cod_amount', label: 'CoD Amount (₹)', get: t => t.trade_type === 'SELL' && t.cod_sold_amount != null ? Number(t.cod_sold_amount) : '' },
+  { key: 'dealer_payment', label: 'Dealer Payment', get: t => t.trade_type === 'SELL' ? (t.dealer_payment_status || 'Pending') : '' },
+];
+let codTradesVisibleRows = [];
+function exportCodTradesTabExcel() {
+  if (!codTradesVisibleRows.length) { notify('No trade rows to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('codtrades', codTradesVisibleRows, CODTRADES_COLUMNS, 'rewire-dms-cod-purchased-sold.xlsx', 'COD Purchased-Sold');
+}
+
+function renderCodTradesTable(rows) {
+  codTradesVisibleRows = rows || [];
+  const tbody = document.getElementById('tbodyCodTrades');
+  if (!tbody) return;
+  if (!rows || !rows.length) {
+    tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No trade history uploaded yet.</td></tr>';
+    initColumnPicker('codtrades', CODTRADES_COLUMNS, 'codtradesColumnPicker', 'tableCodTrades');
+    return;
+  }
+  tbody.innerHTML = rows.map(t => `<tr>
+    <td data-col="cd_no" style="font-weight:500;">${t.cd_no}</td>
+    <td data-col="vehicle_no">${t.vehicle_number || '—'}</td>
+    <td data-col="dms_lead_no">${t._lead ? t._lead.lead_no : '<span style="color:#dc2626;">Not Matched</span>'}</td>
+    <td data-col="category">${t.category || '—'}</td>
+    <td data-col="category_group">${codCategoryGroup(t)}</td>
+    <td data-col="make">${t.make || '—'}</td>
+    <td data-col="trade_type">${t.trade_type === 'BUY' ? '<span class="badge badge-q">BUY</span>' : (t.trade_type === 'SELL' ? '<span class="badge" style="background:#d1fae5;color:#065f46;">SELL</span>' : (t.trade_type || '—'))}</td>
+    <td data-col="traded_price">${t.traded_price != null && t.traded_price !== '' ? '₹' + Number(t.traded_price).toLocaleString('en-IN') : '—'}</td>
+    <td data-col="trade_date">${t.trade_date ? new Date(t.trade_date).toLocaleString() : '—'}</td>
+    <td data-col="payment_status">${t.payment_status || '—'}</td>
+    <td data-col="utr_no">${t.utr_no || '—'}</td>
+    <td data-col="dealer">${t.dealer ? t.dealer.name : (t.customer_name ? t.customer_name + ' <span style="color:var(--color-text-tertiary);font-size:10.5px;">(Customer)</span>' : '—')}</td>
+    <td data-col="cod_amount">${t.trade_type === 'SELL' && t.cod_sold_amount != null ? '₹' + Number(t.cod_sold_amount).toLocaleString('en-IN') : '—'}</td>
+    <td data-col="dealer_payment">${t.trade_type === 'SELL' ? `<span class="badge ${t.dealer_payment_status === 'Received' ? 'badge-na' : 'badge-l'}">${t.dealer_payment_status || 'Pending'}</span>` : '—'}</td>
+    <td>${t.trade_type === 'SELL' ? `<button class="btn btn-outline" style="font-size:11px;padding:4px 10px;" onclick="openAssignDealerModal('${t.id}','${(t.cd_no || '').replace(/'/g, "\\'")}')">${(t.dealer || t.customer_name) ? 'Edit' : 'Sold to'}</button>` : ''}</td>
+  </tr>`).join('');
+  initColumnPicker('codtrades', CODTRADES_COLUMNS, 'codtradesColumnPicker', 'tableCodTrades');
+}
+
+function filterCodTradesTable(v) {
+  codTradesSearchTerm = (v || '').toLowerCase();
+  const typeFilter = (document.getElementById('ctTradeTypeFilter') || {}).value || '';
+  const dFrom = (document.getElementById('ctDateFrom') || {}).value || '', dTo = (document.getElementById('ctDateTo') || {}).value || '';
+  const istDay = v => new Date(new Date(v).getTime() + 330 * 60000).toISOString().slice(0, 10);
+  const filtered = codTradesCache.filter(t =>
+    (!codTradesSearchTerm || (t.cd_no || '').toLowerCase().includes(codTradesSearchTerm) || (t.vehicle_number || '').toLowerCase().includes(codTradesSearchTerm))
+    && (!typeFilter || t.trade_type === typeFilter)
+    && (!dFrom || (t.trade_date && istDay(t.trade_date) >= dFrom))
+    && (!dTo || (t.trade_date && istDay(t.trade_date) <= dTo)));
+  renderCodTradesTable(filtered);
+}
+
+let codTradesBulkRows = null;
+
+function resetCodTradesBulk() {
+  codTradesBulkRows = null;
+  const fileInput = document.getElementById('ctBulkFile');
+  if (fileInput) fileInput.value = '';
+  document.getElementById('ctBulkPreviewArea').style.display = 'none';
+  const resultsArea = document.getElementById('ctBulkResultsArea');
+  resultsArea.style.display = 'none'; resultsArea.innerHTML = '';
+}
+
+function codTradesBulkFileSelected(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const json = XLSX.utils.sheet_to_json(ws, { defval: '' });
+      if (!json.length) { notify('File has no data rows.', { icon: 'error' }); return; }
+      codTradesBulkRows = json.map(row => ({
+        cd_no: bulkCell(row, ['cd no', 'cod no', 'cd number']),
+        category: bulkCell(row, ['category']),
+        make: bulkCell(row, ['make']),
+        traded_price: bulkCell(row, ['traded price']),
+        trade_type: (bulkCell(row, ['trade type']) || '').toUpperCase(),
+        trade_date_raw: bulkCell(row, ['trade date']),
+        payment_status: bulkCell(row, ['payment status']),
+        utr_no: bulkCell(row, ['utr no', 'utr number']),
+        payout_value: bulkCell(row, ['payout value']),
+      })).filter(r => r.cd_no && r.trade_type);
+      if (!codTradesBulkRows.length) { notify('No rows had both a CD No and a Trade Type — check the file headers match: CD No, Trade Type, Trade Date, Traded Price, Payment Status, UTR No.', { icon: 'error' }); return; }
+      const byKey = new Map();
+      codTradesBulkRows.forEach(r => byKey.set(r.cd_no.toUpperCase() + '|' + r.trade_type, r));
+      const dropped = codTradesBulkRows.length - byKey.size;
+      codTradesBulkRows = Array.from(byKey.values());
+      if (dropped > 0) notify(`${dropped} duplicate CD No + Trade Type row(s) in this file — kept the last entry for each.`, { icon: 'info' });
+      renderCodTradesBulkPreview();
+    } catch (err) {
+      notify('Could not read file: ' + err.message, { icon: 'error' });
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function renderCodTradesBulkPreview() {
+  const area = document.getElementById('ctBulkPreviewArea');
+  if (!codTradesBulkRows || !codTradesBulkRows.length) { area.style.display = 'none'; return; }
+  const cols = ['cd_no', 'category', 'make', 'traded_price', 'trade_type', 'trade_date_raw', 'payment_status', 'utr_no'];
+  document.getElementById('ctBulkPreviewHead').innerHTML = '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+  const show = codTradesBulkRows.slice(0, 100);
+  document.getElementById('ctBulkPreviewBody').innerHTML = show.map(r => '<tr>' + cols.map(c => `<td>${r[c] === null || r[c] === '' ? '—' : r[c]}</td>`).join('') + '</tr>').join('');
+  document.getElementById('ctBulkPreviewCount').textContent = `${codTradesBulkRows.length} row(s) parsed` + (codTradesBulkRows.length > 100 ? ' (showing first 100)' : '');
+  area.style.display = '';
+}
+
+async function runCodTradesBulkUpload() {
+  if (!codTradesBulkRows || !codTradesBulkRows.length) { notify('Upload a file first.', { icon: 'error' }); return; }
+  if (!confirm(`This will upsert ${codTradesBulkRows.length} trade row(s) — existing rows for the same CD No + Trade Type get overwritten with the file's values, missing ones get created. Continue?`)) return;
+
+  const leadsIndex = await buildTraderCodLeadIndex();
+  let matched = 0;
+  const rows = codTradesBulkRows.map(r => {
+    const leadMatch = matchCodTradeVehicle(r.cd_no, leadsIndex);
+    if (leadMatch) matched++;
+    return {
+      cd_no: r.cd_no,
+      vehicle_number: leadMatch ? leadMatch.val_vehicle_number : (codVehicleOf({ cd_no: r.cd_no }) || null),
+      lead_id: leadMatch ? leadMatch.id : null,
+      category: r.category || null,
+      make: r.make || null,
+      traded_price: r.traded_price ? Number(String(r.traded_price).replace(/[^0-9.]/g, '')) || null : null,
+      trade_type: r.trade_type,
+      trade_date: parseTradeDateTime(r.trade_date_raw),
+      payment_status: r.payment_status || null,
+      utr_no: r.utr_no || null,
+      payout_value: r.payout_value ? Number(String(r.payout_value).replace(/[^0-9.]/g, '')) || null : null,
+      uploaded_by: currentProfile.id,
+      uploaded_at: new Date().toISOString(),
+    };
+  });
+
+  let success = 0; const failed = [];
+  const chunkSize = 300;
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    const { error } = await sb.from('rewire_cod_trades').upsert(chunk, { onConflict: 'cd_no,trade_type' });
+    if (error) chunk.forEach(r => failed.push({ key: r.cd_no, error: error.message }));
+    else success += chunk.length;
+  }
+
+  const resultsArea = document.getElementById('ctBulkResultsArea');
+  resultsArea.style.display = '';
+  resultsArea.innerHTML = `<div class="info-banner" style="${failed.length ? 'background:#fef2f2;border-color:#fecaca;' : ''}">
+    <i class="ti ${failed.length ? 'ti-alert-triangle' : 'ti-circle-check'}" aria-hidden="true"></i>
+    <span><strong>${success}</strong> row(s) uploaded — <strong>${matched}</strong> matched to a Trader-COD lead by vehicle number.${failed.length ? ` <strong style="color:#dc2626;">${failed.length} failed</strong> — ${failed.slice(0, 5).map(f => f.key + ': ' + f.error).join('; ')}` : ''}</span>
+  </div>`;
+  notify(`Trade History upload: ${success} row(s) saved, ${matched} matched.` + (failed.length ? ` ${failed.length} failed.` : ''));
+  codTradesSummaryCache = null;
+  if (typeof renderCodTradesSection === 'function') renderCodTradesSection();
+}
+
+let codTradesSummaryCache = null;
+async function renderCodTradesSummaryWidget(targetId) {
+  const el = document.getElementById(targetId);
+  if (!el) return;
+
+  const leadsIndex = await buildTraderCodLeadIndex();
+  if (!codTradesSummaryCache) {
+    codTradesSummaryCache = await fetchAllRows((from, to) => sb.from('rewire_cod_trades')
+      .select('cd_no, vehicle_number, lead_id, trade_type, trade_date').range(from, to))
+      .catch(err => { console.error(err); return []; });
+  }
+  const trades = codTradesSummaryCache;
+
+  const buys = (trades || []).filter(t => t.trade_type === 'BUY');
+  const sells = (trades || []).filter(t => t.trade_type === 'SELL');
+  const purchasedLeadIds = new Set(buys.map(t => t.lead_id).filter(Boolean));
+  const buyKeys = new Set(buys.map(codVehicleOf).filter(Boolean));
+  const sellKeys = new Set(sells.map(codVehicleOf).filter(Boolean));
+  const total = leadsIndex.length;
+  const purchased = buyKeys.size;
+  const sold = sellKeys.size;
+  const pending = leadsIndex.filter(l => !purchasedLeadIds.has(l.id)).length;
+  const stock = Array.from(buyKeys).filter(k => !sellKeys.has(k)).length;
+
+  const tradeMonthLabel = (dateStr) => {
+    if (!dateStr) return 'Unknown';
+    const d = new Date(dateStr);
+    return isNaN(d) ? 'Unknown' : d.toLocaleDateString('en-IN', { month: 'short', year: '2-digit' });
+  };
+  const byMonth = {};
+  (trades || []).forEach(t => {
+    const m = tradeMonthLabel(t.trade_date);
+    byMonth[m] = byMonth[m] || { buy: 0, sell: 0 };
+    if (t.trade_type === 'BUY') byMonth[m].buy++;
+    else if (t.trade_type === 'SELL') byMonth[m].sell++;
+  });
+  const months = Object.keys(byMonth).filter(m => m !== 'Unknown').sort((a, b) => new Date('1 ' + a) - new Date('1 ' + b));
+  if (byMonth['Unknown']) months.push('Unknown');
+
+  const kpiCard = (label, value, bg, fg, onclick) => `<div ${onclick ? `style="cursor:pointer;" onclick="${onclick}"` : ''}>
+    <div style="background:${bg};border-radius:8px;padding:10px 12px;text-align:center;">
+      <div style="font-size:9.5px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.04em;font-weight:600;">${label}</div>
+      <div style="font-size:19px;font-weight:700;margin-top:2px;color:${fg};">${value}</div>
+    </div>
+  </div>`;
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;">
+      ${kpiCard('Trader-COD Leads', total, '#f1f5f9', '#0f172a')}
+      ${kpiCard('COD Purchased', purchased, '#dbeafe', '#2563eb', `document.getElementById('ctTradeTypeFilter').value='BUY';showSection('codcvs');showCodCvsTab('trades');`)}
+      ${kpiCard('Sold', sold, '#ecfdf5', '#059669', `document.getElementById('ctTradeTypeFilter').value='SELL';showSection('codcvs');showCodCvsTab('trades');`)}
+      ${kpiCard('Purchase Pending', pending, '#fef2f2', '#dc2626')}
+      ${kpiCard('COD Stock', stock, '#f5f3ff', '#7c3aed')}
+    </div>
+    ${months.length ? `<table class="crm-table" style="margin-bottom:0;">
+      <thead><tr style="background:#dbeafe;"><th style="font-weight:700;">Month</th><th style="font-weight:700;">Trades Bought (BUY)</th><th style="font-weight:700;">Trades Sold (SELL)</th></tr></thead>
+      <tbody>${months.map(m => `<tr><td>${m}</td><td>${byMonth[m].buy}</td><td>${byMonth[m].sell}</td></tr>`).join('')}</tbody>
+    </table>` : '<div style="text-align:center;color:var(--color-text-tertiary);padding:12px;">No trade history uploaded yet.</div>'}
+  `;
+}
+
+</script>

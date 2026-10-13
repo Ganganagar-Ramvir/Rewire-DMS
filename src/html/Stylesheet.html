@@ -1,0 +1,661 @@
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:var(--font-sans, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);background:var(--color-background-tertiary,#f8fafc);font-size:13px;color:var(--color-text-primary,#111827);}
+
+/* height:100% + overflow:hidden here (was min-height:100vh, no overflow
+   control) is the actual fix for "top nav bar doesn't stay fixed on
+   Dashboard/Leads/Partners/Reports/Settings": with min-height, if ANY
+   nested flex child's content grew taller than the viewport — a flexbox
+   default (children refuse to shrink below their content size unless
+   min-height:0 is set at every level) — the whole page grew past 100vh and
+   the BROWSER scrolled the page itself, taking the topbar and sidebar with
+   it. Those 5 sections just happened to be the ones whose content was most
+   likely to run long. Locking html/body/crm-shell to the viewport height
+   and adding min-height:0 down the flex chain below forces ALL scrolling
+   to happen inside each section's own .table-area instead, where it was
+   always meant to. .topbar keeps position:sticky too as a second line of
+   defense in case some future section still leaks past this. */
+html,body{height:100%;overflow:hidden;}
+.crm-shell{display:flex;flex-direction:column;height:100vh;overflow:hidden;}
+
+.topbar{background:linear-gradient(135deg,#111827 0%,#1e1b4b 100%);height:50px;display:flex;align-items:center;padding:0 20px;gap:16px;flex-shrink:0;position:sticky;top:0;z-index:100;box-shadow:0 1px 3px rgba(0,0,0,0.15);}
+.topbar-brand{display:flex;align-items:center;gap:8px;color:#fff;font-size:14px;font-weight:600;letter-spacing:-0.01em;}
+.topbar-brand .dot{width:8px;height:8px;background:#60a5fa;border-radius:50%;box-shadow:0 0 8px rgba(96,165,250,0.6);}
+.topbar-search{flex:1;max-width:320px;position:relative;}
+.topbar-search input{width:100%;background:rgba(255,255,255,0.08);border:0.5px solid rgba(255,255,255,0.15);border-radius:7px;padding:6px 10px 6px 32px;color:#e5e7eb;font-size:12px;outline:none;}
+.topbar-search input::placeholder{color:rgba(255,255,255,0.35);}
+.topbar-search i{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:rgba(255,255,255,0.4);font-size:14px;}
+.topbar-user{margin-left:auto;display:flex;align-items:center;gap:8px;}
+.avatar{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#60a5fa);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#fff;box-shadow:0 2px 6px rgba(37,99,235,0.4);}
+.topbar-user span{color:#cbd5e1;font-size:12px;}
+
+.main-layout{display:flex;flex:1;min-height:0;}
+/* min-height:0 on every flex level down to .table-area is what actually
+   lets overflow:auto/hidden take effect below instead of the page growing
+   past the viewport — see the .crm-shell comment above. Targets every
+   section by its id prefix instead of editing each one's inline style in
+   Sections.html individually. */
+.page-body>div[id^="section-"]{min-height:0;}
+
+/* Wraps .sidebar so the hover-to-reveal behaviour below (desktop, sidebar
+   hidden) has a hoverable strip to attach to — display:contents means the
+   wrapper itself takes no part in .main-layout's flex box, so .sidebar
+   still lays out exactly as if this wrapper weren't there at all whenever
+   it's NOT overridden by the sidebar-hidden rules further down. */
+.sidebar-hover-zone{display:contents;}
+
+/* "Indigo Pro" palette refresh — the sidebar used to be a plain slate
+   (#1e293b) sitting right below a dark indigo-tinted topbar gradient
+   (#111827→#1e1b4b), so the two dark "chrome" surfaces never quite matched
+   and the active nav item used a leftover blue (#3b82f6/#60a5fa) instead
+   of the indigo (#1d4ed8) used for every button/tab/badge elsewhere in the
+   app. Both are unified here: sidebar now matches the topbar's darker
+   gradient stop for one continuous dark shell, and every "selected/active"
+   state (nav item, tabs, buttons, badges) shares the same indigo family. */
+.sidebar{width:212px;background:#111827;border-right:none;flex-shrink:0;padding:14px 0;overflow-y:auto;}
+.sidebar-section{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;padding:10px 16px 5px;margin-top:8px;font-weight:700;}
+.sidebar-item{display:flex;align-items:center;gap:9px;padding:9px 16px;font-size:13px;color:#94a3b8;cursor:pointer;border-left:3px solid transparent;transition:all .15s;}
+.sidebar-item:hover{background:rgba(255,255,255,0.06);color:#e2e8f0;}
+.sidebar-item.active{background:rgba(37,99,235,0.18);color:#bfdbfe;border-left-color:#2563eb;font-weight:600;}
+.sidebar-item i{font-size:16px;}
+.sidebar-badge{margin-left:auto;background:#1d4ed8;color:#fff;border-radius:10px;padding:1px 7px;font-size:10px;font-weight:700;min-width:20px;text-align:center;}
+.sidebar-badge.blue{background:#1d4ed8;color:#fff;}
+/* Collapsible sidebar accordion groups (Ramvir, Sept 2026) — Operations/
+   Payments/Compliance/Inventory headers toggle their items so the sidebar
+   doesn't look permanently "bhara hua" with every group expanded at once.
+   See toggleSidebarGroup()/initSidebarGroups() in JS-Wiring.html. */
+/* Ramvir, Sept 2026 — first pass just recolored the plain .sidebar-section
+   label and added a tiny caret, but next to the flat (non-collapsible)
+   Main/Pipeline/Settings headers it didn't read as clickable at all ("tab
+   hi nahi lag raha"). Now styled as its own pill/button — background,
+   padding, rounded corners, border, bigger caret — so it visually reads as
+   a toggle control, not just another section label. */
+.sidebar-section-collapsible{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none;margin:12px 10px 6px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.06);border:0.5px solid rgba(255,255,255,0.09);color:#cbd5e1;font-size:11px;}
+.sidebar-section-collapsible:hover{background:rgba(255,255,255,0.12);color:#fff;border-color:rgba(255,255,255,0.16);}
+.sidebar-caret{font-size:15px!important;color:#60a5fa;transition:transform .18s ease;}
+.sidebar-section-collapsible.is-collapsed .sidebar-caret{transform:rotate(-90deg);}
+.sidebar-group-items{max-height:1200px;overflow:hidden;transition:max-height .22s ease;}
+.sidebar-group-items.collapsed{max-height:0;}
+
+.page-body{flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0;}
+
+.page-header{background:var(--color-background-primary,#fff);border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);padding:16px 20px;display:flex;align-items:center;justify-content:space-between;}
+.page-header h1{font-size:17px;font-weight:600;color:var(--color-text-primary,#111827);letter-spacing:-0.01em;}
+.page-header .breadcrumb{font-size:11px;color:var(--color-text-tertiary,#9ca3af);margin-top:2px;}
+.header-actions{display:flex;gap:8px;}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 13px;border-radius:7px;font-size:12px;font-weight:500;cursor:pointer;border:0.5px solid var(--color-border-secondary,#e5e7eb);background:var(--color-background-primary,#fff);color:var(--color-text-primary,#111827);box-shadow:0 1px 2px rgba(15,23,42,0.04);transition:all .12s;}
+.btn:hover{background:var(--color-background-secondary,#f8fafc);box-shadow:0 2px 6px rgba(15,23,42,0.08);}
+.btn-primary{background:#1d4ed8;color:#fff;border-color:#1d4ed8;box-shadow:0 2px 6px rgba(29,78,216,0.28);}
+.btn-primary:hover{background:#1e40af;box-shadow:0 4px 10px rgba(29,78,216,0.35);transform:translateY(-0.5px);}
+/* .btn-outline was used across the app (Filter buttons, View Archive,
+   etc.) but never actually had its own rule — it silently fell back to
+   plain .btn. Giving it a real colored-outline treatment now: transparent
+   background, indigo border+text (matching .btn-primary's brand color),
+   filling in lightly on hover. Used for the Payments (Pending/Hold/To be
+   Sent for Payment/Pending UTR/Archive) tab buttons so the inactive ones
+   read as colored buttons, not plain text tabs. */
+.btn-outline{background:transparent;border-color:#bfdbfe;color:#1d4ed8;box-shadow:none;}
+.btn-outline:hover{background:#dbeafe;border-color:#1d4ed8;box-shadow:none;}
+
+.pipeline-bar{background:var(--color-background-primary,#fff);border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);padding:0 20px;display:flex;gap:0;overflow-x:auto;}
+.pipeline-stage{display:flex;flex-direction:column;align-items:center;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;gap:3px;position:relative;}
+
+.table-area{flex:1;overflow:auto;padding:16px 20px;min-height:0;}
+/* Boxed-grid frame — every data table AND every lead-cards-grid (All
+   Leads / Qualified Pipeline — same idea, just cards instead of table
+   rows) now sits inside a single visible border/rounded-corner "box"
+   (like Odoo/other CRM list views: header row frozen, first column
+   frozen, all of it staying inside that one frame no matter which
+   direction you scroll), instead of floating directly on the page
+   background with no visible container. Scoped with :has() to ONLY
+   sections that actually hold a table.crm-table or a .lead-cards-grid —
+   .table-area is reused as a plain scrollable wrapper on other non-list
+   sections too (Dashboard, Partners' card grid, etc.), which shouldn't
+   get this treatment. overflow:auto (already set above) clips its
+   content to this border-radius on its own — no extra wrapper element
+   needed, and no conflict with the sticky thead/frozen-column
+   positioning below, since .table-area remains their nearest scrolling
+   ancestor exactly as before. */
+.table-area:has(table.crm-table),.table-area:has(.lead-cards-grid){border:1px solid var(--color-border-tertiary,#e5e7eb);border-radius:10px;background:var(--color-background-primary,#fff);padding:0;}
+/* The box's own border above is now the ONE visible frame — the table's
+   own border/radius/shadow would otherwise sit as a redundant second
+   border just inside it. Left/right/bottom padding is gone too (was 20px/
+   16px), so the toolbar row and the grid both now run edge-to-edge inside
+   the box, flush against page-header above (no gap) instead of floating
+   with whitespace around it. */
+.table-area:has(table.crm-table) table.crm-table{border:none;box-shadow:none;}
+/* .lead-cards-grid itself still has 16px/20px worth of breathing room
+   around the cards (the box's own border shouldn't touch the cards
+   directly) — restored here since the parent .table-area's own padding
+   was just zeroed out above. */
+.table-area:has(.lead-cards-grid) .lead-cards-grid{padding:16px 20px;}
+.table-area:has(.lead-cards-grid) .pagi-row{padding:0 20px 16px;}
+
+.filter-row{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;}
+/* When a filter-row sits directly inside .table-area (Purchased, Commission,
+   Omini Pay, Accessories, Logistics, RC Tracking, Crane Charges, COD/CVS,
+   Closed Lost, Partners, All Leads, Qualified Pipeline, etc. — everything
+   except Payments, whose filter row already lives outside .table-area in
+   .tabs-filter-row and so never scrolls at all), it used to scroll away
+   with the rest of the body content, leaving only the sticky thead (on a
+   table) behind, or nothing at all (on a lead-cards-grid). Pinning it at
+   top:0 handles the vertical axis. left:0 is the other half — without it,
+   a sticky element only stays put on the axis it has an offset for; on
+   the LEFT axis it was still plain static/in-flow, so once a wide table
+   got scrolled horizontally, this row (search/date/Filter/Clear/count)
+   scrolled off to the left right along with it — which is also why its
+   own background stopped actually covering the table underneath once
+   scrolled past the row's own on-screen width, instead of reaching all
+   the way to wherever the columns currently are. With both axes pinned,
+   it now always stays exactly aligned with the visible viewport, however
+   far you scroll in either direction. */
+.table-area>.filter-row{position:sticky;top:0;left:0;z-index:5;background:#f8fafc;margin-bottom:0;padding-bottom:12px;}
+/* Boxed sections (table OR lead-cards-grid) specifically: .table-area
+   itself has no padding anymore (see above), so this row needs its own
+   edge-to-edge padding plus a border to read as a toolbar strip flush
+   against the box's top and sides. */
+.table-area:has(table.crm-table)>.filter-row,.table-area:has(.lead-cards-grid)>.filter-row{padding:14px 20px;border-bottom:1px solid var(--color-border-tertiary,#e5e7eb);}
+.search-field{position:relative;flex:1;min-width:180px;max-width:280px;}
+.search-field input{width:100%;border:0.5px solid var(--color-border-secondary,#e5e7eb);border-radius:6px;padding:7px 10px 7px 30px;font-size:12px;background:var(--color-background-primary,#fff);color:var(--color-text-primary,#0f172a);outline:none;transition:border-color .12s,box-shadow .12s;}
+.search-field input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,0.12);}
+.search-field i{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--color-text-tertiary,#9ca3af);font-size:14px;}
+.filter-select{border:0.5px solid var(--color-border-secondary,#e5e7eb);border-radius:6px;padding:6px 10px;font-size:12px;background:var(--color-background-primary,#fff);color:var(--color-text-primary,#0f172a);outline:none;cursor:pointer;transition:border-color .12s,box-shadow .12s;}
+.filter-select:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,0.12);}
+.filter-count{font-size:11px;color:var(--color-text-tertiary,#9ca3af);margin-left:auto;}
+
+/* overflow:hidden was removed from .crm-table itself — a sticky thead (see
+   below) needs its OWN ancestor chain to actually scroll and clip, and
+   overflow:hidden directly on the table element clips sticky cells' visual
+   "stuck" position too, since they'd be positioned relative to a container
+   that immediately hides anything outside its own (unscrolled) box. The
+   rounded corners this used to provide come from .table-area's own
+   scroll box now; visually identical when not scrolled. */
+/* border-collapse:separate (was collapse) + border-spacing:0 — this is the
+   actual fix for "a data row shows through above the sticky search/filter
+   bar": border-collapse:collapse combined with position:sticky on table
+   cells (thead th for the sticky header, td.frozen-col for frozen columns)
+   is a well-documented browser rendering bug — collapsed table cells share
+   a single border/stacking model that sticky positioning doesn't compose
+   with reliably, so a scrolled row can paint in the wrong stacking order
+   and appear to "float" above content that should be covering it.
+   border-collapse:separate gives every cell its own independent box, which
+   sticky positioning handles correctly. border-spacing:0 keeps cells
+   touching so this is visually identical to collapsed borders. */
+.crm-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--color-background-primary,#fff);border:0.5px solid var(--color-border-tertiary,#e5e7eb);border-radius:9px;font-size:12px;box-shadow:0 1px 2px rgba(0,0,0,0.03);}
+.crm-table thead tr{background:#dbeafe;border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);}
+/* Sticky header — stays pinned at the top of .table-area's scroll box (or
+   the horizontal-scroll wrapper's ancestor, for Purchased) while scrolling
+   down through a long table, instead of scrolling out of view. z-index:2 so
+   it renders above normal body cells; frozen-column cells (below) go
+   higher still since they're stuck in both directions at once. */
+.crm-table th{position:sticky;top:0;background:#dbeafe;padding:9px 12px;text-align:left;font-size:10px;font-weight:500;color:var(--color-text-secondary,#475569);text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;z-index:2;box-shadow:0 0.5px 0 var(--color-border-tertiary,#e5e7eb);}
+/* border-radius on <table> only clips the table's own outer border paint —
+   it does NOT clip child cell backgrounds (a table doesn't establish a
+   clipping context for its cells the way overflow:hidden containers do).
+   With overflow:hidden removed from .crm-table above (needed for sticky
+   headers/columns to work), the header row's #dbeafe background would
+   otherwise show hard square corners poking out past the table's rounded
+   top corners instead of following them — this restores that rounding
+   directly on the corner cells themselves, which sticky positioning
+   doesn't interfere with. */
+.crm-table thead tr:first-child th:first-child{border-top-left-radius:8px;}
+.crm-table thead tr:first-child th:last-child{border-top-right-radius:8px;}
+.crm-table td{padding:10px 12px;border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);vertical-align:middle;white-space:nowrap;color:var(--color-text-primary,#0f172a);}
+.crm-table tr:last-child td{border-bottom:none;}
+.crm-table tbody tr:last-child td:first-child{border-bottom-left-radius:8px;}
+.crm-table tbody tr:last-child td:last-child{border-bottom-right-radius:8px;}
+.crm-table tbody tr:hover td{background:var(--color-background-secondary,#f8fafc);}
+/* Frozen first columns (Lead No. / Customer, detected per-table by
+   JS-Core.html's wireStickyColumns()) — pinned while scrolling a wide
+   table horizontally, so it's always clear whose row you're looking at.
+   Explicit backgrounds (not "inherit") because a sticky cell needs an
+   OPAQUE background or the scrolling columns behind it show through. */
+.crm-table td.frozen-col{position:sticky;background:var(--color-background-primary,#fff);z-index:1;}
+.crm-table thead th.frozen-col{z-index:3;}
+.crm-table tbody tr:hover td.frozen-col{background:var(--color-background-secondary,#f8fafc);}
+.crm-table td.frozen-col-last,.crm-table th.frozen-col-last{box-shadow:2px 0 4px -2px rgba(0,0,0,0.15);}
+.crm-table td .lid{font-family:'Courier New',monospace;font-weight:700;color:#1d4ed8;font-size:11px;background:#dbeafe;padding:2px 7px;border-radius:5px;}
+
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:20px;font-size:10px;font-weight:500;white-space:nowrap;}
+.badge::before{content:'';width:5px;height:5px;border-radius:50%;}
+.badge-na{background:#ede9fe;color:#5b21b6;} .badge-na::before{background:#7c3aed;}
+.badge-q{background:#d1fae5;color:#065f46;} .badge-q::before{background:#059669;}
+.badge-l{background:#fee2e2;color:#991b1b;} .badge-l::before{background:#dc2626;}
+.badge-pn{background:#fef3c7;color:#92400e;} .badge-pn::before{background:#d97706;}
+.badge-bk{background:#dbeafe;color:#1e40af;} .badge-bk::before{background:#2563eb;}
+.badge-gm{background:#f3e8ff;color:#6d28d9;} .badge-gm::before{background:#9333ea;}
+.badge-ap{background:#d1fae5;color:#065f46;} .badge-ap::before{background:#16a34a;}
+
+.action-btns{display:flex;gap:4px;align-items:center;}
+.ab{display:inline-flex;align-items:center;gap:3px;padding:4px 8px;border-radius:4px;font-size:11px;cursor:pointer;border:none;font-weight:500;white-space:nowrap;}
+.ab-edit{background:#fef3c7;color:#92400e;}
+.ab-edit:hover{background:#fde68a;}
+.ab-form{background:#dbeafe;color:#1e40af;}
+.ab-form:hover{background:#bfdbfe;}
+.ab-view{background:transparent;color:#1d4ed8;border:0.5px solid #93c5fd !important;padding:3px 7px;}
+.ab-view:hover{background:#dbeafe;}
+
+.partner-cell{display:flex;align-items:center;gap:6px;}
+.partner-name{font-size:11px;color:var(--color-text-primary,#0f172a);}
+.partner-phone{font-size:10px;color:var(--color-text-tertiary,#9ca3af);}
+
+.pagi-row{display:flex;align-items:center;justify-content:space-between;margin-top:12px;padding:0 20px 14px;}
+.pagi-info{font-size:11px;color:var(--color-text-tertiary,#9ca3af);}
+.pagi-btns{display:flex;gap:4px;}
+.pb{border:0.5px solid var(--color-border-secondary,#e5e7eb);background:var(--color-background-primary,#fff);border-radius:4px;padding:4px 9px;font-size:11px;cursor:pointer;color:var(--color-text-primary,#0f172a);}
+.pb.active{background:#1d4ed8;color:#fff;border-color:#1d4ed8;}
+
+.tabs-row{display:flex;gap:0;border-bottom:1px solid var(--color-border-tertiary,#e5e7eb);background:var(--color-background-primary,#fff);padding:0 20px;margin-bottom:0;}
+/* Payments' tabs-rows get this extra class to sit right-aligned (under the
+   header-actions buttons, "the other side" from the default left-aligned
+   layout every other tabs-row uses) — scoped to Payments only since
+   tabs-row is shared with Leads/Omini Pay/Commission, which weren't asked
+   to move. */
+.tabs-row-end{justify-content:flex-end;}
+/* border-bottom was 2px solid transparent + margin-bottom:-0.5px, matched
+   against the row's old 0.5px border above. Sub-pixel widths (0.5px) round
+   differently per browser/zoom/device-pixel-ratio, so the active tab's
+   underline sometimes landed exactly over the row's border (looked fine)
+   and sometimes one device-pixel off (showed as a faint double line or a
+   gap) — "underline kabhi kaam karti hai kabhi nahi". Using whole-pixel
+   values on both (1px row border, -1px margin) makes the overlap exact and
+   consistent everywhere. */
+.tab{padding:10px 16px;font-size:12px;font-weight:500;color:var(--color-text-secondary,#475569);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;}
+.tab:hover{color:var(--color-text-primary,#0f172a);}
+.tab.active{color:#1d4ed8;border-bottom-color:#1d4ed8;}
+
+/* Boxed/outlined variant (Ramvir, Sept 2026) — Dashboard's own 3 main tabs
+   (Overview/Purchases/PE-Team-Performance) weren't reading as clickable
+   tabs with just the plain underline style above, so this gives each one
+   a visible outer border/pill instead. Scoped to .tabs-row-boxed only —
+   the shared .tab/.tabs-row underline style stays exactly as-is everywhere
+   else (Settings sub-tabs, Purchases-pane category tabs, etc.). */
+.tabs-row-boxed{border-bottom:none;gap:8px;padding:0 20px;}
+/* Ramvir, Sept 2026 — inactive boxed tabs were plain white-on-white
+   against the page background, so they didn't read as clickable tabs at
+   all ("pata hi nahi lagta sub tab hai"). Inactive tabs now get a visible
+   light-gray fill + a slightly darker border so every tab looks like a
+   distinct button whether active or not; the active one still stands out
+   clearly via the indigo fill/border/shadow below. */
+.tabs-row-boxed .tab{border:1px solid var(--color-border-secondary,#cbd5e1);border-radius:8px;margin-bottom:0;background:var(--color-background-secondary,#f1f5f9);color:var(--color-text-secondary,#475569);font-weight:600;transition:background .12s,border-color .12s,color .12s;}
+.tabs-row-boxed .tab:hover{border-color:#93c5fd;background:#dbeafe;color:#1d4ed8;}
+.tabs-row-boxed .tab.active{background:#1d4ed8;border-color:#1d4ed8;color:#fff;box-shadow:0 2px 6px rgba(29,78,216,0.3);}
+
+/* Payments: tabs + Search/Date/Filter/Clear merged into ONE row instead of
+   a tabs strip with a separate filter-row stacked below it — filter
+   controls on the left, tabs on the right, both bottom-aligned so the
+   tabs' underline still sits exactly on this row's own border (same trick
+   as .tabs-row above), while the filter controls float slightly above it
+   with their own small bottom margin. */
+.tabs-filter-row{display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:12px 20px;padding:10px 20px 0;background:#f8fafc;border-bottom:1px solid var(--color-border-tertiary,#e5e7eb);}
+.tabs-filter-row .filter-row{margin:0 0 8px;flex:1;min-width:260px;}
+.tabs-inline{display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0;}
+
+.stage-path{display:flex;align-items:center;flex-wrap:wrap;row-gap:8px;padding:12px 20px;background:linear-gradient(180deg,#f8fafc,#f1f5f9);border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);gap:0;flex-shrink:0;}
+.sp-item{display:flex;align-items:center;gap:0;flex-wrap:wrap;}
+.sp-step{display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:20px;font-size:11px;color:var(--color-text-secondary,#4b5569);cursor:pointer;white-space:nowrap;border:1px solid transparent;transition:all .15s;font-weight:500;}
+.sp-step:hover{background:#fff;border-color:#e5e7eb;}
+.sp-step.active{background:#1d4ed8;color:#fff;font-weight:600;box-shadow:0 2px 8px rgba(29,78,216,0.35);}
+.sp-step.active i{color:#fff;}
+.sp-step.done{color:#059669;background:#ecfdf5;border-color:#a7f3d0;}
+.sp-step.done i{color:#059669;}
+.sp-arrow{color:var(--color-text-tertiary,#cbd5e1);font-size:14px;margin:0 3px;}
+.sp-step i{font-size:14px;}
+/* Step-number badge — visual order 1..11 across the whole stepper (incl.
+   the parallel Payment Release step and the RC Send shortcut at the end),
+   so users can always tell "which step number" they're looking at, per
+   request. */
+.sp-num{display:inline-flex;align-items:center;justify-content:center;min-width:15px;height:15px;padding:0 3px;border-radius:50%;background:#e2e8f0;color:#475569;font-size:9px;font-weight:700;flex-shrink:0;}
+.sp-step.active .sp-num{background:rgba(255,255,255,.28);color:#fff;}
+.sp-step.done .sp-num{background:#a7f3d0;color:#065f46;}
+
+.empty-state{text-align:center;padding:40px 20px;color:var(--color-text-tertiary,#9ca3af);}
+.empty-state i{font-size:32px;margin-bottom:8px;display:block;}
+
+.tab-pane{display:none;flex:1;overflow:hidden;flex-direction:column;}
+.tab-pane.active{display:flex;}
+
+/* MODALS */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:flex-start;justify-content:center;padding:24px 16px;z-index:1000;overflow-y:auto;}
+.modal{background:var(--color-background-primary,#fff);border-radius:var(--border-radius-lg,14px);width:700px;max-width:100%;border:0.5px solid var(--color-border-tertiary,#e5e7eb);overflow:hidden;margin-bottom:24px;box-shadow:0 20px 40px -12px rgba(15,23,42,0.25);}
+.modal.md{width:520px;}
+.modal-hdr{padding:16px 20px;border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);display:flex;align-items:center;justify-content:space-between;}
+.modal-title{display:flex;align-items:center;gap:10px;}
+.modal-icon{width:32px;height:32px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:16px;}
+.mi-blue{background:#dbeafe;color:#1d4ed8;}
+.mi-green{background:#d1fae5;color:#059669;}
+.mi-amber{background:#fef3c7;color:#d97706;}
+.mi-purple{background:#ede9fe;color:#7c3aed;}
+.mi-slate{background:var(--color-background-secondary,#f8fafc);color:var(--color-text-secondary,#475569);}
+.mi-pink{background:#fce7f3;color:#be185d;}
+.modal-title h2{font-size:14px;font-weight:500;}
+.modal-title .modal-sub{font-size:11px;color:var(--color-text-tertiary,#9ca3af);margin-top:1px;}
+.modal-close{background:none;border:none;cursor:pointer;color:var(--color-text-secondary,#475569);padding:4px;border-radius:4px;display:flex;align-items:center;}
+.modal-close:hover{background:var(--color-background-secondary,#f8fafc);}
+.modal-body{padding:20px;max-height:65vh;overflow-y:auto;}
+.modal-footer{padding:14px 20px;border-top:0.5px solid var(--color-border-tertiary,#e5e7eb);display:flex;justify-content:flex-end;gap:8px;align-items:center;}
+
+.form-section{margin-bottom:20px;}
+.form-section-label{font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.08em;color:var(--color-text-tertiary,#9ca3af);padding-bottom:8px;border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);margin-bottom:12px;}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px;}
+.form-grid.cols3{grid-template-columns:1fr 1fr 1fr;}
+.fg-full{grid-column:1/-1;}
+.form-field{display:flex;flex-direction:column;gap:4px;}
+.form-field label{font-size:11px;font-weight:500;color:var(--color-text-secondary,#475569);}
+.form-field label .req{color:#dc2626;margin-left:2px;font-size:10px;opacity:.75;}
+.form-field input,.form-field select,.form-field textarea{border:0.5px solid var(--color-border-secondary,#e5e7eb);border-radius:6px;padding:7px 10px;font-size:12px;color:var(--color-text-primary,#0f172a);outline:none;background:var(--color-background-primary,#fff);width:100%;font-family:inherit;}
+.form-field input:focus,.form-field select:focus,.form-field textarea:focus{border-color:#2563eb;box-shadow:0 0 0 2px rgba(59,130,246,0.12);}
+.form-field input[readonly],.form-field input:disabled,.form-field select:disabled,.form-field textarea:disabled,
+.form-field select[readonly],.form-field textarea[readonly]{background:#e5e7eb !important;color:#6b7280 !important;cursor:not-allowed;border-color:#d1d5db !important;}
+.form-hint{font-size:10px;color:var(--color-text-tertiary,#9ca3af);}
+.upload-field-input{border:0.5px dashed var(--color-border-secondary,#e5e7eb);border-radius:6px;padding:8px;font-size:11px;background:var(--color-background-secondary,#f8fafc);width:100%;color:var(--color-text-tertiary,#9ca3af);}
+/* Style the browser's native file-picker button so it matches the app's
+   outline buttons instead of the default OS-styled grey button — this is
+   what made upload fields look out of place next to the sleek text/select
+   inputs. Covers both the modern standard property and the older WebKit-
+   prefixed one (Chrome/Edge/Safari all need the prefixed version too). */
+.upload-field-input::file-selector-button,
+.upload-field-input::-webkit-file-upload-button{
+  border:0.5px solid var(--color-border-secondary,#e5e7eb);border-radius:5px;
+  padding:5px 10px;font-size:11px;font-family:inherit;font-weight:500;
+  background:var(--color-background-primary,#fff);color:var(--color-text-secondary,#475569);
+  margin-right:8px;cursor:pointer;
+}
+.upload-field-input::file-selector-button:hover,
+.upload-field-input::-webkit-file-upload-button:hover{background:var(--color-background-secondary,#f8fafc);}
+
+.partner-search-wrap{position:relative;}
+.ps-input-row{border:0.5px solid var(--color-border-secondary,#e5e7eb);border-radius:6px;padding:6px 10px;display:flex;align-items:center;gap:6px;background:var(--color-background-primary,#fff);cursor:pointer;}
+.ps-input-row:focus-within{border-color:#2563eb;box-shadow:0 0 0 2px rgba(59,130,246,0.12);}
+.ps-input-row input{border:none;outline:none;font-size:12px;flex:1;background:transparent;color:var(--color-text-primary,#0f172a);}
+.ps-input-row i{color:var(--color-text-tertiary,#9ca3af);font-size:14px;}
+.ps-dropdown{position:absolute;top:calc(100% + 3px);left:0;right:0;background:var(--color-background-primary,#fff);border:0.5px solid var(--color-border-secondary,#e5e7eb);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.1);z-index:100;overflow:hidden;display:none;}
+.ps-dropdown.open{display:block;}
+.ps-list{max-height:160px;overflow-y:auto;}
+.ps-item{padding:8px 12px;cursor:pointer;display:flex;align-items:center;gap:10px;}
+.ps-item:hover{background:var(--color-background-secondary,#f8fafc);}
+.ps-item-avatar{width:28px;height:28px;border-radius:50%;background:var(--color-background-info,#dbeafe);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:500;color:var(--color-text-info,#1d4ed8);flex-shrink:0;}
+.ps-item-name{font-size:12px;font-weight:500;color:var(--color-text-primary,#0f172a);}
+.ps-item-phone{font-size:11px;color:var(--color-text-tertiary,#9ca3af);}
+.ps-item-loc{font-size:10px;color:var(--color-text-tertiary,#9ca3af);margin-left:auto;display:flex;align-items:center;gap:2px;}
+.ps-add{padding:9px 12px;border-top:0.5px solid var(--color-border-tertiary,#e5e7eb);display:flex;align-items:center;gap:6px;cursor:pointer;color:#1d4ed8;font-size:12px;font-weight:500;}
+.ps-add:hover{background:var(--color-background-secondary,#f8fafc);}
+
+.status-dep{display:none;}
+.status-dep.show{display:flex;}
+
+.info-banner{background:var(--color-background-info,#dbeafe);border:0.5px solid var(--color-border-info,#bfdbfe);border-radius:6px;padding:10px 12px;display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--color-text-info,#1d4ed8);margin-top:12px;}
+.info-banner i{font-size:14px;flex-shrink:0;margin-top:1px;}
+
+.vd-card{background:var(--color-background-secondary,#f8fafc);border-radius:6px;padding:12px 14px;margin-bottom:8px;width:100%;box-sizing:border-box;}
+.vd-row{display:flex;align-items:center;padding:5px 0;border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);}
+.vd-row:last-child{border-bottom:none;}
+.vd-label{font-size:11px;color:var(--color-text-secondary,#475569);width:150px;flex-shrink:0;}
+.vd-value{font-size:12px;color:var(--color-text-primary,#0f172a);font-weight:500;}
+
+/* Reusable "grouped form section" card — used to visually split a long
+   form (Part Sold, Scrap Sold, etc.) into clearly-labeled blocks instead of
+   one undifferentiated wall of fields (Ramvir, Sept 2026 feedback: forms
+   felt unclear/flat). Distinct from .vd-card (which is a flat, borderless
+   info box) — this one has a real border + shadow + a titled header strip
+   so each block reads as its own card. */
+.form-section-card{background:var(--color-background-primary,#fff);border:0.5px solid var(--color-border-tertiary,#e5e7eb);border-radius:10px;box-shadow:0 1px 3px rgba(15,23,42,.06);margin-bottom:16px;overflow:hidden;}
+.form-section-card-header{display:flex;align-items:center;gap:7px;padding:11px 16px;background:var(--color-background-secondary,#f8fafc);border-bottom:0.5px solid var(--color-border-tertiary,#e5e7eb);font-size:12px;font-weight:700;color:var(--color-text-primary,#0f172a);}
+.form-section-card-header i{font-size:14px;color:#1d4ed8;}
+.form-section-card-body{padding:16px;display:flex;flex-direction:column;gap:14px;}
+.vd-section{font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.08em;color:var(--color-text-tertiary,#9ca3af);margin:12px 0 8px;}
+.uploaded{display:inline-flex;align-items:center;gap:4px;color:#059669;font-size:11px;font-weight:500;}
+
+/* ============================================================
+   MOBILE RESPONSIVE — isolated block, doesn't touch rules above.
+   Sidebar becomes an off-canvas drawer toggled by a hamburger
+   button (#mobileMenuBtn) below ~860px width.
+   ============================================================ */
+.mobile-menu-btn{display:none;}
+@media (max-width:860px){
+  .mobile-menu-btn{display:flex;align-items:center;justify-content:center;width:34px;height:34px;background:rgba(255,255,255,.08);border:0.5px solid rgba(255,255,255,.15);border-radius:7px;color:#fff;font-size:18px;cursor:pointer;flex-shrink:0;}
+  .topbar-search{display:none;}
+  .sidebar{position:fixed;top:50px;left:0;bottom:0;z-index:150;transform:translateX(-100%);transition:transform .2s ease;box-shadow:4px 0 16px rgba(0,0,0,.15);}
+  .sidebar.mobile-open{transform:translateX(0);}
+  .sidebar-backdrop{display:none;position:fixed;inset:50px 0 0 0;background:rgba(0,0,0,.4);z-index:140;}
+  .sidebar-backdrop.mobile-open{display:block;}
+  .main-layout{position:relative;}
+  .page-header{flex-direction:column;align-items:flex-start;gap:10px;}
+  .header-actions{width:100%;}
+  .form-grid,.form-grid.cols3{grid-template-columns:1fr !important;}
+  .modal{width:96vw !important;max-height:92vh;}
+  .modal-body{max-height:70vh;}
+  .table-area{padding:12px;}
+  .crm-table{font-size:11px;}
+  .crm-table th,.crm-table td{padding:7px 8px;}
+  .filter-row{flex-wrap:wrap;}
+  .search-field{max-width:100%;flex:1 1 100%;}
+  .tabs-row{overflow-x:auto;}
+  .stage-path{padding:8px 12px;}
+}
+
+/* ============================================================
+   DESKTOP SIDEBAR HIDE/SHOW TOGGLE — separate from the mobile
+   drawer above. Works via body.sidebar-hidden, state remembered
+   in localStorage so it persists across reloads (defaults to
+   hidden on a first-ever visit — see the JS default near
+   toggleDesktopSidebar(), JS-Wiring.html).
+
+   When hidden on desktop, the sidebar isn't just gone — a thin
+   hover strip along the left edge (.sidebar-hover-zone) slides it
+   back in as a floating overlay the instant the cursor reaches
+   it, and slides it away again the instant the cursor leaves
+   both the strip and the sidebar itself. This is what gives
+   things like the Qualified Pipeline's stage-path the full window
+   width to lay its steps out in by default, without losing
+   one-motion access to the sidebar (click the toggle button for a
+   sidebar that stays open instead, same as before).
+
+   Gated to min-width:861px on purpose — mobile keeps the separate
+   hamburger-drawer behaviour above completely untouched.
+   ============================================================ */
+.sidebar-toggle-btn{display:flex;align-items:center;justify-content:center;width:30px;height:30px;background:rgba(255,255,255,.08);border:0.5px solid rgba(255,255,255,.15);border-radius:6px;color:#fff;font-size:16px;cursor:pointer;flex-shrink:0;}
+.sidebar{transition:width .18s ease, min-width .18s ease;}
+/* Fixed (Ramvir, Sept 2026) — this rule's own comment above says it's
+   "Gated to min-width:861px on purpose", but it was actually sitting
+   OUTSIDE that @media block below, so it applied unconditionally at every
+   screen size. On mobile, if the desktop sidebar-hide preference
+   (localStorage 'rewire_sidebar_hidden', defaults to hidden on a first-ever
+   visit) was ever set, this forced the mobile hamburger drawer's .sidebar
+   to width:0 + overflow:hidden — so tapping the hamburger correctly added
+   the .mobile-open class (transform:translateX(0), backdrop dimmed fine)
+   but the panel itself had zero width and its content was clipped, making
+   the drawer look completely broken/invisible. Moving it inside the
+   min-width:861px block below is the actual fix — matches what the
+   comment always claimed this did. */
+@media (min-width:861px){
+  body.sidebar-hidden .sidebar{width:0;min-width:0;overflow:hidden;border-right:none;padding:0;}
+  /* overflow:hidden here is a second, independent safeguard — the 212px-
+     wide .sidebar inside normally stays invisible purely via its own
+     transform:translateX(-100%) (pushed fully off-screen to the left), but
+     if that transform is ever caught mid-transition or the zone gets a
+     stray :hover while the cursor happens to be near x<14px (e.g. while
+     horizontally scrolling a wide table with the mouse resting near the
+     left edge), nothing previously stopped the sidebar's content —
+     including its nav-badge pills — from visually spilling out past this
+     zone's own 14px box and over whatever table is scrolled underneath.
+     Clipping this box to its own bounds makes that impossible regardless
+     of the sidebar's own transform state. */
+  body.sidebar-hidden .sidebar-hover-zone{display:block;position:fixed;top:50px;bottom:0;left:0;width:14px;z-index:160;overflow:hidden;}
+  /* Third, independent safeguard on top of transform + overflow:hidden —
+     visibility:hidden. transform:translateX(-100%) moves the sidebar's
+     paint position off-screen, and overflow:hidden on the 14px zone clips
+     whatever's still outside its own box either way — but visibility is a
+     completely different mechanism (it removes the element from hit-
+     testing/paint entirely rather than just moving or clipping it), so if
+     the badge pills were ever still showing through despite both of the
+     above (e.g. some intermediate reported state during the transform's
+     own transition, or a browser subpixel-rounding edge case right at the
+     14px clip boundary), this closes that gap independently — it can only
+     hide things further, never un-hide anything the other two already
+     handled correctly. */
+  body.sidebar-hidden .sidebar-hover-zone .sidebar{
+    position:absolute;top:0;left:0;bottom:0;width:212px;min-width:212px;
+    padding:14px 0;border-right:none;overflow:hidden;
+    transform:translateX(-100%);transition:transform .18s ease, visibility .18s ease;
+    box-shadow:4px 0 20px rgba(0,0,0,.3);
+    visibility:hidden;
+  }
+  body.sidebar-hidden .sidebar-hover-zone:hover{width:212px;}
+  body.sidebar-hidden .sidebar-hover-zone:hover .sidebar{transform:translateX(0);overflow-y:auto;visibility:visible;}
+}
+@media (max-width:860px){
+  .sidebar-toggle-btn{display:none;} /* mobile uses the hamburger drawer instead */
+}
+
+/* ============================================================
+   LEAD CARDS — used by All Leads + Qualified Pipeline instead
+   of a plain table. Isolated block, doesn't touch .crm-table.
+   ============================================================ */
+.lead-cards-grid{display:flex;flex-direction:column;gap:14px;}
+.lead-card{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(15,23,42,.08);border:0.5px solid var(--color-border-tertiary,#e5e7eb);cursor:pointer;transition:box-shadow .15s;}
+.lead-card:hover{box-shadow:0 4px 14px rgba(15,23,42,.14);}
+.lead-card-header{background:linear-gradient(135deg,#1e3a8a,#1e3a8a);padding:12px 18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
+.lead-card-title{color:#fff;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.lead-card-title .lid{background:rgba(255,255,255,.15);color:#fff;font-family:'Courier New',monospace;}
+.lead-card-actions{display:flex;gap:8px;flex-wrap:wrap;}
+.lead-card-btn{background:#fff;color:#1e3a8a;border:none;border-radius:20px;padding:6px 14px;font-size:11px;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:5px;white-space:nowrap;}
+.lead-card-btn:hover{background:#dbeafe;}
+.lead-card-btn.danger{color:#dc2626;}
+.lead-card-body{padding:16px 18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px 20px;}
+.lead-card-block-label{display:flex;align-items:center;gap:5px;font-size:10.5px;font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;}
+.lead-card-block-value{font-size:13px;color:#111827;line-height:1.6;}
+.lead-card-block-value .sub{color:#6b7280;font-size:11.5px;}
+/* Calling module (Oct 2026) */
+.cc-scope input[type=text],.cc-scope input:not([type]),.cc-scope input[type=tel],.cc-scope input[type=email],.cc-scope input[type=date],.cc-scope input[type=time],.cc-scope select{height:44px;font-size:14.5px;padding:0 12px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#0f172a;box-sizing:border-box;width:100%;outline:none;}
+.cc-scope textarea{font-size:14.5px;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;box-sizing:border-box;width:100%;min-height:90px;outline:none;font-family:inherit;}
+.cc-scope input:focus,.cc-scope select:focus,.cc-scope textarea:focus{border-color:#ea6a1f;box-shadow:0 0 0 3px rgba(234,106,31,.15);}
+.cc-scope .form-field label{font-size:13px;font-weight:600;color:#334155;margin-bottom:5px;display:block;}
+.cc-scope .form-grid{gap:14px 16px;}
+.cc-scroll{flex:1;overflow:auto;min-height:0;padding-bottom:30px;}
+.cc-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:14px 20px 0;}
+.cc-kpi{display:flex;align-items:center;gap:12px;background:#fff;border:0.5px solid #e5e7eb;border-radius:12px;padding:12px 16px;box-shadow:0 1px 2px rgba(15,23,42,.04);}
+.cc-kpi>i{font-size:24px;color:var(--k,#2563eb);background:color-mix(in srgb,var(--k,#2563eb) 12%,transparent);width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.cc-kpi-label{font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.04em;}
+.cc-kpi-val{font-size:24px;font-weight:700;line-height:1.15;color:#0f172a;}
+.cc-pct{font-size:12px;font-weight:600;color:#059669;margin-left:6px;}
+.cc-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:14px 20px 0;padding:12px;background:linear-gradient(90deg,#e8f1fb,#f1f6fc);border-radius:12px;}
+.cc-toolbar select{width:auto;min-width:150px;}
+.cc-searchbox{flex:1;min-width:300px;max-width:640px;display:flex;align-items:center;background:#fff;border:1px solid #cbd5e1;border-radius:8px;height:44px;position:relative;overflow:hidden;}
+.cc-searchbox select{border:none!important;border-right:1px solid #e2e8f0!important;border-radius:0!important;width:120px!important;min-width:0!important;font-weight:600;background:#f8fafc!important;}
+.cc-searchbox i{margin-left:12px;color:#94a3b8;font-size:17px;}
+.cc-searchbox input{border:none!important;box-shadow:none!important;flex:1;height:42px!important;}
+.cc-filterbtn{height:44px;padding:0 18px;border:1px solid #cbd5e1;background:#fff;border-radius:8px;font-size:14.5px;font-weight:600;color:#334155;cursor:pointer;display:inline-flex;align-items:center;gap:8px;}
+.cc-filterbtn:hover{border-color:#ea6a1f;color:#ea6a1f;}
+.cc-fcount{background:#ea6a1f;color:#fff;border-radius:999px;font-size:11px;min-width:18px;height:18px;align-items:center;justify-content:center;padding:0 5px;}
+.cc-selall{font-size:13px;font-weight:600;color:#334155;display:flex;align-items:center;gap:6px;white-space:nowrap;}
+.cc-switch{display:inline-flex;align-items:center;gap:10px;font-size:14px;font-weight:600;color:#334155;cursor:pointer;margin-left:auto;}
+.cc-switch input{display:none;}
+.cc-slider{width:42px;height:24px;border-radius:999px;background:#cbd5e1;position:relative;transition:background .15s;flex-shrink:0;}
+.cc-slider::after{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:left .15s;}
+.cc-switch input:checked+.cc-slider{background:#ea6a1f;}
+.cc-switch input:checked+.cc-slider::after{left:21px;}
+.cc-addbtn{height:42px;padding:0 20px;font-size:14.5px;background:#ea6a1f!important;border-color:#ea6a1f!important;border-radius:10px;}
+.cc-list{margin:14px 20px 8px;display:flex;flex-direction:column;gap:12px;}
+.cc-card{background:#fff;border:0.5px solid #e5e7eb;border-left:4px solid #94a3b8;border-radius:12px;box-shadow:0 1px 3px rgba(15,23,42,.05);cursor:pointer;transition:box-shadow .15s;}
+.cc-card:hover{box-shadow:0 4px 16px rgba(15,23,42,.11);}
+.cc-card-main{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;flex-wrap:wrap;}
+.cc-sel{margin-top:14px;width:18px;height:18px;}
+.cc-avatar{width:46px;height:46px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;flex-shrink:0;}
+.cc-card-info{flex:1;min-width:260px;}
+.cc-name{font-size:15.5px;font-weight:700;color:#0f172a;display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.cc-phone{font-size:15px;font-weight:700;color:#ea580c;margin-top:3px;display:flex;align-items:center;gap:5px;}
+.cc-meta{font-size:12.5px;color:#64748b;margin-top:3px;}
+.cc-last{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:#334155;background:#f8fafc;border:1px solid #eef2f7;border-radius:8px;padding:7px 10px;margin-top:8px;}
+.cc-last>i{font-size:16px;color:#2563eb;margin-top:1px;}
+.cc-last-none{color:#94a3b8;}.cc-last-none>i{color:#cbd5e1;}
+.cc-last-what{font-weight:600;color:#475569;}
+.cc-last-rem{color:#475569;margin-top:2px;font-style:italic;}
+.cc-chip{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid transparent;white-space:nowrap;}
+.cc-card-side{min-width:170px;font-size:12.5px;color:#64748b;display:flex;flex-direction:column;gap:3px;padding-top:2px;}
+.cc-side-line{display:flex;justify-content:space-between;gap:12px;}
+.cc-side-line b{color:#0f172a;font-weight:600;}
+.cc-card-actions{display:flex;align-items:center;gap:8px;margin-left:auto;padding-top:2px;}
+.cc-act{width:38px;height:38px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:18px;text-decoration:none;color:#fff;flex-shrink:0;}
+.button.cc-act,.cc-act{border:none;cursor:pointer;}
+.cc-act-call{background:#2563eb;}.cc-act-wa{background:#16a34a;}.cc-act-sms{background:#64748b;}
+.cc-update{height:38px;padding:0 18px;font-size:13.5px;border-radius:8px;background:#ea6a1f!important;border-color:#ea6a1f!important;}
+.cc-link{background:none;border:none;color:#ea6a1f;font-size:13px;font-weight:700;cursor:pointer;padding:6px;}
+.cc-detail{border-top:1px dashed #cbd5e1;background:#f0f7ff;padding:16px 20px;border-radius:0 0 12px 12px;cursor:default;}
+.cc-detail-grid{display:grid;grid-template-columns:1.2fr 1.2fr 1fr;gap:24px;}
+@media(max-width:1000px){.cc-detail-grid{grid-template-columns:1fr;}}
+.cc-dt-title{font-size:11.5px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;}
+.cc-kv{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:3px 0;border-bottom:1px dashed #dbeafe;}
+.cc-kv span{color:#64748b;}.cc-kv b{font-weight:600;text-align:right;}
+.cc-prev{background:#fff;border:1px solid #dbeafe;border-radius:8px;padding:10px 12px;font-size:13px;min-height:50px;}
+.cc-prev-hd{font-weight:700;margin-bottom:3px;}.cc-prev-rem{color:#475569;margin-top:4px;}
+.cc-outline-btn{margin-top:12px;border:1.5px solid #ea6a1f!important;color:#ea6a1f!important;background:#fff!important;font-weight:700;height:38px;}
+.cc-comm{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-weight:700;font-size:14px;color:#ea580c;}
+.cc-comm span{background:#fff;border:1px solid #dbeafe;border-radius:8px;padding:8px 12px;min-width:130px;}
+.cc-hist{margin-top:14px;border-top:1px dashed #cbd5e1;padding-top:10px;}
+.cc-hist-row{font-size:12.5px;padding:5px 0;border-bottom:0.5px solid #dbeafe;}
+.cc-empty{text-align:center;color:#94a3b8;padding:56px 0;font-size:15px;background:#fff;border:1px dashed #cbd5e1;border-radius:12px;}
+.cc-empty i{display:block;font-size:38px;margin-bottom:8px;color:#10b981;}
+.cc-other-row{display:flex;gap:10px;padding:0 16px 14px 76px;cursor:default;}
+.cc-other-row input{flex:1;}
+.cc-pager{display:flex;align-items:center;justify-content:space-between;margin:6px 20px 20px;font-size:13px;color:#64748b;flex-wrap:wrap;gap:8px;}
+.cc-pager-btns{display:flex;gap:6px;align-items:center;}
+.cc-pager-btns button{min-width:36px;height:36px;border:1px solid #e2e8f0;background:#fff;border-radius:8px;cursor:pointer;font-weight:600;color:#475569;}
+.cc-pager-btns button.on{background:#fff3ea;border-color:#ea6a1f;color:#ea6a1f;}
+.cc-pager-btns button:disabled{opacity:.4;cursor:default;}
+/* drawer */
+.cc-drawer-bd{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;justify-content:flex-end;z-index:1000;}
+.cc-drawer{width:min(640px,100vw);height:100vh;background:#fff;display:flex;flex-direction:column;box-shadow:-10px 0 34px rgba(0,0,0,.2);animation:ccSlide .22s ease-out;}
+@keyframes ccSlide{from{transform:translateX(48px);opacity:.3}to{transform:none;opacity:1}}
+.cc-drawer-hdr{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;border-bottom:1px solid #e5e7eb;font-size:17px;font-weight:700;}
+.cc-drawer-body{flex:1;overflow:auto;padding:18px 24px 24px;}
+.cc-drawer-ftr{padding:14px 24px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:10px;}
+.cc-drawer-ftr .btn{height:44px;padding:0 22px;font-size:14.5px;}
+.cc-submit{background:#ea6a1f!important;border-color:#ea6a1f!important;min-width:150px;font-weight:700;}
+.cc-custcard{border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;margin-bottom:6px;}
+.cc-cust-top{display:flex;align-items:center;gap:12px;margin-bottom:10px;}
+.cc-strip{display:flex;gap:18px;flex-wrap:wrap;background:#f1f5f9;border-radius:8px;padding:8px 12px;font-size:12.5px;color:#475569;}
+.cc-strip b{color:#0f172a;}.cc-strip-plain{background:none;padding:8px 2px 0;}
+.cc-step{font-size:12px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px;}
+.cc-pills{display:flex;gap:10px;flex-wrap:wrap;}
+.cc-pill{display:inline-flex;align-items:center;gap:7px;padding:11px 20px;border-radius:10px;border:1.5px solid #cbd5e1;background:#fff;color:#334155;font-size:14.5px;font-weight:600;cursor:pointer;transition:all .12s;}
+.cc-pill:hover{border-color:#ea6a1f;color:#ea6a1f;}
+.cc-pill.active{background:#ea6a1f;border-color:#ea6a1f;color:#fff;box-shadow:0 2px 8px rgba(234,106,31,.35);}
+.cc-fgroup{margin-bottom:20px;}.cc-fhd{font-size:13.5px;font-weight:700;margin-bottom:8px;color:#0f172a;}
+.cc-chips{display:flex;gap:8px;flex-wrap:wrap;}
+.cc-chipbtn{padding:7px 14px;border-radius:8px;border:1px solid #cbd5e1;background:#fff;font-size:13px;font-weight:600;color:#475569;cursor:pointer;}
+.cc-chipbtn.on{background:#fff3ea;border-color:#ea6a1f;color:#ea6a1f;}
+/* status summary matrix — app theme (same light-blue header as the other tables) */
+.cc-sum{width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;border:0.5px solid #e5e7eb;border-radius:9px;overflow:hidden;}
+.cc-sum th{background:#dbeafe;color:#1e3a8a;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;padding:11px 10px;text-align:center;border-bottom:1px solid #bfdbfe;}
+.cc-sum td{padding:10px;text-align:center;border-bottom:0.5px solid #eef2f7;color:#0f172a;}
+.cc-sum tbody tr:hover td{background:#f8fafc;}
+.cc-sum .cc-sum-y{background:#fef3c7!important;color:#92400e;}
+.cc-sum .cc-sum-yc{background:#fffbeb;color:#92400e;font-weight:600;}
+.cc-sum-tot td{background:#eff6ff!important;font-weight:700;color:#1e3a8a;border-top:1px solid #bfdbfe;border-bottom:none;}
+.cc-sum-tot td.cc-sum-y{background:#fef3c7!important;color:#92400e;}
+/* performance */
+.cc-tabs{display:flex;gap:26px;margin:14px 20px 0;padding:0 4px;border-bottom:1px solid #dbe5f0;}
+.cc-tab{background:none;border:none;padding:10px 4px;font-size:15px;font-weight:600;color:#64748b;cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-1px;}
+.cc-tab.on{color:#ea6a1f;border-bottom-color:#ea6a1f;}
+.cc-ptop{display:grid;grid-template-columns:320px 1fr;gap:14px;margin:14px 20px 0;}
+@media(max-width:1000px){.cc-ptop{grid-template-columns:1fr;}}
+.cc-pcard{background:#fff;border:0.5px solid #e5e7eb;border-radius:12px;padding:16px 18px;box-shadow:0 1px 2px rgba(15,23,42,.04);}
+.cc-pname{font-weight:700;font-size:15px;margin-bottom:12px;display:flex;align-items:center;gap:8px;}
+.cc-pcard-left{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-content:start;}
+.cc-pcard-left .cc-pname{grid-column:1/-1;margin-bottom:2px;}
+.cc-pbox{border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;}
+.cc-pbox span{display:block;font-size:11px;color:#64748b;text-transform:uppercase;font-weight:700;}
+.cc-pbox b{font-size:26px;}.cc-pbox small{font-size:13px;color:#94a3b8;font-weight:600;}
+.cc-pfacts{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;font-size:13px;}
+.cc-pfacts div{display:flex;justify-content:space-between;}.cc-pfacts span{color:#64748b;}
+.cc-ptitle{font-weight:700;font-size:15px;margin-bottom:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.cc-ptop-stats{font-size:13px;font-weight:500;color:#64748b;}.cc-ptop-stats b{color:#0f172a;font-size:16px;}
+.cc-rings{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px 20px;}
+.cc-ring{display:flex;align-items:center;gap:12px;}.cc-ring-l{font-weight:600;font-size:13.5px;}.cc-ring-s{font-size:12px;color:#64748b;}
+.cc-pcharts{display:flex;gap:14px;flex-wrap:wrap;margin:14px 20px 0;}
+.cc-chart{background:#fff;border:0.5px solid #e5e7eb;border-radius:12px;padding:14px 16px;flex:1;min-width:340px;}
+.cc-chart-hd{display:flex;justify-content:space-between;font-weight:700;font-size:14px;margin-bottom:8px;}
+.cc-chart-hd span{font-size:11.5px;font-weight:500;color:#64748b;display:flex;align-items:center;gap:5px;}
+.cc-chart-hd i{display:inline-block;width:10px;height:10px;border-radius:50%;}
+</style>

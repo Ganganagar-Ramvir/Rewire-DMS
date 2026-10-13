@@ -1,0 +1,2147 @@
+<!-- MODALS - GENERAL: Add Lead, View/Register Partner, Accessories Check, Vehicle Receipt (Received at Plant), Add User, COD/CVS Entry, Omini Pay, Dashboard detail popups (Monthly + Purchase Summary). -->
+<!-- MONTHLY DETAIL MODAL -->
+<!-- PURCHASE SUMMARY DETAIL MODAL -->
+<div class="modal-backdrop" id="purchaseSummaryModal" style="display:none;" onclick="bdClose(event,'purchaseSummaryModal')">
+<div class="modal" style="width:96vw;max-width:1400px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-car" aria-hidden="true"></i></div>
+      <div><h2 id="psModalTitle">Month</h2><div class="modal-sub">Purchased vehicles this month</div></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <select id="psPeFilter" onchange="renderPurchaseSummaryTable()" style="border:0.5px solid var(--color-border-secondary);border-radius:6px;padding:6px 10px;font-size:12px;">
+        <option value="">All PE</option>
+      </select>
+      <button class="btn" onclick="psClearAllFilters()" title="Reset PE filter, CoD Deduction, and any column filter on the table"><i class="ti ti-filter-off" style="font-size:13px;" aria-hidden="true"></i> Clear Filter</button>
+      <button class="btn" onclick="copyPurchaseSummaryTable()"><i class="ti ti-copy" style="font-size:13px;" aria-hidden="true"></i> Copy</button>
+      <button class="modal-close" onclick="closeModal('purchaseSummaryModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+    </div>
+  </div>
+  <div class="modal-body" style="max-height:75vh;">
+    <div style="display:flex;gap:12px;align-items:stretch;margin-bottom:16px;">
+      <div id="psStatsRow" style="display:flex;gap:0;border:0.5px solid var(--color-border-tertiary);border-radius:8px;overflow:hidden;flex:1;"></div>
+      <!-- CoD Deduction (Ramvir, Sept 2026) — a live what-if figure, same
+           idea as the Purchases tab's own CoD Deduction field but scoped to
+           whatever's currently shown in THIS popup (respects the PE filter
+           above). Typing an amount subtracts it from every visible row's
+           Final Purchase and recomputes Avg Purchase/Kg off that reduced
+           figure — nothing is written to the database, purely a viewing aid. -->
+      <div class="form-field" style="width:200px;flex-shrink:0;margin-bottom:0;">
+        <label style="font-size:10px;">CoD Deduction (₹)</label>
+        <input type="number" id="psCodDeduction" placeholder="0" min="0" oninput="renderPurchaseSummaryTable()" style="height:100%;box-sizing:border-box;" />
+      </div>
+    </div>
+    <div style="overflow-x:auto;">
+      <table class="crm-table" id="psTable" data-col-filter-hook="psOnColumnFilterChange">
+        <thead><tr>
+          <th>Month</th><th>PE</th><th>Customer Name</th><th>Phone</th><th>Vehicle Type</th><th>Vehicle No.</th>
+          <th>Make</th><th>Model</th><th>Kerb Wt (Kg)</th><th>Customer Payment</th>
+          <th>Broker Payment</th><th>Trader Payment</th><th>Cash Commission</th><th>Avg Purchase/Kg</th><th>Final Purchase</th>
+        </tr></thead>
+        <tbody id="psTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal('purchaseSummaryModal')">Close</button></div>
+</div></div>
+
+<!-- LOCATION WISE SUMMARY DETAIL MODAL -->
+<div class="modal-backdrop" id="locationSummaryModal" style="display:none;" onclick="bdClose(event,'locationSummaryModal')">
+<div class="modal" style="width:90vw;max-width:900px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-map-pin" aria-hidden="true"></i></div>
+      <div><h2 id="lsModalTitle">Location Summary</h2><div class="modal-sub">Vehicles in this bucket</div></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <button class="btn" onclick="copyLocationSummaryDetailTable()"><i class="ti ti-copy" style="font-size:13px;" aria-hidden="true"></i> Copy</button>
+      <button class="modal-close" onclick="closeModal('locationSummaryModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+    </div>
+  </div>
+  <div class="modal-body" style="max-height:70vh;">
+    <table class="crm-table" id="lsTable">
+      <thead><tr><th>Lead No.</th><th>Customer</th><th>Phone</th><th>Vehicle Type</th><th>Vehicle No.</th><th>Make/Model</th><th>Days Parked</th></tr></thead>
+      <tbody id="lsTableBody"></tbody>
+    </table>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal('locationSummaryModal')">Close</button></div>
+</div></div>
+
+<div class="modal-backdrop" id="monthModal" style="display:none;" onclick="bdClose(event,'monthModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-calendar" aria-hidden="true"></i></div>
+      <div><h2 id="monthModalTitle">Month</h2><div class="modal-sub">Leads created this month</div></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <button class="btn" onclick="copyMonthModalTable()"><i class="ti ti-copy" style="font-size:13px;" aria-hidden="true"></i> Copy</button>
+      <button class="modal-close" onclick="closeModal('monthModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+    </div>
+  </div>
+  <div class="modal-body">
+    <table class="crm-table" id="monthModalTable">
+      <thead><tr><th>Lead No.</th><th>Customer</th><th>PE</th><th>Status</th></tr></thead>
+      <tbody id="monthModalBody"></tbody>
+    </table>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal('monthModal')">Close</button></div>
+</div></div>
+
+<!-- CVS vs COD MONTHLY SUMMARY DETAIL MODAL — shared by the Dashboard card
+     and the Reports tab card (both call openCvsVsCodDetail(), JS-Payments.html) -->
+<div class="modal-backdrop" id="cvsVsCodDetailModal" style="display:none;" onclick="bdClose(event,'cvsVsCodDetailModal')">
+<div class="modal" style="width:90vw;max-width:900px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-scale" aria-hidden="true"></i></div>
+      <div><h2 id="cvsVsCodDetailTitle">CVS vs COD</h2><div class="modal-sub">Entries in this bucket</div></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <button class="btn" onclick="copyTableById('cvsVsCodDetailTable')"><i class="ti ti-copy" style="font-size:13px;" aria-hidden="true"></i> Copy</button>
+      <button class="modal-close" onclick="closeModal('cvsVsCodDetailModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+    </div>
+  </div>
+  <div class="modal-body" style="max-height:70vh;">
+    <table class="crm-table" id="cvsVsCodDetailTable">
+      <thead><tr><th>Registration No.</th><th>Number</th><th>CVS/COD Date</th><th id="cvsVsCodDetailHead4">DMS/Rewire No.</th></tr></thead>
+      <tbody id="cvsVsCodDetailBody"></tbody>
+    </table>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal('cvsVsCodDetailModal')">Close</button></div>
+</div></div>
+
+<!-- OMINI PAY MODAL -->
+<div class="modal-backdrop" id="ominiPayModal" style="display:none;" onclick="bdClose(event,'ominiPayModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-purple"><i class="ti ti-credit-card" aria-hidden="true"></i></div>
+      <div><h2>Omini Pay</h2><div class="modal-sub" id="ominiPayModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('ominiPayModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Omini Payments By Name <span class="req">*</span></label><select id="opByName"><option value="">Select who is paying</option></select></div>
+      <div class="form-field"><label>OMNIPAY TXN ID <span class="req">*</span></label><input id="opTxnId" /></div>
+      <div class="form-field"><label>OMNIPAY Reference ID <span class="req">*</span></label><input id="opReferenceId" /></div>
+      <div class="form-field fg-full"><label>Amount Paid (₹) <span class="req">*</span></label><input id="opAmountPaid" type="number" min="0" onwheel="this.blur()" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('ominiPayModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#7c3aed;border-color:#7c3aed;" onclick="withLoading(this, () => submitOminiPay())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Pay</button>
+  </div>
+</div></div>
+
+<!-- ACCESSORIES CHECK MODAL -->
+<div class="modal-backdrop" id="accessoriesModal" style="display:none;" onclick="bdClose(event,'accessoriesModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-list-check" aria-hidden="true"></i></div>
+      <div><h2>Accessories Check</h2><div class="modal-sub" id="accessoriesModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('accessoriesModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <table class="crm-table">
+      <thead><tr><th>Item</th><th>Valuation (PE)</th><th>Delivery (PE)</th><th>Photo</th><th>Match?</th></tr></thead>
+      <tbody id="accessoriesCompareBody"></tbody>
+    </table>
+    <div class="form-section-label" style="margin-top:16px;">Documents</div>
+    <div id="accessoriesPhotosGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;"></div>
+
+    <div class="form-section-label" style="margin-top:16px;">Price Negotiation Split — Deduct From</div>
+    <div class="info-banner" style="margin-bottom:10px;">
+      <i class="ti ti-info-circle" aria-hidden="true"></i>
+      <span>Original amounts fixed at Price Negotiation. Enter how much to deduct from each, if any — this makes it clear later which part (customer / broker / COD / cash) the accessory shortfall was recovered from.</span>
+    </div>
+    <table class="crm-table" id="accessoriesPnSplitTable">
+      <thead><tr><th>Component</th><th>Original (₹)</th><th>Deduct (₹)</th></tr></thead>
+      <tbody id="accessoriesPnSplitBody"></tbody>
+    </table>
+
+    <div class="form-grid" style="margin-top:16px;">
+      <div class="form-field"><label>Total Deal Amount (₹)</label><input id="accessoriesDealTotalAmount" readonly style="background:var(--color-background-secondary);font-weight:700;" /></div>
+      <div class="form-field"><label>Total Deduction (₹)</label><input type="number" id="accessoriesDeductionAmount" readonly min="0" onwheel="this.blur()" style="background:var(--color-background-secondary);font-weight:700;color:#dc2626;" /></div>
+      <div class="form-field"><label>Deduction Reason</label><input id="accessoriesDeductionReason" placeholder="e.g. Missing spare wheel" /></div>
+      <div class="form-field fg-full" id="logisticsCraneRatesField" style="display:none;">
+        <label>COD Calculation — selected vehicles</label>
+        <table class="crm-table" data-no-enhance><thead><tr><th>Vehicle</th><th>Vehicle Amount</th><th>COD Amount</th><th>Weight (KG)</th><th>Vehicle Rate/KG</th><th>COD Rate/KG</th></tr></thead><tbody id="logisticsCraneRatesBody"></tbody></table>
+      </div>
+      <div class="form-field fg-full"><label>Remarks</label><textarea id="accessoriesRemarks" rows="2" placeholder="Any notes on mismatches…"></textarea></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('accessoriesModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitAccessoriesCheck())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Confirm & Proceed to Head Approval</button>
+  </div>
+</div></div>
+
+<!-- ACCESSORIES REVIEW MODAL (Ramvir, Sept 2026) — Manager's step between
+     Accessories Check (deduction > 0 only) and Head Approval. Manager sees
+     the same mismatch table Back Office saw, plus the deduction amount and
+     reason (both read-only — Manager can only add a remark here, not edit
+     the numbers), and must add a remark before it can move on. -->
+<div class="modal-backdrop" id="accReviewModal" style="display:none;" onclick="bdClose(event,'accReviewModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-message-2" aria-hidden="true"></i></div>
+      <div><h2>Accessories Review</h2><div class="modal-sub" id="accReviewModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('accReviewModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <table class="crm-table">
+      <thead><tr><th>Item</th><th>Valuation (PE)</th><th>Delivery (PE)</th><th>Status</th></tr></thead>
+      <tbody id="accReviewCompareBody"></tbody>
+    </table>
+    <div class="form-grid" style="margin-top:16px;">
+      <div class="form-field"><label>Deduction Amount</label><input id="accReviewDeductionAmount" readonly style="background:var(--color-background-secondary);font-weight:700;color:#dc2626;" /></div>
+      <div class="form-field"><label>Deduction Reason</label><input id="accReviewDeductionReason" readonly style="background:var(--color-background-secondary);" /></div>
+      <div class="form-field fg-full"><label>Your Remarks <span class="req">*</span></label><textarea id="accReviewRemarks" rows="3" placeholder="e.g. Confirmed with customer, deduction is fair…"></textarea></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('accReviewModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitAccessoriesReview())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Send to Head Approval</button>
+  </div>
+</div></div>
+
+<!-- ============================================================
+     INCENTIVE MODULE MODALS (Ramvir, Oct 2026) — see JS-Incentive.html
+     ============================================================ -->
+<!-- Detail modal: breakdown view + Manager's manual adjustment/verify +
+     Accounts' mark-paid, all in one modal (which controls show depends on
+     the record's status and the viewer's role — see openIncentiveDetail()). -->
+<div class="modal-backdrop" id="incentiveDetailModal" style="display:none;" onclick="bdClose(event,'incentiveDetailModal')">
+<div class="modal" style="width:90vw;max-width:800px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-coin" aria-hidden="true"></i></div>
+      <div><h2>Incentive Detail</h2><div class="modal-sub" id="incentiveDetailSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('incentiveDetailModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <table class="crm-table" data-no-enhance>
+      <thead><tr><th>₹/kg Bucket</th><th>Count</th><th>Tier</th><th>Rate</th><th>Amount</th></tr></thead>
+      <tbody id="incentiveBreakdownBody"></tbody>
+    </table>
+    <div class="info-banner" style="margin-top:10px;"><i class="ti ti-info-circle" aria-hidden="true"></i><span id="incentiveCodSummary">—</span></div>
+    <div class="form-grid" style="margin-top:14px;">
+      <div class="form-field"><label>Calculated Total</label><input id="incentiveCalcTotal" readonly style="background:var(--color-background-secondary);font-weight:700;" /></div>
+      <div class="form-field"><label>Manual Adjustment (₹) <span style="font-weight:400;color:var(--color-text-tertiary);">— +/- , e.g. Back Office correction</span></label><input type="number" id="incentiveAdjustAmount" onwheel="this.blur()" placeholder="0" /></div>
+      <div class="form-field fg-full"><label>Adjustment Remarks</label><textarea id="incentiveAdjustRemarks" rows="2" placeholder="Reason for addition/deduction, if any…"></textarea></div>
+      <div class="form-field fg-full" id="incentivePayRefWrap" style="display:none;"><label>Payment Reference / UTR No. <span class="req">*</span></label><input id="incentivePayRef" placeholder="e.g. UTR123456789" /></div>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--color-text-tertiary);" id="incentiveStatusLine">—</div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('incentiveDetailModal')">Close</button>
+    <button class="btn btn-primary" id="incentiveVerifyBtn" style="display:none;background:#1d4ed8;border-color:#1d4ed8;" onclick="withLoading(this, () => submitIncentiveVerify())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Verify</button>
+    <button class="btn btn-primary" id="incentivePayBtn" style="display:none;background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitIncentivePay())"><i class="ti ti-cash" style="font-size:13px;" aria-hidden="true"></i> Mark Paid</button>
+  </div>
+</div></div>
+
+<!-- Policy editor (Admin only) — creates a new versioned policy row
+     effective from the chosen date; past months keep whichever policy was
+     active on their own calculation date. -->
+<div class="modal-backdrop" id="incentivePolicyModal" style="display:none;" onclick="bdClose(event,'incentivePolicyModal')">
+<div class="modal" style="width:92vw;max-width:900px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-settings" aria-hidden="true"></i></div>
+      <div><h2 id="incentivePolicyModalTitle">Edit Incentive Policy</h2><div class="modal-sub" id="incentivePolicyModalSub">Saves as a new version — doesn't change already-calculated months</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('incentivePolicyModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="info-banner"><i class="ti ti-info-circle" aria-hidden="true"></i><span>Vehicle Purchase Incentive slabs apply to M-category (4W) vehicles only. 2W/3W get a flat rate per vehicle. CoD Trading Incentive applies to 4W/M-category only.</span></div>
+
+    <div style="font-weight:700;font-size:13px;margin:14px 0 6px;">PE — Vehicle Purchase Incentive (₹ per vehicle, by ₹/kg bucket × unit-count tier)</div>
+    <table class="crm-table" data-no-enhance>
+      <thead><tr><th>₹/kg Bucket</th><th>Tier 1 (low volume)</th><th>Tier 2</th><th>Tier 3 (high volume)</th></tr></thead>
+      <tbody>
+        <tr><td>Up to ₹20/kg</td><td><input type="number" id="incPolPe_20_tier1" /></td><td><input type="number" id="incPolPe_20_tier2" /></td><td><input type="number" id="incPolPe_20_tier3" /></td></tr>
+        <tr><td>₹20–25/kg</td><td><input type="number" id="incPolPe_25_tier1" /></td><td><input type="number" id="incPolPe_25_tier2" /></td><td><input type="number" id="incPolPe_25_tier3" /></td></tr>
+        <tr><td>₹25–30/kg</td><td><input type="number" id="incPolPe_30_tier1" /></td><td><input type="number" id="incPolPe_30_tier2" /></td><td><input type="number" id="incPolPe_30_tier3" /></td></tr>
+      </tbody>
+    </table>
+    <div class="form-grid" style="margin-top:8px;">
+      <div class="form-field"><label>PE Tier 2 starts at (vehicles in that bucket)</label><input type="number" id="incPolPeTier2Min" /></div>
+      <div class="form-field"><label>PE Tier 3 starts at</label><input type="number" id="incPolPeTier3Min" /></div>
+    </div>
+
+    <div style="font-weight:700;font-size:13px;margin:16px 0 6px;">Manager — Vehicle Purchase Incentive (₹ per vehicle, team-wide)</div>
+    <table class="crm-table" data-no-enhance>
+      <thead><tr><th>₹/kg Bucket</th><th>Tier 1 (low volume)</th><th>Tier 2</th><th>Tier 3 (high volume)</th></tr></thead>
+      <tbody>
+        <tr><td>Up to ₹20/kg</td><td><input type="number" id="incPolMgr_20_tier1" /></td><td><input type="number" id="incPolMgr_20_tier2" /></td><td><input type="number" id="incPolMgr_20_tier3" /></td></tr>
+        <tr><td>₹20–25/kg</td><td><input type="number" id="incPolMgr_25_tier1" /></td><td><input type="number" id="incPolMgr_25_tier2" /></td><td><input type="number" id="incPolMgr_25_tier3" /></td></tr>
+        <tr><td>₹25–30/kg</td><td><input type="number" id="incPolMgr_30_tier1" /></td><td><input type="number" id="incPolMgr_30_tier2" /></td><td><input type="number" id="incPolMgr_30_tier3" /></td></tr>
+      </tbody>
+    </table>
+    <div class="form-grid" style="margin-top:8px;">
+      <div class="form-field"><label>Manager Tier 2 starts at (team vehicles in that bucket)</label><input type="number" id="incPolMgrTier2Min" /></div>
+      <div class="form-field"><label>Manager Tier 3 starts at</label><input type="number" id="incPolMgrTier3Min" /></div>
+    </div>
+
+    <div style="font-weight:700;font-size:13px;margin:16px 0 6px;">CoD Trading Incentive &amp; Other Settings</div>
+    <div class="form-grid">
+      <div class="form-field"><label>CoD Deduction Amount (₹ per CoD, net-of-CoD price calc)</label><input type="number" id="incPolCodDeduction" /></div>
+      <div class="form-field"><label>2W/3W Flat Rate (₹ per vehicle)</label><input type="number" id="incPolTwoWheelerRate" /></div>
+      <div class="form-field"><label>CoD Base Units (before higher rate kicks in)</label><input type="number" id="incPolCodBaseUnits" /></div>
+      <div class="form-field"><label>CoD Base Rate (₹/unit, within base units)</label><input type="number" id="incPolCodBaseRate" /></div>
+      <div class="form-field"><label>CoD Excess Rate (₹/unit, beyond base units)</label><input type="number" id="incPolCodExcessRate" /></div>
+      <div class="form-field"><label>Manager's CoD Incentive (% of PE-equivalent)</label><input type="number" id="incPolCodMgrPct" /></div>
+      <div class="form-field"><label>Effective From <span class="req">*</span></label><input type="date" id="incPolEffectiveFrom" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('incentivePolicyModal')" id="incentivePolicyCancelBtn">Cancel</button>
+    <button class="btn btn-primary" id="incentivePolicySaveBtn" onclick="withLoading(this, () => submitIncentivePolicy())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save New Policy Version</button>
+  </div>
+</div></div>
+
+
+<!-- ============================================================
+     CALLING MODULE MODALS (Ramvir, Oct 2026) — see JS-Calling.html
+     ============================================================ -->
+<div class="cc-drawer-bd" id="callingDispModal" style="display:none;" onclick="bdClose(event,'callingDispModal')">
+<div class="cc-drawer cc-scope">
+  <div class="cc-drawer-hdr"><div><i class="ti ti-phone-call" aria-hidden="true" style="color:#ea6a1f;"></i> Lead Disposition</div>
+    <button class="modal-close" onclick="closeModal('callingDispModal')"><i class="ti ti-x" style="font-size:18px;" aria-hidden="true"></i></button></div>
+  <div class="cc-drawer-body">
+    <div class="cc-custcard">
+      <div class="cc-cust-top"><div class="cc-avatar" style="background:#ea6a1f1a;color:#ea6a1f;" id="cdInit">–</div><div style="font-size:18px;font-weight:700;" id="cdTitle">—</div></div>
+      <div class="cc-strip" id="cdStrip"></div>
+      <div class="cc-strip cc-strip-plain" id="cdVeh"></div>
+    </div>
+    <div id="cdLast"></div>
+    <div class="cc-step">Contact Status</div>
+    <div class="cc-pills" id="cdContactPills"></div>
+
+    <div id="cdContactedBox">
+      <div class="cc-step">Status</div>
+      <div class="cc-pills" id="cdCrmPills"></div>
+    </div>
+    <div id="cdNotContactedBox" style="display:none;">
+      <div class="cc-step">Reason</div>
+      <div class="cc-pills" id="cdReasonPills"></div>
+    </div>
+    <div class="cc-step">Next Action</div>
+    <div class="cc-pills" id="cdActionPills"></div>
+
+    <div id="cdNextBox" style="display:none;margin-top:16px;"><div class="cc-step" id="cdNextLabel" style="margin-top:0;">Date &amp; Time</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;"><input type="date" id="cdNextDate" /><input type="time" id="cdNextTime" /></div></div>
+
+    <!-- Assign to PE — DMS "New Lead Entry" form, pre-filled; fill whatever is still missing -->
+    <div id="cdPeBox" style="display:none;margin-top:16px;padding:14px 16px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:12px;">
+      <div style="font-weight:700;font-size:14px;color:#1d4ed8;margin-bottom:2px;">DMS Lead Details</div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:12px;">Already filled from calling data — complete the rest, then the lead is created for the PE.</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Customer Name <span class="req">*</span></label><input id="cdAsName" onblur="callingProper(this)" /></div>
+        <div class="form-field"><label>Phone <span class="req">*</span></label><input id="cdAsPhone" type="tel" maxlength="10" oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)" /></div>
+        <div class="form-field"><label>Email</label><input id="cdAsEmail" type="email" /></div>
+        <div class="form-field"><label>City <span class="req">*</span></label><input id="cdAsCity" list="cdCityList" placeholder="Pick from list" autocomplete="off" /><datalist id="cdCityList"></datalist></div>
+        <div class="form-field fg-full"><label>Address <span class="req">*</span></label><textarea id="cdAsAddress" rows="2" onblur="callingProper(this)"></textarea></div>
+        <div class="form-field"><label>Lead Source <span class="req">*</span></label><select id="cdAsSource"></select></div>
+        <div class="form-field"><label>Lead Type <span class="req">*</span></label><select id="cdAsLeadType" onchange="callingRenderDispUi()"><option>Direct</option><option>Partner</option></select></div>
+        <div class="form-field fg-full" id="cdAsPartnerWrap" style="display:none;"><label>Partner <span class="req">*</span></label><select id="cdAsPartner"><option value="">Select partner</option></select></div>
+        <div class="form-field fg-full"><label>Assign to PE <span class="req">*</span></label><select id="cdPeSelect"><option value="">Select PE</option></select></div>
+      </div>
+    </div>
+
+    <div class="cc-step">Remarks</div>
+    <textarea id="cdRemarks" rows="3" placeholder="Enter any additional remarks… (e.g. customer demand 60k without cod // RC pending)"></textarea>
+  </div>
+  <div class="cc-drawer-ftr">
+    <button class="btn" onclick="closeModal('callingDispModal')">Cancel</button>
+    <button class="btn btn-primary cc-submit" onclick="withLoading(this, () => submitCallingDisposition())">Submit</button>
+  </div>
+</div></div>
+
+<div class="cc-drawer-bd" id="callingWaModal" style="display:none;" onclick="bdClose(event,'callingWaModal')">
+<div class="cc-drawer cc-scope" style="width:min(520px,100vw);">
+  <div class="cc-drawer-hdr"><div><i class="ti ti-brand-whatsapp" aria-hidden="true" style="color:#16a34a;"></i> Send WhatsApp</div>
+    <button class="modal-close" onclick="closeModal('callingWaModal')"><i class="ti ti-x" style="font-size:18px;" aria-hidden="true"></i></button></div>
+  <div class="cc-drawer-body">
+    <div class="cc-custcard"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.05em;">To</div><div style="font-size:16px;font-weight:700;margin-top:2px;" id="cwTo">—</div></div>
+    <div class="cc-step">Message</div>
+    <textarea id="cwText" rows="6" maxlength="900" placeholder="Type the message to send to the customer…"></textarea>
+    <div style="font-size:12px;color:#64748b;margin-top:8px;">Sent through the approved WhatsApp template — your text fills the template's variable. Line breaks are converted to spaces.</div>
+  </div>
+  <div class="cc-drawer-ftr">
+    <button class="btn" onclick="closeModal('callingWaModal')">Cancel</button>
+    <button class="btn btn-primary cc-submit" id="cwSendBtn" style="background:#16a34a!important;border-color:#16a34a!important;" onclick="callingWaSubmit()"><i class="ti ti-send" style="font-size:14px;" aria-hidden="true"></i> Send</button>
+  </div>
+</div></div>
+
+<div class="cc-drawer-bd" id="callingFilterModal" style="display:none;" onclick="bdClose(event,'callingFilterModal')">
+<div class="cc-drawer cc-scope" style="width:min(460px,100vw);">
+  <div class="cc-drawer-hdr"><div><i class="ti ti-filter" aria-hidden="true"></i> Filters</div>
+    <button class="modal-close" onclick="closeModal('callingFilterModal')"><i class="ti ti-x" style="font-size:18px;" aria-hidden="true"></i></button></div>
+  <div class="cc-drawer-body" id="cfBody"></div>
+  <div class="cc-drawer-ftr">
+    <button class="btn" onclick="callingFiltClear()">Clear All Filters</button>
+    <button class="btn btn-primary cc-submit" onclick="callingFiltApply()">Apply Filters</button>
+  </div>
+</div></div>
+
+<div class="cc-drawer-bd" id="callingAddLeadModal" style="display:none;" onclick="bdClose(event,'callingAddLeadModal')">
+<div class="cc-drawer cc-scope">
+  <div class="cc-drawer-hdr"><div><i class="ti ti-user-plus" aria-hidden="true" style="color:#ea6a1f;"></i> RVSF Source Lead Form</div>
+    <button class="modal-close" onclick="closeModal('callingAddLeadModal')"><i class="ti ti-x" style="font-size:18px;" aria-hidden="true"></i></button></div>
+  <div class="cc-drawer-body">
+    <div style="font-size:12px;color:#64748b;margin-bottom:12px;">Vehicle Scrap leads go to the CRE's call list — other types go to Other Leads.</div>
+    <div class="form-grid">
+    <div class="form-field fg-full"><label>Customer Name <span class="req">*</span></label><input id="calName" placeholder="Full name" onblur="callingProper(this)" /></div>
+    <div class="form-field"><label>Phone Number <span class="req">*</span></label><input id="calPhone" type="tel" maxlength="10" placeholder="10-digit mobile" oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)" /></div>
+    <div class="form-field"><label>Alt. Phone</label><input id="calAlt" type="tel" maxlength="10" placeholder="10-digit mobile" oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)" /></div>
+    <div class="form-field"><label>Location</label><input id="calCity" list="calCityList" placeholder="Search city…" autocomplete="off" /><datalist id="calCityList"></datalist></div>
+    <div class="form-field"><label>Lead Source <span class="req">*</span></label><select id="calSource"></select></div>
+    <div class="form-field"><label>Lead Type <span class="req">*</span></label><select id="calLeadType" onchange="callingAddTypeChanged()"></select></div>
+    <div class="form-field"><label>CRE Name <span class="req">*</span></label><select id="calCre"></select></div>
+    <div class="fg-full" id="calScrapBox" style="display:none;grid-column:1/-1;">
+      <div class="form-grid">
+        <div class="form-field"><label>Make</label><input id="calMake" list="calMakeList" placeholder="Search make…" autocomplete="off" /><datalist id="calMakeList"></datalist></div>
+        <div class="form-field"><label>Model</label><input id="calModel" onblur="callingProper(this)" /></div>
+        <div class="form-field"><label>Vehicle Type</label><select id="calVehType"></select></div>
+        <div class="form-field"><label>Deal Type <span class="req">*</span></label><select id="calDealType" onchange="callingAddDealChanged()"></select></div>
+        <div class="form-field fg-full" id="calBrokerBox" style="display:none;"><label>Broker Name <span class="req">*</span></label><input id="calBrokerName" list="calBrokerList" placeholder="Search broker…" autocomplete="off" /><datalist id="calBrokerList"></datalist></div>
+      </div>
+    </div>
+    <div class="form-field fg-full"><label>Remarks</label><textarea id="calRemarks" rows="3" placeholder="Remarks if any"></textarea></div>
+    </div>
+  </div>
+  <div class="cc-drawer-ftr">
+    <button class="btn" onclick="closeModal('callingAddLeadModal')">Cancel</button>
+    <button class="btn btn-primary cc-submit" onclick="withLoading(this, () => submitCallingAddLead())">Submit</button>
+  </div>
+</div></div>
+
+<div class="modal-backdrop" id="callingBulkModal" style="display:none;" onclick="bdClose(event,'callingBulkModal')">
+<div class="modal cc-scope" style="width:92vw;max-width:520px;">
+  <div class="modal-hdr">
+    <div class="modal-title"><div class="modal-icon mi-amber"><i class="ti ti-upload" aria-hidden="true"></i></div><div><h2>Bulk Upload Calling Leads</h2><div class="modal-sub">Excel — duplicates (same phone) are skipped</div></div></div>
+    <button class="modal-close" onclick="closeModal('callingBulkModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <button class="btn btn-outline" onclick="downloadCallingTemplate()"><i class="ti ti-download" style="font-size:13px;" aria-hidden="true"></i> Download format</button>
+    <div style="margin-top:12px;"><input type="file" id="callingBulkFile" accept=".xlsx,.xls,.csv" onchange="callingBulkFileSelected(this)" /></div>
+    <div id="callingBulkPreview" style="margin-top:10px;"></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('callingBulkModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => runCallingBulkUpload())">Upload</button>
+  </div>
+</div></div>
+
+<!-- ============================================================
+     CONVEYANCE MODULE MODALS (Ramvir, Oct 2026) — see JS-Conveyance.html
+     ============================================================ -->
+<!-- PE month drill-down (Manager > PE > Type > Entry) -->
+<div class="modal-backdrop" id="conveyancePeModal" style="display:none;" onclick="bdClose(event,'conveyancePeModal')">
+<div class="modal" style="max-width:860px;width:96%;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-route" aria-hidden="true"></i></div>
+      <div><h2 id="convPeTitle">PE</h2><div class="modal-sub" id="convPeSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeConveyancePeModal()"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body" id="convPeBody" style="max-height:70vh;overflow:auto;"></div>
+  <div class="modal-footer"><button class="btn" onclick="closeConveyancePeModal()">Close</button></div>
+</div></div>
+
+<!-- Add expense: Bus / Train / Tour / Auto -->
+<div class="modal-backdrop" id="convExpenseModal" style="display:none;" onclick="bdClose(event,'convExpenseModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-receipt" aria-hidden="true"></i></div>
+      <div><h2>Conveyance Expense</h2><div class="modal-sub">Type: <b id="convExpType">—</b></div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('convExpenseModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Date</label><input type="date" id="convExpDate" /></div>
+      <div class="form-field"><label>Amount (₹) <span class="req">*</span></label><input type="number" id="convExpAmount" min="0" onwheel="this.blur()" /></div>
+      <div class="form-field"><label>From Location <span class="req">*</span></label><input type="text" id="convExpFrom" /></div>
+      <div class="form-field"><label>To Location <span class="req">*</span></label><input type="text" id="convExpTo" /></div>
+      <div class="form-field fg-full"><label>Upload Bill <span class="req">*</span></label><input type="file" id="convExpBill" accept="image/*,application/pdf" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('convExpenseModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitConveyanceExpense())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Expense</button>
+  </div>
+</div></div>
+
+<!-- Expense detail: view bill + Manager verify + Accounts pay -->
+<div class="modal-backdrop" id="conveyanceExpenseDetailModal" style="display:none;" onclick="bdClose(event,'conveyanceExpenseDetailModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-receipt" aria-hidden="true"></i></div>
+      <div><h2>Expense Detail</h2><div class="modal-sub" id="convExpDetailSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('conveyanceExpenseDetailModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Type</label><div id="convExpDetailType" style="font-weight:600;">—</div></div>
+      <div class="form-field"><label>Amount</label><div id="convExpDetailAmount" style="font-weight:700;color:#16a34a;">—</div></div>
+      <div class="form-field fg-full"><label>From → To</label><div id="convExpDetailRoute" style="font-weight:600;">—</div></div>
+      <div class="form-field"><label>Bill</label><button class="btn btn-outline" id="convExpDetailBill" style="font-size:12px;padding:4px 10px;">View Bill</button></div>
+      <div class="form-field fg-full"><label>Manager Remarks</label><textarea id="convExpDetailRemarks" rows="2" placeholder="Any notes before verifying…"></textarea></div>
+      <div class="form-field fg-full" id="convExpPayRefWrap" style="display:none;"><label>Payment Reference / UTR No. <span class="req">*</span></label><input id="convExpPayRef" placeholder="e.g. UTR123456789" /></div>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--color-text-tertiary);" id="convExpStatusLine">—</div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('conveyanceExpenseDetailModal')">Close</button>
+    <button class="btn btn-primary" id="convExpRejectBtn" style="display:none;background:#dc2626;border-color:#dc2626;" onclick="withLoading(this, () => submitConveyanceExpenseReject())"><i class="ti ti-x" style="font-size:13px;" aria-hidden="true"></i> Reject</button>
+    <button class="btn btn-primary" id="convExpVerifyBtn" style="display:none;background:#1d4ed8;border-color:#1d4ed8;" onclick="withLoading(this, () => submitConveyanceExpenseVerify())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Verify</button>
+    <button class="btn btn-primary" id="convExpPayBtn" style="display:none;background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitConveyanceExpensePay())"><i class="ti ti-cash" style="font-size:13px;" aria-hidden="true"></i> Mark Paid</button>
+  </div>
+</div></div>
+
+<div class="modal-backdrop" id="convStartModal" style="display:none;" onclick="bdClose(event,'convStartModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-player-play" aria-hidden="true"></i></div>
+      <div><h2>Start Trip</h2><div class="modal-sub">Enter your starting odometer reading</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('convStartModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Starting KM <span class="req">*</span></label><input type="number" id="convStartKm" min="0" onwheel="this.blur()" /></div>
+      <div class="form-field fg-full"><label>Odometer Photo <span class="req">*</span></label><input type="file" id="convStartPhoto" accept="image/*" capture="environment" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('convStartModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitConveyanceStart())"><i class="ti ti-player-play" style="font-size:13px;" aria-hidden="true"></i> Start Trip</button>
+  </div>
+</div></div>
+
+<div class="modal-backdrop" id="convEndModal" style="display:none;" onclick="bdClose(event,'convEndModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-player-stop" aria-hidden="true"></i></div>
+      <div><h2>End Trip</h2><div class="modal-sub">Enter your ending odometer reading</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('convEndModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Ending KM <span class="req">*</span></label><input type="number" id="convEndKm" min="0" onwheel="this.blur()" /></div>
+      <div class="form-field fg-full"><label>Odometer Photo <span class="req">*</span></label><input type="file" id="convEndPhoto" accept="image/*" capture="environment" /></div>
+      <div class="form-field fg-full"><label>Places Visited / Work <span class="req">*</span></label><textarea id="convWorkDescription" rows="2"></textarea></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('convEndModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#d97706;border-color:#d97706;" onclick="withLoading(this, () => submitConveyanceEnd())"><i class="ti ti-player-stop" style="font-size:13px;" aria-hidden="true"></i> End Trip</button>
+  </div>
+</div></div>
+
+<!-- Detail modal: view trip + odometer photos + Manager's verify + Accounts' mark-paid. -->
+<div class="modal-backdrop" id="conveyanceDetailModal" style="display:none;" onclick="bdClose(event,'conveyanceDetailModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-route" aria-hidden="true"></i></div>
+      <div><h2>Trip Detail</h2><div class="modal-sub" id="conveyanceDetailSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('conveyanceDetailModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Starting KM</label><div id="convDetailStartKm" style="font-weight:600;">—</div></div>
+      <div class="form-field"><label>Ending KM</label><div id="convDetailEndKm" style="font-weight:600;">—</div></div>
+      <div class="form-field"><label>Distance</label><div id="convDetailDistance" style="font-weight:600;">—</div></div>
+      <div class="form-field"><label>Rate</label><div id="convDetailRate" style="font-weight:600;">—</div></div>
+      <div class="form-field"><label>Amount</label><div id="convDetailAmount" style="font-weight:700;color:#16a34a;">—</div></div>
+      <div class="form-field"><label>Photos</label><div style="display:flex;gap:10px;"><a id="convDetailStartPhoto" href="#" target="_blank" style="color:#1d4ed8;text-decoration:underline;">Start Photo</a><a id="convDetailEndPhoto" href="#" target="_blank" style="color:#1d4ed8;text-decoration:underline;">End Photo</a></div></div>
+      <div class="form-field fg-full"><label>Places Visited / Work</label><div id="convDetailWork" style="color:var(--color-text-secondary);">—</div></div>
+      <div class="form-field fg-full"><label>Manager Remarks</label><textarea id="convDetailRemarks" rows="2" placeholder="Any notes before verifying…"></textarea></div>
+      <div class="form-field fg-full" id="conveyancePayRefWrap" style="display:none;"><label>Payment Reference / UTR No. <span class="req">*</span></label><input id="convPayRef" placeholder="e.g. UTR123456789" /></div>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--color-text-tertiary);" id="conveyanceStatusLine">—</div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('conveyanceDetailModal')">Close</button>
+    <button class="btn btn-primary" id="conveyanceAdminEndBtn" style="display:none;background:#d97706;border-color:#d97706;" onclick="openConveyanceEndModalForAdmin()"><i class="ti ti-player-stop" style="font-size:13px;" aria-hidden="true"></i> End Trip (Admin)</button>
+    <button class="btn btn-primary" id="conveyanceRejectBtn" style="display:none;background:#dc2626;border-color:#dc2626;" onclick="withLoading(this, () => submitConveyanceReject())"><i class="ti ti-x" style="font-size:13px;" aria-hidden="true"></i> Reject</button>
+    <button class="btn btn-primary" id="conveyanceVerifyBtn" style="display:none;background:#1d4ed8;border-color:#1d4ed8;" onclick="withLoading(this, () => submitConveyanceVerify())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Verify</button>
+    <button class="btn btn-primary" id="conveyancePayBtn" style="display:none;background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitConveyancePay())"><i class="ti ti-cash" style="font-size:13px;" aria-hidden="true"></i> Mark Paid</button>
+  </div>
+</div></div>
+
+<!-- Rate editor (Admin only) — versioned, same pattern as Incentive Policy. -->
+<div class="modal-backdrop" id="conveyanceRateModal" style="display:none;" onclick="bdClose(event,'conveyanceRateModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-settings" aria-hidden="true"></i></div>
+      <div><h2>Edit Conveyance Rate</h2><div class="modal-sub">Saves as a new version — doesn't change already-logged trips</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('conveyanceRateModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-field"><label>Current Rate</label><div id="convRateCurrentDisplay" style="font-weight:600;">—</div></div>
+    <div class="form-grid" style="margin-top:10px;">
+      <div class="form-field"><label>New Rate (₹ per km) <span class="req">*</span></label><input type="number" id="convRateNewValue" min="0" step="0.1" onwheel="this.blur()" /></div>
+      <div class="form-field"><label>Effective From <span class="req">*</span></label><input type="date" id="convRateEffectiveFrom" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('conveyanceRateModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitConveyanceRate())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save New Rate</button>
+  </div>
+</div></div>
+
+<!-- INCENTIVE VEHICLE DETAIL MODAL — opened by clicking the Vehicles / CoD
+     Units count in the Incentive table (openIncentiveVehicleDetail(),
+     JS-Incentive.html). Reuses the copyTableById() helper for the Copy button. -->
+<div class="modal-backdrop" id="incentiveVehicleDetailModal" style="display:none;" onclick="bdClose(event,'incentiveVehicleDetailModal')">
+<div class="modal" style="width:92vw;max-width:1000px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-car" aria-hidden="true"></i></div>
+      <div><h2 id="incentiveVehicleDetailTitle">Vehicle Details</h2></div>
+    </div>
+    <button class="btn" onclick="copyTableById('incentiveVehicleDetailTable')"><i class="ti ti-copy" style="font-size:13px;" aria-hidden="true"></i> Copy</button>
+    <button class="modal-close" onclick="closeModal('incentiveVehicleDetailModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body" style="max-height:70vh;overflow:auto;">
+    <table class="crm-table" id="incentiveVehicleDetailTable">
+      <thead><tr><th>Lead No</th><th>Customer</th><th>Vehicle Type</th><th>Weight (kg)</th><th>Price</th><th>Trader Payment</th><th>₹/kg</th><th>Bucket</th><th>CoD</th><th>Amount</th></tr></thead>
+      <tbody id="incentiveVehicleDetailBody"></tbody>
+    </table>
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal('incentiveVehicleDetailModal')">Close</button></div>
+</div></div>
+
+<!-- PLANT ACCESSORIES CHECK MODAL — shown before Vehicle Receipt Form. Lets
+     plant staff confirm, item-by-item, whether each accessory (already
+     compared once at Valuation vs Delivery in the Accessories Check screen)
+     is actually present now that the vehicle has physically reached the
+     plant. Result is stored on the Vehicle Receipt row (see submitVehicleReceipt). -->
+<div class="modal-backdrop" id="plantAccessoriesModal" style="display:none;" onclick="bdClose(event,'plantAccessoriesModal')">
+<div class="modal" style="width:90vw;max-width:1000px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-list-check" aria-hidden="true"></i></div>
+      <div><h2>Accessories Check — Received at Plant</h2><div class="modal-sub" id="plantAccessoriesModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('plantAccessoriesModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="info-banner" style="margin-bottom:12px;">
+      <i class="ti ti-info-circle" aria-hidden="true"></i>
+      <span>Confirm whether each item is actually present on the vehicle now that it has reached the plant, before filling the Vehicle Receipt Form.</span>
+    </div>
+    <!-- Receive mode only (Received at Plant > Pending Receipt > Receive):
+         where the vehicle was unloaded/received — updates its location. -->
+    <div class="form-field" id="plantReceiveLocationField" style="display:none;margin-bottom:12px;max-width:360px;">
+      <label>Received Location <span class="req">*</span></label>
+      <div class="partner-search-wrap">
+        <div class="ps-input-row" onclick="toggleMasterSearchDD('plantReceiveLocation',event)">
+          <i class="ti ti-search" aria-hidden="true"></i>
+          <input id="plantReceiveLocation" data-masterlist="location" placeholder="Search location…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('plantReceiveLocation');event.stopPropagation()" autocomplete="off" />
+          <i class="ti ti-chevron-down" aria-hidden="true"></i>
+        </div>
+        <div class="ps-dropdown" id="msd_plantReceiveLocation"><div class="ps-list" id="msl_plantReceiveLocation"></div></div>
+      </div>
+      <label style="margin-top:8px;">Received Sub-Location</label>
+      <select id="plantReceiveSubLocation" disabled><option value="">— None —</option></select>
+    </div>
+    <div style="overflow-x:auto;">
+    <table class="crm-table" data-no-enhance>
+      <thead><tr><th>Item</th><th>Valuation (PE)</th><th>Delivery (PE)</th><th>Accessories Check</th><th>Re-upload Photo</th><th>Present at Plant? <span class="req">*</span></th></tr></thead>
+      <tbody id="plantAccessoriesBody"></tbody>
+    </table>
+    </div>
+    <div class="form-grid" style="margin-top:14px;">
+      <div class="form-field"><label>Debit Amount (₹) <span style="font-weight:400;color:var(--color-text-tertiary);">— if any item found short</span></label><input type="number" id="plantDebitAmount" min="0" onwheel="this.blur()" placeholder="0" /></div>
+      <div class="form-field"><label>Debit Reason</label><input id="plantDebitReason" placeholder="e.g. Stereo missing" /></div>
+      <div class="form-field"><label>Other Debit (₹) <span style="font-weight:400;color:var(--color-text-tertiary);">— optional</span></label><input type="number" id="plantOtherDebitAmount" min="0" onwheel="this.blur()" placeholder="0" /></div>
+      <div class="form-field"><label>Other Debit Reason</label><input id="plantOtherDebitReason" placeholder="e.g. Body damage in transit" /></div>
+    </div>
+    <div class="form-field fg-full" style="margin-top:8px;"><label>Remarks</label><textarea id="plantAccessoriesRemarks" rows="2" placeholder="Any notes on missing items…"></textarea></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('plantAccessoriesModal')">Cancel</button>
+    <button class="btn btn-primary" id="plantAccessoriesConfirmBtn" style="background:#d97706;border-color:#d97706;" onclick="withLoading(this, () => confirmPlantAccessoriesCheck())"><i class="ti ti-arrow-right" style="font-size:13px;" aria-hidden="true"></i> <span id="plantAccessoriesConfirmLabel">Confirm &amp; Continue to Receipt Form</span></button>
+  </div>
+</div></div>
+
+<!-- VEHICLE RECEIPT (Received at Plant) MODAL -->
+<div class="modal-backdrop" id="plantModal" style="display:none;" onclick="bdClose(event,'plantModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-building-warehouse" aria-hidden="true"></i></div>
+      <div><h2>Vehicle Receipt Form</h2><div class="modal-sub" id="plantModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('plantModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Received From</label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="toggleMasterSearchDD('prReceivedFrom',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="prReceivedFrom" data-masterlist="location" placeholder="Search location…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('prReceivedFrom');event.stopPropagation()" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="msd_prReceivedFrom"><div class="ps-list" id="msl_prReceivedFrom"></div></div>
+        </div>
+      </div>
+      <div class="form-field"><label>Vehicle Dropping Person</label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="toggleMasterSearchDD('prDroppingPerson',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="prDroppingPerson" data-masterlist="vehicle_dropping_person" placeholder="Search dropping person…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('prDroppingPerson');event.stopPropagation()" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="msd_prDroppingPerson"><div class="ps-list" id="msl_prDroppingPerson"></div></div>
+        </div>
+      </div>
+      <div class="form-field"><label>RST No.</label><input id="prRstNo" /></div>
+      <div class="form-field"><label>RST Receipt Date</label><input type="date" id="prRstDate" /></div>
+      <div class="form-field"><label>Weight (Kg) as per Bridge Slip</label><input type="number" id="prWeight" min="0" onwheel="this.blur()" /></div>
+      <div class="form-field"><label>Upload Bridge Slip Photo <span id="prBridgeSlipExisting" style="display:none;font-weight:400;color:var(--color-text-tertiary);">(already uploaded — pick a file only to replace it)</span></label><input type="file" id="prBridgeSlipPhoto" class="upload-field-input" /></div>
+      <div class="form-field"><label>Upload Vehicle Photo <span id="prVehiclePhotoExisting" style="display:none;font-weight:400;color:var(--color-text-tertiary);">(already uploaded — pick a file only to replace it)</span></label><input type="file" id="prVehiclePhoto" class="upload-field-input" /></div>
+      <div class="form-field fg-full"><label>Remarks if any</label><textarea id="prRemarks" rows="2"></textarea></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('plantModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitVehicleReceipt())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Receipt</button>
+  </div>
+</div></div>
+
+<!-- UPDATE LOCATION MODAL (Location Tracking tab) -->
+<div class="modal-backdrop" id="locationUpdateModal" style="display:none;" onclick="bdClose(event,'locationUpdateModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-map-pin" aria-hidden="true"></i></div>
+      <div><h2>Update Vehicle Location</h2><div class="modal-sub" id="locUpdateModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('locationUpdateModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Current Location</label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="toggleMasterSearchDD('locUpdateValue',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="locUpdateValue" data-masterlist="location" data-exclude="Jaipur Plant" placeholder="Search location…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('locUpdateValue');event.stopPropagation()" onblur="refreshSubLocationSelect('locUpdateSubValue',this.value)" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="msd_locUpdateValue"><div class="ps-list" id="msl_locUpdateValue"></div></div>
+        </div>
+      </div>
+      <div class="form-field"><label>Sub-Location</label>
+        <select id="locUpdateSubValue" disabled><option value="">— None —</option></select>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('locationUpdateModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitLocationUpdate())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Location</button>
+  </div>
+</div></div>
+
+<!-- VEHICLE DISPOSAL MODAL (Vehicle Disposal tab) — Scrapped requires
+     4-10 mandatory dismantle photos AND 4-10 mandatory dismantle videos;
+     Reserved needs no evidence, those fields stay hidden. -->
+<div class="modal-backdrop" id="vehicleDisposalModal" style="display:none;" onclick="bdClose(event,'vehicleDisposalModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-recycle" aria-hidden="true"></i></div>
+      <div><h2>Vehicle Disposal</h2><div class="modal-sub" id="disposalModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('vehicleDisposalModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Status to be</label>
+        <select id="disposalStatus" onchange="handleDisposalStatusChange(this.value)">
+          <option value="">Select…</option>
+          <option value="Scrapped">Scrapped</option>
+          <option value="Reserved">Reserved</option>
+        </select>
+      </div>
+      <div id="disposalEvidenceFields" style="display:none;" class="fg-full">
+        <div class="form-grid">
+          <div class="form-field fg-full">
+            <label>Upload Dismantle Photos (min 4, max 10)</label>
+            <input type="file" id="disposalPhotos" class="upload-field-input" accept="image/*" multiple />
+          </div>
+          <div class="form-field fg-full">
+            <label>Upload Dismantle Videos (min 4, max 10)</label>
+            <input type="file" id="disposalVideos" class="upload-field-input" accept="video/*" multiple />
+          </div>
+        </div>
+      </div>
+      <!-- Reserved reason (Ramvir, Oct 2026) — mandatory now, with who did
+           it captured server-side via scrap_reserved_by on save. -->
+      <div id="disposalReservedFields" style="display:none;" class="fg-full">
+        <div class="form-field fg-full"><label>Reason for Reserving <span class="req">*</span></label>
+          <textarea id="disposalReservedReason" rows="2" placeholder="Why is this vehicle being reserved instead of scrapped/allocated?"></textarea>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('vehicleDisposalModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitVehicleDisposal())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save</button>
+  </div>
+</div></div>
+
+<!-- ALLOCATE TO CONTRACTOR MODAL (Vehicle Disposal — Pending Disposal tab) —
+     Ramvir, Oct 2026. Picks an existing contractor; "+ Add Contractor"
+     link jumps to the dedicated Add Contractor modal below instead of
+     duplicating that form here. -->
+<div class="modal-backdrop" id="allocateContractorModal" style="display:none;" onclick="bdClose(event,'allocateContractorModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-truck-delivery" aria-hidden="true"></i></div>
+      <div><h2>Allocate to Contractor</h2><div class="modal-sub" id="allocateModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('allocateContractorModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Contractor <span class="req">*</span>
+        <a href="javascript:void(0)" onclick="closeModal('allocateContractorModal');openAddContractorModal()" style="font-size:10px;font-weight:400;">+ Add New Contractor</a></label>
+        <select id="allocateContractorSelect"><option value="">Select…</option></select>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('allocateContractorModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitAllocateContractor())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Allocate</button>
+  </div>
+</div></div>
+
+<!-- ADD CONTRACTOR MODAL — Ramvir, Oct 2026. Name/Phone/Location, per the
+     Vehicle Scrapping Module doc ("some vehicles are scrapped by a
+     Contractor"). -->
+<div class="modal-backdrop" id="addContractorModal" style="display:none;" onclick="bdClose(event,'addContractorModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-user-plus" aria-hidden="true"></i></div>
+      <div><h2>Add Contractor</h2><div class="modal-sub">Scrap contractors who take vehicles for scrapping</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('addContractorModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Name <span class="req">*</span></label><input type="text" id="contractorName" placeholder="Contractor name" /></div>
+      <div class="form-field"><label>Phone</label><input type="text" id="contractorPhone" placeholder="Phone number" /></div>
+      <div class="form-field"><label>Location</label><input type="text" id="contractorLocation" placeholder="Location" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('addContractorModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitAddContractor())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save</button>
+  </div>
+</div></div>
+
+<!-- BULK RESERVE MODAL (Ramvir, Oct 2026) — reason for Reserving, shared by
+     the Pending Disposal and Contractor tabs' "Reserve Selected"/"Move to
+     Reserved" bulk actions (openBulkReserveModal / submitBulkReserve,
+     JS-Operations.html). -->
+<div class="modal-backdrop" id="bulkReserveModal" style="display:none;" onclick="bdClose(event,'bulkReserveModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-pin" aria-hidden="true"></i></div>
+      <div><h2>Reserve Vehicles</h2><div class="modal-sub" id="bulkReserveCount">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('bulkReserveModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Reason for Reserving <span class="req">*</span></label>
+        <textarea id="bulkReserveReason" rows="2" placeholder="Why are these vehicles being reserved instead of scrapped/allocated?"></textarea>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('bulkReserveModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitBulkReserve())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Reserve</button>
+  </div>
+</div></div>
+
+<!-- ============================================================
+     COD DASHBOARD MODALS (Ramvir, Oct 2026) — Dealer master, per-CoD
+     "sold to" assignment, CoD Order, Payment Entry. See JS-Tracking.html
+     for the submit handlers.
+     ============================================================ -->
+
+<!-- ADD COD DEALER — standalone master (rewire_cod_dealers), seeded from
+     his "Debtors CODs.xlsx" Master sheet's 73 names. -->
+<div class="modal-backdrop" id="addCodDealerModal" style="display:none;" onclick="bdClose(event,'addCodDealerModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-building-store" aria-hidden="true"></i></div>
+      <div><h2>Add CoD Dealer</h2><div class="modal-sub">Customer who buys sold CoDs from us (e.g. a dealership)</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('addCodDealerModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Dealer / Company Name <span class="req">*</span></label><input type="text" id="codDealerName" placeholder="e.g. Rajesh Toyota" /></div>
+      <div class="form-field"><label>Contact Name</label><input type="text" id="codDealerContact" placeholder="Contact person" /></div>
+      <div class="form-field"><label>Mobile</label><input type="text" id="codDealerMobile" placeholder="Phone number" /></div>
+      <div class="form-field fg-full"><label>GST Number</label><input type="text" id="codDealerGst" placeholder="GSTIN (optional)" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('addCodDealerModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitAddCodDealer())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save</button>
+  </div>
+</div></div>
+
+<!-- ASSIGN DEALER — on a SOLD CoD trade row, picks who actually bought it
+     (manual, since DigiELV's own export has no concept of this) plus the
+     Dealer-side Payment Status, mirroring his "Sales" sheet. -->
+<div class="modal-backdrop" id="assignCodDealerModal" style="display:none;" onclick="bdClose(event,'assignCodDealerModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-user-dollar" aria-hidden="true"></i></div>
+      <div><h2>Sold To</h2><div class="modal-sub" id="assignDealerModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('assignCodDealerModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <!-- Assign To (Ramvir, Oct 2026) — a sold CoD can go either to a
+           regular Dealer (tracked in rewire_cod_dealers, with its own
+           Ledger/Pending Payment reports) or to a one-off Customer (just a
+           name + mobile snapshot on the trade row itself, no master
+           record) — e.g. a walk-in buyer who isn't a repeat dealer.
+           Customer-assigned rows won't show up in the Dealer Ledger/
+           Pending Payment reports since there's no dealer account to
+           reconcile against; they still clear out of the "Pending Assign"
+           queue once saved. -->
+      <div class="form-field fg-full"><label>Assign To <span class="req">*</span></label>
+        <select id="assignToType" onchange="onAssignToTypeChange()">
+          <option value="dealer">Dealer</option>
+          <option value="customer">Customer</option>
+        </select>
+      </div>
+      <div class="form-field fg-full" id="assignDealerBlock"><label>Dealer <span class="req">*</span>
+        <a href="javascript:void(0)" onclick="closeModal('assignCodDealerModal');openAddCodDealerModal()" style="font-size:10px;font-weight:400;">+ Add New Dealer</a></label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="togglePSD('assignDealerDropdown',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="assignDealerInput" placeholder="Search Dealer…" oninput="filterAssignDealerOptions(this.value)" onclick="openPSD('assignDealerDropdown');event.stopPropagation()" autocomplete="off" />
+          </div>
+          <div class="ps-dropdown" id="assignDealerDropdown"><div class="ps-list" id="assignDealerList"></div></div>
+        </div>
+        <input type="hidden" id="assignDealerSelect" />
+      </div>
+      <div class="form-field fg-full" id="assignCustomerBlock" style="display:none;">
+        <div class="form-grid" style="padding:0;">
+          <div class="form-field"><label>Customer Name <span class="req">*</span></label><input type="text" id="assignCustomerName" placeholder="Customer's name" /></div>
+          <div class="form-field"><label>Customer Mobile</label><input type="text" id="assignCustomerMobile" placeholder="Mobile number" /></div>
+        </div>
+      </div>
+      <div class="form-field"><label>Payment Status</label>
+        <select id="assignDealerPaymentStatus" onchange="onAssignPaymentStatusChange()"><option value="Pending">Pending</option><option value="Received">Received</option></select>
+      </div>
+      <div class="form-field" id="assignPaymentModeField" style="display:none;"><label>Payment Mode <span class="req">*</span></label>
+        <select id="assignPaymentMode"><option value="">Select…</option><option value="Cash">Cash</option><option value="GNM-101">GNM-101</option><option value="HDFC-6002">HDFC-6002</option><option value="GVUPL">GVUPL</option><option value="DigiELV-Direct">DigiELV-Direct</option><option value="FOC">FOC</option></select>
+      </div>
+      <div class="form-field"><label>CoD Amount (₹)</label><input type="number" min="0" step="any" id="assignCodAmount" placeholder="Amount received for this CoD" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('assignCodDealerModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitAssignCodDealer())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save</button>
+  </div>
+</div></div>
+
+<!-- COD ORDER — forward demand from a Dealer: ONE CoD at a time (category
+     + quoted price without GST), per Ramvir's explicit correction — no
+     quantity/number field, since each actual Sale is always a single CD
+     No anyway (see the info banner on the CoD Dashboard pane for how this
+     relates to the real sale, which still happens via "Assign Dealer" on
+     the COD Purchased/Sold tab, not here). -->
+<div class="modal-backdrop" id="codOrderModal" style="display:none;" onclick="bdClose(event,'codOrderModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-clipboard-list" aria-hidden="true"></i></div>
+      <div><h2>New CoD Order</h2><div class="modal-sub">A Dealer's booking for ONE CoD — category + quoted price (without GST)</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('codOrderModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Dealer <span class="req">*</span>
+        <a href="javascript:void(0)" onclick="closeModal('codOrderModal');openAddCodDealerModal()" style="font-size:10px;font-weight:400;">+ Add New Dealer</a></label>
+        <select id="codOrderDealerSelect"><option value="">Select…</option></select>
+      </div>
+      <div class="form-field"><label>CoD Category <span class="req">*</span></label>
+        <select id="codOrderCategory">
+          <option value="">Select…</option>
+          <option value="PV CoD - Rajasthan">PV CoD - Rajasthan</option>
+          <option value="PV CoD - Non Rajasthan">PV CoD - Non Rajasthan</option>
+          <option value="CV CoD - LGV">CV CoD - LGV</option>
+          <option value="CV CoD - HGV">CV CoD - HGV</option>
+          <option value="2W CoD">2W CoD</option>
+        </select>
+      </div>
+      <div class="form-field"><label>Price without GST (₹) <span class="req">*</span></label><input type="number" id="codOrderPrice" min="0" placeholder="Quoted price for this CoD" /></div>
+      <div class="form-field"><label>Order Date</label><input type="date" id="codOrderDate" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('codOrderModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitCodOrder())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save</button>
+  </div>
+</div></div>
+
+<!-- PAYMENT ENTRY — Dealer + multi-select of their sold-but-unpaid CoDs +
+     amount + payment mode, per his requirement #7. -->
+<div class="modal-backdrop" id="codPaymentModal" style="display:none;" onclick="bdClose(event,'codPaymentModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-cash" aria-hidden="true"></i></div>
+      <div><h2>Payment Entry</h2><div class="modal-sub">Record a payment received from a Dealer</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('codPaymentModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Dealer <span class="req">*</span>
+        <a href="javascript:void(0)" onclick="closeModal('codPaymentModal');openAddCodDealerModal()" style="font-size:10px;font-weight:400;">+ Add New Dealer</a></label>
+        <select id="codPaymentDealerSelect" onchange="onCodPaymentDealerChange()"><option value="">Select…</option></select>
+      </div>
+      <div class="form-field fg-full"><label>CoDs Sold to this Dealer (optional — tick the ones this payment covers)</label>
+        <div id="codPaymentCdList" style="max-height:140px;overflow:auto;border:1px solid var(--color-border-secondary);border-radius:8px;padding:8px;font-size:12px;">
+          <span style="color:var(--color-text-tertiary);">Select a Dealer first…</span>
+        </div>
+      </div>
+      <div class="form-field"><label>Amount (₹) <span class="req">*</span></label><input type="number" id="codPaymentAmount" min="0" placeholder="Amount received" /></div>
+      <div class="form-field"><label>Payment Mode <span class="req">*</span></label>
+        <select id="codPaymentMode">
+          <option value="">Select…</option>
+          <option value="Cash">Cash</option>
+          <option value="GNM-101">GNM-101</option>
+          <option value="HDFC-6002">HDFC-6002</option>
+          <option value="GVUPL">GVUPL</option>
+          <option value="DigiELV-Direct">DigiELV-Direct</option>
+          <option value="FOC">FOC</option>
+        </select>
+      </div>
+      <div class="form-field"><label>Payment Date</label><input type="date" id="codPaymentDate" /></div>
+      <div class="form-field fg-full"><label>Remarks</label><input type="text" id="codPaymentRemarks" placeholder="Optional note" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('codPaymentModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitCodPayment())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Payment</button>
+  </div>
+</div></div>
+
+<!-- ADD USER MODAL (Admin only) -->
+<div class="modal-backdrop" id="addUserModal" style="display:none;" onclick="bdClose(event,'addUserModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-user-plus" aria-hidden="true"></i></div>
+      <div><h2>Add New User</h2><div class="modal-sub">Creates login + assigns role</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('addUserModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>User ID <span class="req">*</span></label><input id="nuUserId" placeholder="e.g. 100617" /></div>
+      <div class="form-field"><label>Full Name <span class="req">*</span></label><input id="nuName" placeholder="Full name" /></div>
+      <div class="form-field"><label>Password <span class="req">*</span></label><input id="nuPassword" type="text" placeholder="Min. 6 characters" /></div>
+      <div class="form-field"><label>Phone (WhatsApp)</label><input id="nuPhone" type="tel" placeholder="10-digit mobile number" /></div>
+      <div class="form-field"><label>Role <span class="req">*</span></label>
+        <select id="nuRole" onchange="toggleManagerField(this.value)">
+          <option value="">Select role</option>
+          <option value="PE">PE</option>
+          <option value="Manager">Manager</option>
+          <option value="Back Office">Back Office</option>
+          <option value="Back Office 2">Back Office 2</option>
+          <option value="Back Office Head">Back Office Head</option>
+          <option value="Store">Store</option>
+          <option value="Logistics">Logistics</option>
+          <option value="Warehouse">Warehouse</option>
+          <option value="CRE">CRE</option>
+          <option value="Accounts">Accounts</option>
+          <option value="Head">Head</option>
+          <option value="Admin">Admin</option>
+        </select>
+      </div>
+      <div class="form-field" id="nuManagerField" style="display:none;">
+        <label>Reports to Manager</label>
+        <select id="nuManagerId"><option value="">Select manager</option></select>
+      </div>
+      <div class="form-field" id="nuManagerEmailField" style="display:none;">
+        <label>Email <span class="req">*</span></label>
+        <input id="nuManagerEmail" type="email" placeholder="name@company.com" />
+      </div>
+    </div>
+    <div class="info-banner">
+      <i class="ti ti-info-circle" aria-hidden="true"></i>
+      <span>Login will be: <strong id="nuLoginPreview">User ID + Password</strong> (no email needed).</span>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('addUserModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitAddUser())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Create User</button>
+  </div>
+</div></div>
+
+<!-- COD/CVS ENTRY MODAL -->
+<div class="modal-backdrop" id="codModal" style="display:none;" onclick="bdClose(event,'codModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-file-certificate" aria-hidden="true"></i></div>
+      <div><h2>COD / CVS Entry</h2><div class="modal-sub">Document tracking</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('codModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <!-- Upload Type moved first, before Registration Number (Ramvir, Sept
+           2026) — picking the type up front makes more sense operationally
+           since it decides which fields appear below; Registration Number
+           now follows it instead of leading. -->
+      <div class="form-field"><label>Upload Type <span class="req">*</span></label>
+        <select id="codUploadType" onchange="handleCodType(this.value)">
+          <option value="">Select</option><option>COD</option><option>CVS</option><option>DMS/Rewire No.</option>
+        </select>
+      </div>
+      <div class="form-field fg-full">
+        <label>Registration Number <span class="req">*</span></label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="togglePSD('psdCodReg',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="codRegInput" placeholder="Search, or type a new registration number…" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase();filterCodRegOptions(this.value)" onclick="openPSD('psdCodReg');event.stopPropagation()" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="psdCodReg">
+            <div class="ps-list" id="codRegList"></div>
+          </div>
+        </div>
+        <div id="codRegStatusNote" style="font-size:11px;margin-top:5px;"></div>
+      </div>
+      <div class="form-field" id="codDateField" style="display:none;"><label id="codDateLabel">Date</label><input type="date" data-field="cod_date" /></div>
+      <div class="form-field fg-full" id="dmsRewireField" style="display:none;"><label>DMS / Rewire Reference No.</label><input data-field="cod_dms_rewire" placeholder="Enter reference number (leave blank if pending)" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase()"/></div>
+      <div class="form-field" id="codField" style="display:none;"><label>COD Number</label><input data-field="cod_number" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase()"/></div>
+      <div class="form-field" id="codFileField" style="display:none;"><label>Upload COD</label><input type="file" data-field="cod_file" class="upload-field-input" /></div>
+      <div class="form-field" id="cvsField" style="display:none;"><label>CVS Number</label><input data-field="cvs_number" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase()"/></div>
+      <div class="form-field" id="cvsFileField" style="display:none;"><label>Upload CVS</label><input type="file" data-field="cvs_file" class="upload-field-input" /></div>
+      <div class="form-field" id="cvsChassisPlateField" style="display:none;"><label>Chassis Plate Photo</label><input type="file" data-field="cvs_chassis_plate_photo" class="upload-field-input" /></div>
+      <div class="form-field" id="cvsEnginePlateField" style="display:none;"><label>Engine Plate Photo</label><input type="file" data-field="cvs_engine_plate_photo" class="upload-field-input" /></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('codModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitCodCvs())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Save Entry</button>
+  </div>
+</div></div>
+
+<!-- COD/CVS BULK UPLOAD MODAL — 3 independent Excel uploads (DMS/Rewire No.,
+     COD, CVS), each upserted by (registration_number, upload_type) so
+     they can be uploaded in any order/at different times and get linked
+     automatically once a row for that vehicle exists on all 3 types. -->
+<div class="modal-backdrop" id="codCvsBulkModal" style="display:none;" onclick="bdClose(event,'codCvsBulkModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-upload" aria-hidden="true"></i></div>
+      <div><h2>Bulk Upload — COD / CVS</h2><div class="modal-sub">Excel file, one upload type at a time</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('codCvsBulkModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field"><label>Upload Type <span class="req">*</span></label>
+        <select id="codBulkType" onchange="handleCodBulkTypeChange(this.value)">
+          <option value="">Select</option>
+          <option value="DMS/Rewire No.">DMS/Rewire No.</option>
+          <option value="COD">COD</option>
+          <option value="CVS">CVS</option>
+        </select>
+      </div>
+      <div class="form-field fg-full" id="codBulkColsNote" style="font-size:11px;color:var(--color-text-tertiary);"></div>
+      <div class="form-field fg-full"><label>Excel File <span class="req">*</span></label><input type="file" id="codBulkFile" accept=".xlsx,.xls,.csv" onchange="codCvsBulkFileSelected(this)" /></div>
+    </div>
+    <div id="codBulkPreviewArea" style="display:none;margin-top:10px;">
+      <div style="font-size:12px;color:var(--color-text-tertiary);margin-bottom:6px;" id="codBulkPreviewCount"></div>
+      <div style="max-height:260px;overflow:auto;border:0.5px solid var(--color-border-tertiary);border-radius:8px;">
+        <table class="crm-table" style="margin-bottom:0;"><thead id="codBulkPreviewHead"></thead><tbody id="codBulkPreviewBody"></tbody></table>
+      </div>
+    </div>
+    <div id="codBulkResultsArea" style="display:none;margin-top:10px;"></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('codCvsBulkModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => runCodCvsBulkUpload())"><i class="ti ti-database-export" style="font-size:13px;" aria-hidden="true"></i> Upload</button>
+  </div>
+</div></div>
+
+<!-- COD PURCHASED/SOLD (Trade History) BULK UPLOAD MODAL (Ramvir, Sept 2026)
+     — one fixed file format (CD No/Category/Make/Traded Price/Trade Type/
+     Trade Date/Payment Status/UTR No/Payout Value), unlike the 3-type COD/
+     CVS modal above there's no "Upload Type" picker here since BUY/SELL is
+     itself a column in the file. Upserted on (cd_no, trade_type) so a CoD's
+     BUY row and its later SELL row both land as separate rows instead of
+     overwriting each other. -->
+<div class="modal-backdrop" id="codTradesBulkModal" style="display:none;" onclick="bdClose(event,'codTradesBulkModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-upload" aria-hidden="true"></i></div>
+      <div><h2>Upload Trade History</h2><div class="modal-sub">Excel export — CD No, Category, Make, Traded Price, Trade Type (BUY/SELL), Trade Date, Payment Status, UTR No, Payout Value</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('codTradesBulkModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Excel File <span class="req">*</span></label><input type="file" id="ctBulkFile" accept=".xlsx,.xls,.csv" onchange="codTradesBulkFileSelected(this)" /></div>
+    </div>
+    <div id="ctBulkPreviewArea" style="display:none;margin-top:10px;">
+      <div style="font-size:12px;color:var(--color-text-tertiary);margin-bottom:6px;" id="ctBulkPreviewCount"></div>
+      <div style="max-height:260px;overflow:auto;border:0.5px solid var(--color-border-tertiary);border-radius:8px;">
+        <table class="crm-table" style="margin-bottom:0;"><thead id="ctBulkPreviewHead"></thead><tbody id="ctBulkPreviewBody"></tbody></table>
+      </div>
+    </div>
+    <div id="ctBulkResultsArea" style="display:none;margin-top:10px;"></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('codTradesBulkModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => runCodTradesBulkUpload())"><i class="ti ti-database-export" style="font-size:13px;" aria-hidden="true"></i> Upload</button>
+  </div>
+</div></div>
+
+<!-- PLANT BULK PURCHASE MODAL (Honda/Tata OEM intake — Ramvir, Sept 2026)
+     Back Office Head only. These vehicles come pre-paid and in bulk from
+     Honda/Tata; this inserts brand-new, already-fully-processed vehicle
+     records directly (skipping the retail Need Analysis -> ... -> Head
+     Approval pipeline) so they land straight in the existing Purchased
+     tab and Received at Plant queue — "same process" as any other
+     purchased vehicle from that point on, per Ramvir's instruction. -->
+<div class="modal-backdrop" id="plantBulkPurchaseModal" style="display:none;" onclick="bdClose(event,'plantBulkPurchaseModal')">
+<div class="modal" style="max-width:900px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-building-factory-2" aria-hidden="true"></i></div>
+      <div><h2>Bulk Upload — Plant Purchase</h2><div class="modal-sub">Excel columns: Registration Number, Purchase Date, Customer Name, Address, City, PAN/TAN, Aadhar, Mobile Number, Email ID, Vehicle Make, Model/Variant, Registration Year, Vehicle Type, Engine No., Chassis No., Fuel Type, RC Type, Location, Sub-Location (last 6 optional), Procurement Executive Name, Purchase Type, Vendor Name, COD Ownership, Trader Name, Car Purchase Value, Customer Payment, Dealer/Broker Payment, COD Payment, Bank Name, Bank Branch Name, Bank Account Number, IFSC Code, Remarks</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('plantBulkPurchaseModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="info-banner"><i class="ti ti-info-circle" aria-hidden="true"></i><span>Har vehicle payment already-done maan kar seedhe "Purchased" me save hogi (Received at Plant tak same process). Registration Number jo already system me hai, wo row skip ho jayegi.</span></div>
+    <div class="form-grid">
+      <div class="form-field fg-full">
+        <label>Excel File <span class="req">*</span></label>
+        <input type="file" id="pbpBulkFile" accept=".xlsx,.xls,.csv" onchange="plantBulkPurchaseFileSelected(this)" />
+        <a href="javascript:void(0)" onclick="downloadPlantBulkPurchaseSample()" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#1d4ed8;text-decoration:underline;margin-top:6px;"><i class="ti ti-download" aria-hidden="true" style="font-size:13px;"></i> Download Sample Excel</a>
+      </div>
+    </div>
+    <div id="pbpBulkPreviewArea" style="display:none;margin-top:10px;">
+      <div style="font-size:12px;color:var(--color-text-tertiary);margin-bottom:6px;" id="pbpBulkPreviewCount"></div>
+      <div style="max-height:260px;overflow:auto;border:0.5px solid var(--color-border-tertiary);border-radius:8px;">
+        <table class="crm-table" style="margin-bottom:0;"><thead id="pbpBulkPreviewHead"></thead><tbody id="pbpBulkPreviewBody"></tbody></table>
+      </div>
+    </div>
+    <div id="pbpBulkResultsArea" style="display:none;margin-top:10px;"></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('plantBulkPurchaseModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => runPlantBulkPurchaseUpload())"><i class="ti ti-database-export" style="font-size:13px;" aria-hidden="true"></i> Upload</button>
+  </div>
+</div></div>
+
+<!-- STOCK BULK UPDATE MODAL (Ramvir, Sept 2026) — Admin-only. Excel format
+     matches the "Stock/Sold Update Format" template (one sheet per
+     Material Category: Fuel, Tyre, Parts, Engine, Catcon, Seats, Spare
+     Wheel, Speaker, Stereo, Battery, Tyre Inv, Rim Inv, Jack, Jack Rod),
+     same headers Material Entry + the Stock tab already use. -->
+<div class="modal-backdrop" id="stockBulkUpdateModal" style="display:none;" onclick="bdClose(event,'stockBulkUpdateModal')">
+<div class="modal" style="max-width:900px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-database-import" aria-hidden="true"></i></div>
+      <div><h2>Bulk Stock Update</h2><div class="modal-sub">Upload the Stock/Sold Update Format workbook (one sheet per Material Category) — matches vehicles by Vehicle No., fills Unique Codes automatically, and updates Stock/Sold status.</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('stockBulkUpdateModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="info-banner"><i class="ti ti-info-circle" aria-hidden="true"></i><span>Vehicle No. se match hoga — jo vehicle system me nahi milegi, uski row skip ho jayegi aur upload ke baad list me dikhegi. Missing Unique Codes khud sahi sequence me generate honge.</span></div>
+    <div class="form-grid">
+      <div class="form-field fg-full">
+        <label>Excel File <span class="req">*</span></label>
+        <input type="file" id="stockBulkFile" accept=".xlsx,.xls" onchange="stockBulkUpdateFileSelected(this)" />
+      </div>
+    </div>
+    <div id="stockBulkPreviewArea" style="display:none;margin-top:10px;">
+      <div style="font-size:12px;color:var(--color-text-tertiary);margin-bottom:6px;" id="stockBulkPreviewCount"></div>
+      <div style="max-height:260px;overflow:auto;border:0.5px solid var(--color-border-tertiary);border-radius:8px;">
+        <table class="crm-table" style="margin-bottom:0;"><thead id="stockBulkPreviewHead"></thead><tbody id="stockBulkPreviewBody"></tbody></table>
+      </div>
+    </div>
+    <div id="stockBulkResultsArea" style="display:none;margin-top:10px;"></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('stockBulkUpdateModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => runStockBulkUpdateUpload())"><i class="ti ti-database-export" style="font-size:13px;" aria-hidden="true"></i> Upload</button>
+  </div>
+</div></div>
+
+<!-- DOCUMENTS MANAGEMENT MODAL -->
+<div class="modal-backdrop" id="documentsModal" style="display:none;" onclick="bdClose(event,'documentsModal')">
+<div class="modal" style="max-width:760px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-files" aria-hidden="true"></i></div>
+      <div><h2>Documents Management</h2><div class="modal-sub" id="docModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('documentsModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="vd-card" style="margin-bottom:14px;">
+      <div class="vd-row"><span class="vd-label">PE Name</span><span class="vd-value" id="docPeName">–</span></div>
+      <div class="vd-row"><span class="vd-label">Vehicle Registration No.</span><span class="vd-value" id="docVehicleNo">–</span></div>
+      <div class="vd-row"><span class="vd-label">Customer Name</span><span class="vd-value" id="docCustomerName">–</span></div>
+      <div class="vd-row"><span class="vd-label">Customer Mobile</span><span class="vd-value" id="docCustomerMobile">–</span></div>
+      <div class="vd-row"><span class="vd-label">Broker/New Car Dealer/Vendor Name</span><span class="vd-value" id="docBrokerName">–</span></div>
+      <div class="vd-row"><span class="vd-label">Pickup Location</span><span class="vd-value" id="docPickupLocation">–</span></div>
+      <!-- Single form-wide Source (Ramvir, Sept 2026) — replaces the old
+           per-document Source dropdown. One selection here (Manual/Zoho)
+           now determines the source for every item in whichever Part is
+           saved next (submitDocumentsPart1/2, JS-Tracking.html), instead
+           of picking it document-by-document. -->
+      <div class="vd-row"><span class="vd-label">Source</span><span class="vd-value">
+        <select id="docFormSource" style="border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 8px;font-size:12px;">
+          <option value="">Select</option>
+          <option value="Manual">Manual</option>
+          <option value="Zoho">Zoho</option>
+        </select>
+      </span></div>
+    </div>
+    <!-- Split into 2 independently-saved parts (Ramvir, Sept 2026) so 2
+         different Back Office people can each fill their own part without
+         overwriting the other's — Part 1 (pre-dispatch, City Office side,
+         through Vehicle RC) and Part 2 (at Jaipur Plant: Weigh Bridge
+         Receipt onward). Each has its own Save button; submitDocumentsPart1/
+         submitDocumentsPart2 (JS-Tracking.html) only upsert their own
+         columns so the other part's already-saved values are untouched. -->
+    <div data-role-gate="documents-part1">
+      <div class="vd-card" style="margin-bottom:6px;padding:8px 12px;background:var(--color-bg-secondary);">
+        <strong style="font-size:12px;">Part 1 — Pre-Dispatch (Back Office)</strong>
+      </div>
+      <table class="crm-table" data-no-enhance>
+        <thead><tr><th>Document</th><th>Status</th><th>RC Reupload</th></tr></thead>
+        <tbody id="docItemsBodyPart1"></tbody>
+      </table>
+      <div id="docRcSyncBadge" style="display:none;margin:6px 0 0;font-size:11px;color:#059669;"></div>
+      <div style="text-align:right;margin:8px 0 16px;">
+        <button class="btn btn-primary" style="padding:6px 14px;font-size:12px;" onclick="withLoading(this, () => submitDocumentsPart1())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Part 1</button>
+      </div>
+    </div>
+
+    <div data-role-gate="documents-part2">
+      <div class="vd-card" style="margin-bottom:6px;padding:8px 12px;background:var(--color-bg-secondary);">
+        <strong style="font-size:12px;">Part 2 — At Plant (Back Office)</strong>
+      </div>
+      <table class="crm-table" data-no-enhance>
+        <thead><tr><th>Document</th><th>Status</th><th></th></tr></thead>
+        <tbody id="docItemsBodyPart2"></tbody>
+      </table>
+      <div style="text-align:right;margin:8px 0 0;">
+        <button class="btn btn-primary" style="padding:6px 14px;font-size:12px;" onclick="withLoading(this, () => submitDocumentsPart2())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Part 2</button>
+      </div>
+    </div>
+
+    <div class="form-field fg-full" style="margin-top:14px;"><label>Remarks</label><textarea id="docRemarks" rows="2" placeholder="Any notes…"></textarea></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('documentsModal')">Close</button>
+  </div>
+</div></div>
+
+<!-- MATERIAL MODAL — rebuilt from Ramvir's old standalone Apps Script
+     "Material Management Form" (Sept 2026, reworked again per his direct
+     screenshot feedback the same week). His old app showed only ONE of
+     these 14 category fieldsets at a time — picked via a "Material
+     Category" dropdown, everything else stays hidden until that category
+     is chosen. His first version of this rebuild made every category
+     visible at once instead; he pushed back with screenshots of the real
+     old-app UI and asked for the dropdown-gated behavior back exactly as
+     it was. So: matCategory select below + handleMatCategoryChange()
+     (JS-Tracking.html) shows exactly one .mat-cat-group at a time. The
+     underlying DATA MODEL is unchanged from the first rebuild, though —
+     still ONE combined row per vehicle in rewire_materials (upsert on
+     lead_id), not a fresh row per category submission like the old app.
+     This works because every category's fields stay in the DOM (just
+     hidden via CSS) and keep whatever value openMaterialModal() prefilled
+     from the existing row, so clicking Save always resubmits the full set —
+     the one category you just edited, plus every other category's
+     untouched existing value. Only 3 of the old file uploads carried over
+     (Speaker Photo, Stereo Photo, Battery Testing Report) since those were
+     the only ones the old form itself had. -->
+<div class="modal-backdrop" id="materialModal" style="display:none;" onclick="bdClose(event,'materialModal')">
+<div class="modal" style="max-width:720px;">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-tools" aria-hidden="true"></i></div>
+      <div><h2>Material</h2><div class="modal-sub" id="matModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('materialModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="vd-card" style="margin-bottom:14px;">
+      <div class="vd-row"><span class="vd-label">PE Name</span><span class="vd-value" id="matPeName">–</span></div>
+      <div class="vd-row"><span class="vd-label">Vehicle Registration No.</span><span class="vd-value" id="matVehicleNo">–</span></div>
+      <div class="vd-row"><span class="vd-label">Customer Name</span><span class="vd-value" id="matCustomerName">–</span></div>
+      <div class="vd-row"><span class="vd-label">Make/Model</span><span class="vd-value" id="matMakeModel">–</span></div>
+    </div>
+
+    <div class="form-field fg-full" style="margin-bottom:14px;"><label>Material Category <span class="req">*</span></label>
+      <select id="matCategory" onchange="handleMatCategoryChange(this.value)">
+        <option value="">Select</option>
+        <option value="fuel">Fuel</option>
+        <option value="tyre">Tyre</option>
+        <option value="parts">Parts</option>
+        <option value="engine">Engine</option>
+        <option value="catcon">Catcon</option>
+        <option value="seats">Seats</option>
+        <option value="spareWheel">Spare Wheel</option>
+        <option value="speaker">Speaker</option>
+        <option value="stereo">Stereo</option>
+        <option value="battery">Battery</option>
+        <option value="tyreInv">Tyre Inv</option>
+        <option value="rimInv">Rim Inv</option>
+        <option value="jack">Jack</option>
+        <option value="jackRod">Jack Rod</option>
+      </select>
+    </div>
+
+    <div class="mat-cat-group" data-cat="fuel" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Fuel Entry</div>
+        <div class="form-row">
+          <div class="form-field"><label>Fuel Type</label>
+            <select id="matFuelType"><option value="">Select</option><option value="Diesel">Diesel</option><option value="Petrol">Petrol</option></select>
+          </div>
+          <div class="form-field"><label>Qty (Ltr)</label><input type="number" id="matFuelQty" min="0" step="0.01" /></div>
+          <div class="form-field"><label>Black Oil Qty</label><input type="number" id="matBlackOilQty" min="0" step="0.01" /></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="tyre" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Tyre Entry</div>
+        <div class="form-row">
+          <div class="form-field"><label>Tyre Qty (Nos)</label><input type="number" id="matTyreQty" min="0" step="1" /></div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_tyre" placeholder="TYR000001" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('tyre')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="parts" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Parts</div>
+        <div class="form-row">
+          <div class="form-field"><label>Parts Qty (KGs)</label><input type="number" id="matPartsQty" min="0" step="0.01" /></div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_parts" placeholder="PRT000001" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('parts')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="engine" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Engine</div>
+        <div class="form-row">
+          <div class="form-field"><label>With Gear</label>
+            <select id="matEngineGear"><option value="">Select</option><option value="Yes">Yes</option><option value="No">No</option></select>
+          </div>
+          <div class="form-field"><label>Engine Qty (KGs)</label><input type="number" id="matEngineQty" min="0" step="0.01" /></div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_engine" placeholder="ENG003575" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('engine')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="catcon" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Catcon</div>
+        <div class="form-row">
+          <div class="form-field"><label>Catcon</label>
+            <select id="matCatcon"><option value="">Select</option><option value="Yes">Yes</option><option value="No">No</option></select>
+          </div>
+          <div class="form-field"><label>Fuel Type</label>
+            <select id="matCatconFuelType"><option value="">Select</option><option value="Petrol">Petrol</option><option value="Diesel">Diesel</option></select>
+          </div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_catcon" placeholder="CAT002203" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('catcon')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="seats" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Seats</div>
+        <div class="form-row">
+          <div class="form-field"><label>Seats Qty (Nos)</label><input type="number" id="matSeatsQty" min="0" step="1" /></div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_seats" placeholder="SET000001" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('seats')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="spareWheel" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Spare Wheel</div>
+        <div class="form-row">
+          <div class="form-field"><label>Spare Wheel</label>
+            <select id="matSpareWheel"><option value="">Select</option><option value="Yes">Yes</option><option value="No">No</option></select>
+          </div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_spareWheel" placeholder="SPW000001" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('spareWheel')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="speaker" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Speaker</div>
+        <div class="form-row">
+          <div class="form-field"><label>Speaker Qty (Nos)</label><input type="number" id="matSpeakerQty" min="0" step="1" /></div>
+          <div class="form-field"><label>Speaker Photo</label>
+            <div id="matSpeakerPhotoLink" style="font-size:11px;margin-bottom:4px;"></div>
+            <input type="file" class="upload-field-input" id="matSpeakerPhoto" accept="image/*" />
+          </div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_speaker" placeholder="SPK002202" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('speaker')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="stereo" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Stereo</div>
+        <div class="form-row">
+          <div class="form-field"><label>Stereo Photo</label>
+            <div id="matStereoPhotoLink" style="font-size:11px;margin-bottom:4px;"></div>
+            <input type="file" class="upload-field-input" id="matStereoPhoto" accept="image/*" />
+          </div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_stereo" placeholder="STR018515" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('stereo')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="battery" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Battery</div>
+        <div class="form-row">
+          <div class="form-field"><label>Battery Category</label>
+            <select id="matBatteryCategory"><option value="">Select</option><option value="Scrap">Scrap</option><option value="Reusable">Reusable</option></select>
+          </div>
+          <div class="form-field"><label>Battery Make</label><input type="text" id="matBatteryMake" /></div>
+          <div class="form-field"><label>Battery YoM</label><input type="text" id="matBatteryYom" /></div>
+        </div>
+        <div class="form-row">
+          <div class="form-field"><label>Battery Parameter</label><input type="text" id="matBatteryParameter" /></div>
+          <div class="form-field"><label>Battery Weight (KG)</label><input type="number" id="matBatteryWeight" min="0" step="0.01" /></div>
+          <div class="form-field"><label>Testing Report</label>
+            <div id="matBatteryReportLink" style="font-size:11px;margin-bottom:4px;"></div>
+            <input type="file" class="upload-field-input" id="matBatteryTestingReport" />
+          </div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_battery" placeholder="BAT002793" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('battery')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="tyreInv" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Tyre Inventory (Resale Grading)</div>
+        <div class="form-row">
+          <div class="form-field"><label>Tyre Category</label>
+            <select id="matTyreInvCategory"><option value="">Select</option><option value="A (Resaleable)">A (Resaleable)</option><option value="B (Retreadable)">B (Retreadable)</option><option value="C (Scrap/Waste)">C (Scrap/Waste)</option></select>
+          </div>
+          <div class="form-field"><label>Tyre Make</label><input type="text" id="matTyreInvMake" /></div>
+          <div class="form-field"><label>Tyre Model</label><input type="text" id="matTyreInvModel" /></div>
+        </div>
+        <div class="form-row">
+          <div class="form-field"><label>Tyre Thread %</label><input type="number" id="matTyreInvThreadPct" min="0" max="100" step="0.01" /></div>
+          <div class="form-field"><label>Tyre Weight</label><input type="number" id="matTyreInvWeight" min="0" step="0.01" /></div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_tyreInv" placeholder="TYI000001" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('tyreInv')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="rimInv" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Rim Inventory</div>
+        <div class="form-row">
+          <div class="form-field"><label>Rim Type</label>
+            <select id="matRimType"><option value="">Select</option><option value="Alloy">Alloy</option><option value="Steel">Steel</option></select>
+          </div>
+          <div class="form-field"><label>Rim Category</label>
+            <select id="matRimCategory"><option value="">Select</option><option value="Resalable">Resalable</option><option value="Scrap">Scrap</option></select>
+          </div>
+          <div class="form-field"><label>Rim Weight</label><input type="number" id="matRimWeight" min="0" step="0.01" /></div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_rimInv" placeholder="RIM000002" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('rimInv')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="jack" style="display:none;">
+      <div class="vd-card" style="margin-bottom:10px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Jack</div>
+        <div class="form-row">
+          <div class="form-field"><label>Jack</label>
+            <select id="matJack"><option value="">Select</option><option value="Yes">Yes</option><option value="No">No</option></select>
+          </div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_jack" placeholder="JCK000356" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('jack')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mat-cat-group" data-cat="jackRod" style="display:none;">
+      <div class="vd-card" style="margin-bottom:14px;">
+        <div style="font-weight:700;font-size:12.5px;margin-bottom:8px;">Removal of Jack Rod</div>
+        <div class="form-row">
+          <div class="form-field"><label>Jack Rod</label>
+            <select id="matJackRod"><option value="">Select</option><option value="Yes">Yes</option><option value="No">No</option></select>
+          </div>
+          <div class="form-field"><label>Unique Code</label>
+            <div style="display:flex;gap:6px;"><input type="text" id="matCode_jackRod" placeholder="JR000004" readonly style="flex:1;background:var(--color-bg-secondary,#f1f5f9);cursor:not-allowed;" /><button type="button" class="btn" style="padding:6px 9px;" onclick="suggestMaterialCode('jackRod')" title="Suggest next code"><i class="ti ti-refresh" aria-hidden="true"></i></button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-field fg-full"><label>Remarks</label><textarea id="matRemarks" rows="2" placeholder="Any notes…"></textarea></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('materialModal')">Close</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitMaterial())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save</button>
+  </div>
+</div></div>
+
+<!-- ADD LEAD MODAL -->
+<div class="modal-backdrop" id="addModal" style="display:none;" onclick="bdClose(event,'addModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-user-plus" aria-hidden="true"></i></div>
+      <div><h2>New Lead Entry</h2><div class="modal-sub">Vehicle Enquiry Lead Form</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('addModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Customer Information</div>
+      <div class="form-grid">
+        <div class="form-field fg-full"><label>Customer Name <span class="req">*</span></label><input data-field="customer_name" placeholder="Full name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Phone Number <span class="req">*</span></label><input data-field="phone" type="tel" placeholder="10-digit mobile" maxlength="10" pattern="[0-9]{10}" oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)" /></div>
+        <div class="form-field"><label>Email ID</label><input data-field="email" type="email" placeholder="email@example.com" /></div>
+        <div class="form-field fg-full"><label>Address <span class="req">*</span></label><textarea data-field="address" rows="2" placeholder="Full address" onblur="this.value=toProperCase(this.value)"></textarea></div>
+        <div class="form-field"><label>City <span class="req">*</span></label>
+          <div class="partner-search-wrap">
+            <div class="ps-input-row" onclick="toggleMasterSearchDD('addCity',event)">
+              <i class="ti ti-search" aria-hidden="true"></i>
+              <input id="addCity" data-field="city" data-masterlist="location" placeholder="Search city…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('addCity');event.stopPropagation()" autocomplete="off" />
+              <i class="ti ti-chevron-down" aria-hidden="true"></i>
+            </div>
+            <div class="ps-dropdown" id="msd_addCity"><div class="ps-list" id="msl_addCity"></div></div>
+          </div>
+        </div>
+        <div class="form-field"><label>Lead Source <span class="req">*</span></label>
+          <select data-field="lead_source">
+            <option value="">Select source</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Lead Classification</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Lead Type <span class="req">*</span></label>
+          <select id="ltAdd" onchange="handleLT('Add',this.value)"><option value="">Select</option><option value="Direct">Direct</option><option value="Partner">Partner</option></select>
+        </div>
+        <div class="form-field" id="pfAdd" style="display:none;">
+          <label>Partner Name <span class="req">*</span> <span style="color:#1d4ed8;font-size:10px;cursor:pointer;" onclick="closeModal('addModal');openModal('partnerRegModal')">(+ Register new)</span></label>
+          <div class="partner-search-wrap">
+            <div class="ps-input-row" onclick="togglePSD('psdAdd',event)">
+              <i class="ti ti-search" aria-hidden="true"></i>
+              <input id="pInputAdd" placeholder="Search by name or phone…" oninput="filterPS('Add',this.value)" onclick="openPSD('psdAdd');event.stopPropagation()" autocomplete="off" />
+              <i class="ti ti-chevron-down" aria-hidden="true"></i>
+            </div>
+            <div class="ps-dropdown" id="psdAdd">
+              <div class="ps-list" id="pListAdd"></div>
+              <div class="ps-add" onclick="closeModal('addModal');openModal('partnerRegModal')"><i class="ti ti-plus" style="font-size:14px;" aria-hidden="true"></i> Register new partner</div>
+            </div>
+          </div>
+        </div>
+        <div class="form-field" id="cdAdd" style="display:none;">
+          <label>Company / Dealership Name</label>
+          <div class="partner-search-wrap">
+            <div class="ps-input-row" onclick="toggleMasterSearchDD('addCompanyDealership',event)">
+              <i class="ti ti-search" aria-hidden="true"></i>
+              <input id="addCompanyDealership" data-field="company_dealership_name" data-masterlist="company_dealership" placeholder="Search company/dealership… (optional)" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('addCompanyDealership');event.stopPropagation()" autocomplete="off" />
+              <i class="ti ti-chevron-down" aria-hidden="true"></i>
+            </div>
+            <div class="ps-dropdown" id="msd_addCompanyDealership"><div class="ps-list" id="msl_addCompanyDealership"></div></div>
+          </div>
+        </div>
+        <!-- Lead Status intentionally not asked here — every new lead starts
+             at "Need Analysis" automatically (see submitNewLead). The PE
+             later qualifies it (or marks it Lost) via Edit Lead. -->
+        <div class="form-field"><label>Procurement Executive <span class="req">*</span></label>
+          <select id="peAdd"><option value="">Loading…</option></select>
+        </div>
+        <div class="form-field"><label>Procurement Manager <span class="req">*</span></label>
+          <select id="mgrAdd"><option value="">Loading…</option></select>
+          <input id="mgrAddDisplay" type="text" readonly disabled style="display:none;background:var(--color-surface-secondary);" />
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('addModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitNewLead())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Submit Lead</button>
+  </div>
+</div></div>
+
+<!-- VIEW PARTNER MODAL -->
+<div class="modal-backdrop" id="viewPartnerModal" style="display:none;" onclick="bdClose(event,'viewPartnerModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-purple"><i class="ti ti-briefcase" aria-hidden="true"></i></div>
+      <div><h2 id="vpName">Partner</h2><div class="modal-sub">Partner Profile</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('viewPartnerModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body" id="vpBody">
+    <!-- populated dynamically by JS -->
+  </div>
+  <div class="modal-footer"><button class="btn" onclick="closeModal('viewPartnerModal')">Close</button></div>
+</div></div>
+
+<!-- PARTNER REGISTER MODAL -->
+<div class="modal-backdrop" id="partnerRegModal" style="display:none;" onclick="bdClose(event,'partnerRegModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-green"><i class="ti ti-user-check" aria-hidden="true"></i></div>
+      <div><h2>Register New Partner</h2><div class="modal-sub">KYC &amp; bank details required</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('partnerRegModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Basic Information</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Partner Name <span class="req">*</span></label><input data-field="pr_partner_name" placeholder="Full name / firm name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Mobile Number <span class="req">*</span></label><input data-field="pr_mobile" type="tel" placeholder="10-digit" maxlength="10" oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)" /></div>
+        <div class="form-field"><label>Email ID <span class="req">*</span></label><input data-field="pr_email" type="email" placeholder="email@example.com" /></div>
+        <div class="form-field fg-full"><label>Location <span class="req">*</span></label><input data-field="pr_location" placeholder="City / Area" onblur="this.value=toProperCase(this.value)" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">KYC &amp; Tax Documents</div>
+      <div class="form-grid">
+        <div class="form-field"><label>PAN Number <span class="req">*</span></label><input data-field="pr_pan_number" placeholder="ABCDE1234F" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Upload PAN Card <span class="req">*</span></label><input type="file" data-field="pr_pan_card" class="upload-field-input" /></div>
+        <div class="form-field"><label>GST Number</label><input data-field="pr_gst_number" placeholder="22AAAAA0000A1Z5" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Upload GST Certificate</label><input type="file" data-field="pr_gst_certificate" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Bank Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Account Holder Name <span class="req">*</span></label><input data-field="pr_account_holder_name" placeholder="As per bank records" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Bank Name <span class="req">*</span></label><input data-field="pr_bank_name" placeholder="e.g. HDFC Bank" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Branch Name <span class="req">*</span></label><input data-field="pr_branch_name" placeholder="Branch" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Account Number <span class="req">*</span></label><input data-field="pr_account_number" placeholder="Account number" /></div>
+        <div class="form-field"><label>IFSC Code <span class="req">*</span></label><input data-field="pr_ifsc_code" placeholder="HDFC0001234" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field fg-full"><label>Upload Cancelled Cheque <span class="req">*</span></label><input type="file" data-field="pr_cancelled_cheque" class="upload-field-input" /></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('partnerRegModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitNewPartner())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Register Partner</button>
+  </div>
+</div></div>
+
+<!-- COMMISSION PERSON REGISTER MODAL — same shape as Partner registration,
+     minus PAN/GST (not required for commission payees per business rule). -->
+<div class="modal-backdrop" id="commissionPersonRegModal" style="display:none;" onclick="bdClose(event,'commissionPersonRegModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-green"><i class="ti ti-user-plus" aria-hidden="true"></i></div>
+      <div><h2>Add Commission Person</h2><div class="modal-sub">Bank details for commission payout</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('commissionPersonRegModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Basic Information</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Name <span class="req">*</span></label><input data-field="cp_name" placeholder="Full name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Phone Number</label><input data-field="cp_mobile" type="tel" placeholder="10-digit" /></div>
+        <div class="form-field fg-full"><label>Location</label><input data-field="cp_location" placeholder="City / Area" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Payment Mode</label><select id="cpPaymentMode" onchange="handleCpPaymentMode(this.value)"><option value="">Select</option><option value="UPI">UPI</option><option value="Bank">Bank</option></select></div>
+      </div>
+    </div>
+    <div class="form-section" id="cpUpiSection" style="display:none;">
+      <div class="form-section-label">UPI Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>UPI Phone Number</label><input data-field="cp_upi_phone" type="tel" placeholder="10-digit" /></div>
+        <div class="form-field fg-full"><label>Upload QR Code</label><input type="file" data-field="cp_upi_qr" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section" id="cpBankSection" style="display:none;">
+      <div class="form-section-label">Bank Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Account Holder Name</label><input data-field="cp_account_holder_name" placeholder="As per bank records" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Bank Name</label><input data-field="cp_bank_name" placeholder="e.g. HDFC Bank" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Branch Name</label><input data-field="cp_branch_name" placeholder="Branch" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Account Number</label><input data-field="cp_account_number" placeholder="Account number" /></div>
+        <div class="form-field"><label>IFSC Code</label><input data-field="cp_ifsc_code" placeholder="HDFC0001234" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field fg-full"><label>Upload Cheque</label><input type="file" data-field="cp_cheque_photo" class="upload-field-input" /></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('commissionPersonRegModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitNewCommissionPerson())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Save Person</button>
+  </div>
+</div></div>
+
+<!-- CRANE VENDOR REGISTER MODAL — same shape as Commission Person, plus a Contact Person field. -->
+<div class="modal-backdrop" id="craneVendorRegModal" style="display:none;" onclick="bdClose(event,'craneVendorRegModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-truck" aria-hidden="true"></i></div>
+      <div><h2>Add Crane Vendor</h2><div class="modal-sub">Bank details for vendor payout</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('craneVendorRegModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Basic Information</div>
+      <div class="form-grid">
+        <div class="form-field fg-full"><label>Crane Company Name <span class="req">*</span></label><input data-field="cv_vendor_name" placeholder="Full name / firm name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Contact Person</label><input data-field="cv_contact_person" placeholder="Contact person name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Phone Number</label><input data-field="cv_phone" type="tel" placeholder="10-digit" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Bank Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Account Holder Name</label><input data-field="cv_account_holder_name" placeholder="As per bank records" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Bank Name</label><input data-field="cv_bank_name" placeholder="e.g. HDFC Bank" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Branch Name</label><input data-field="cv_branch_name" placeholder="Branch" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Account Number</label><input data-field="cv_account_number" placeholder="Account number" /></div>
+        <div class="form-field"><label>IFSC Code</label><input data-field="cv_ifsc_code" placeholder="HDFC0001234" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field fg-full"><label>Upload Cheque</label><input type="file" data-field="cv_cheque_photo" class="upload-field-input" /></div>
+        <div class="form-field fg-full"><label>Upload QR Code (UPI) <span style="font-weight:400;color:var(--color-text-tertiary);">— crane payment isi QR se hoga</span></label><input type="file" accept="image/*" data-field="cv_upi_qr" class="upload-field-input" /></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('craneVendorRegModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitNewCraneVendor())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Save Vendor</button>
+  </div>
+</div></div>
+
+<!-- SCRAP BUYER REGISTER MODAL (Ramvir, Sept 2026) — "Customer name Add ka
+     option jaise hum Broker add karte hai", fields per his reference
+     screenshot (Company Name/Billing Address/Contact Name/Mobile/PAN/GST/
+     Bank details/Cheque) — same shape as Partner registration above, plus
+     Billing Address which Partner doesn't have. Submitted via
+     submitNewScrapBuyer() (JS-Tracking.html) into rewire_scrap_buyers. -->
+<div class="modal-backdrop" id="scrapBuyerRegModal" style="display:none;" onclick="bdClose(event,'scrapBuyerRegModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-user-plus" aria-hidden="true"></i></div>
+      <div><h2>Add Buyer</h2><div class="modal-sub">Scrap Sold — buyer details</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('scrapBuyerRegModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Basic Information</div>
+      <div class="form-grid">
+        <div class="form-field fg-full"><label>Customer Company Name <span class="req">*</span></label><input data-field="sb_company_name" placeholder="Company / firm name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field fg-full"><label>Billing Address <span class="req">*</span></label><input data-field="sb_billing_address" placeholder="Billing address" /></div>
+        <div class="form-field"><label>Customer Name <span class="req">*</span></label><input data-field="sb_contact_name" placeholder="Contact person name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Customer Mobile <span class="req">*</span></label><input data-field="sb_mobile" type="tel" placeholder="10-digit" maxlength="10" oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Tax Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>PAN <span class="req">*</span></label><input data-field="sb_pan_number" placeholder="ABCDE1234F" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>GST <span class="req">*</span></label><input data-field="sb_gst_number" placeholder="22AAAAA0000A1Z5" oninput="this.value=this.value.toUpperCase()" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Bank Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Bank Name <span class="req">*</span></label><input data-field="sb_bank_name" placeholder="e.g. HDFC Bank" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Bank Branch <span class="req">*</span></label><input data-field="sb_branch_name" placeholder="Branch" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Account No <span class="req">*</span></label><input data-field="sb_account_number" placeholder="Account number" /></div>
+        <div class="form-field"><label>IFSC <span class="req">*</span></label><input data-field="sb_ifsc_code" placeholder="HDFC0001234" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field fg-full"><label>Upload Cheque <span class="req">*</span></label><input type="file" data-field="sb_cheque_photo" class="upload-field-input" /></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('scrapBuyerRegModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitNewScrapBuyer())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Save Buyer</button>
+  </div>
+</div></div>
+
+<!-- TRANSPORTER REGISTER MODAL — Logistics directory. Lighter than Crane
+     Vendor/Commission Person since no payout is tracked against it here,
+     just who carried the vehicle. -->
+<div class="modal-backdrop" id="transporterRegModal" style="display:none;" onclick="bdClose(event,'transporterRegModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-truck-delivery" aria-hidden="true"></i></div>
+      <div><h2>Add Transporter</h2><div class="modal-sub">Logistics directory</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('transporterRegModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Basic Information</div>
+      <div class="form-grid">
+        <div class="form-field fg-full"><label>Transporter Name <span class="req">*</span></label><input data-field="tr_transporter_name" placeholder="Full name / firm name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Contact Person</label><input data-field="tr_contact_person" placeholder="Contact person name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Phone Number</label><input data-field="tr_phone" type="tel" placeholder="10-digit" /></div>
+        <div class="form-field"><label>Vehicle/Truck Number</label><input data-field="tr_vehicle_number" placeholder="e.g. RJ14AB1234" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase()" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Bank Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Account Holder Name</label><input data-field="tr_account_holder_name" placeholder="As per bank records" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Bank Name</label><input data-field="tr_bank_name" placeholder="e.g. HDFC Bank" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Branch Name</label><input data-field="tr_branch_name" placeholder="Branch" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Account Number</label><input data-field="tr_account_number" placeholder="Account number" /></div>
+        <div class="form-field"><label>IFSC Code</label><input data-field="tr_ifsc_code" placeholder="HDFC0001234" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field fg-full"><label>Upload Cheque</label><input type="file" data-field="tr_cheque_photo" class="upload-field-input" /></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('transporterRegModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitNewTransporter())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Save Transporter</button>
+  </div>
+</div></div>
+
+<!-- LOGISTICS — SEND TO PLANT MODAL — applies to every currently checked
+     vehicle in the Logistics tab at once (see JS-Operations.html). -->
+<!-- PLANT MANIFEST RECEIVING MODAL (Oct 2026) — click a manifest in Received at Plant: per-vehicle Receive (accessories + debit + other debit), then Generate Receiving -->
+<div class="modal-backdrop" id="plantManifestModal" style="display:none;" onclick="bdClose(event,'plantManifestModal')">
+<div class="modal lg">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-green"><i class="ti ti-package-import" aria-hidden="true"></i></div>
+      <div><h2 id="plantManifestTitle">Manifest</h2><div class="modal-sub" id="plantManifestSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('plantManifestModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div id="plantManifestMeta" style="font-size:12px;margin-bottom:10px;display:flex;flex-wrap:wrap;gap:4px 18px;"></div>
+    <table class="crm-table" data-no-enhance>
+      <thead><tr><th>Lead No.</th><th>Vehicle No.</th><th>Make / Model</th><th>Status</th><th>Shortage Debit</th><th>Other Debit</th><th>Action</th></tr></thead>
+      <tbody id="plantManifestBody"></tbody>
+    </table>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('plantManifestModal')">Close</button>
+    <button class="btn btn-primary" id="plantManifestGenBtn" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => generatePlantReceiving())"><i class="ti ti-printer" style="font-size:13px;" aria-hidden="true"></i> Generate Receiving</button>
+  </div>
+</div></div>
+
+<div class="modal-backdrop" id="logisticsSendModal" style="display:none;" onclick="bdClose(event,'logisticsSendModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-green"><i class="ti ti-truck-delivery" aria-hidden="true"></i></div>
+      <div><h2>Raised Transportation Request</h2><div class="modal-sub" id="logisticsSendModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('logisticsSendModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full">
+        <label>Transport Mode <span class="req">*</span></label>
+        <select id="logisticsVehicleSendTo" onchange="handleLogisticsVehicleSendTo(this.value)">
+          <option value="">— Select —</option>
+          <option value="Logistic Carrier">Logistic Carrier</option>
+          <option value="Crane">Crane</option>
+          <option value="Driver">Driver</option>
+          <option value="Towing">Towing</option>
+          <option value="Self Drop">Self (Customer drop)</option>
+        </select>
+      </div>
+      <div class="form-field fg-full" id="logisticsCraneField" style="display:none;">
+        <label>Crane Company <span class="req">*</span> <span style="color:#1d4ed8;font-size:10px;cursor:pointer;" onclick="closeModal('logisticsSendModal');if(typeof clearModalFields==='function')clearModalFields('#craneVendorRegModal');openModal('craneVendorRegModal')">(+ Register new)</span></label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="toggleMasterSearchDD('logisticsCraneVendor',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="logisticsCraneVendor" data-masterlist="crane_vendor" placeholder="Search crane company…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('logisticsCraneVendor');event.stopPropagation()" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="msd_logisticsCraneVendor"><div class="ps-list" id="msl_logisticsCraneVendor"></div></div>
+        </div>
+      </div>
+      <div class="form-field fg-full" id="logisticsDriverField" style="display:none;">
+        <label>Name <span class="req">*</span></label>
+        <input id="logisticsDriverName" list="logisticsDriverList" placeholder="Name" autocomplete="off" />
+        <datalist id="logisticsDriverList"></datalist>
+      </div>
+      <div class="form-field fg-full" id="logisticsDriverPhoneField" style="display:none;">
+        <label>Driver Mobile (WhatsApp) <span class="req">*</span></label>
+        <input id="logisticsDriverPhone" type="tel" inputmode="numeric" maxlength="10" placeholder="10-digit mobile number" autocomplete="off" />
+      </div>
+      <div class="form-field fg-full" id="logisticsTransporterField" style="display:none;">
+        <label>Transporter <span class="req">*</span> <span style="color:#1d4ed8;font-size:10px;cursor:pointer;" onclick="closeModal('logisticsSendModal');if(typeof clearModalFields==='function')clearModalFields('#transporterRegModal');openModal('transporterRegModal')">(+ Register new)</span></label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="toggleMasterSearchDD('logisticsTransporter',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="logisticsTransporter" data-masterlist="transporter" placeholder="Search transporter…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('logisticsTransporter');event.stopPropagation()" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="msd_logisticsTransporter"><div class="ps-list" id="msl_logisticsTransporter"></div></div>
+        </div>
+      </div>
+      <div class="form-field fg-full" id="logisticsFromLocationField" style="display:none;">
+        <label>From Location <span class="req">*</span></label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="toggleMasterSearchDD('logisticsFromLocation',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="logisticsFromLocation" data-masterlist="location" placeholder="Search location…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('logisticsFromLocation');event.stopPropagation()" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="msd_logisticsFromLocation"><div class="ps-list" id="msl_logisticsFromLocation"></div></div>
+        </div>
+      </div>
+      <div class="form-field fg-full" id="logisticsToLocationField" style="display:none;">
+        <label>To Location <span class="req">*</span> <span style="color:var(--color-text-tertiary);font-size:10px;">(Jaipur Plant / Jaipur yard / yard of From Location)</span></label>
+        <div class="partner-search-wrap">
+          <div class="ps-input-row" onclick="toggleMasterSearchDD('logisticsToLocation',event)">
+            <i class="ti ti-search" aria-hidden="true"></i>
+            <input id="logisticsToLocation" data-masterlist="logistics_to" placeholder="Select To Location…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('logisticsToLocation');event.stopPropagation()" autocomplete="off" />
+            <i class="ti ti-chevron-down" aria-hidden="true"></i>
+          </div>
+          <div class="ps-dropdown" id="msd_logisticsToLocation"><div class="ps-list" id="msl_logisticsToLocation"></div></div>
+        </div>
+      </div>
+      <div class="form-field" id="logisticsVehicleNoField" style="display:none;"><label>Vehicle/Truck Number</label><input id="logisticsVehicleNo" placeholder="e.g. RJ14AB1234" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase()" /></div>
+      <div class="form-field" id="logisticsDispatchDateField" style="display:none;"><label>Dispatch Date</label><input type="date" id="logisticsDispatchDate" /></div>
+      <div class="form-field fg-full" id="logisticsOtherDetailsField" style="display:none;"><label>Other Transporter Details</label><input id="logisticsOtherDetails" placeholder="Optional" /></div>
+      <div class="form-field fg-full"><label>Remarks</label><textarea id="logisticsRemarks" rows="2" placeholder="Any remarks…"></textarea></div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('logisticsSendModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitLogisticsSend())"><i class="ti ti-send" style="font-size:13px;" aria-hidden="true"></i> Raised Transportation Request</button>
+  </div>
+</div></div>
+
+<!-- MARK MANIFEST PAID MODAL (Ramvir, Oct 2026) — Bill Amount/Bill No./
+     Upload Bill/Unload Location once for the whole Manifest, plus a
+     per-vehicle Debit Amount/Reason row for every vehicle on it. Marking
+     Paid is what flips every member vehicle to "Sent to Plant" — the only
+     way into Received at Plant now (see renderReceivedPlantSection,
+     JS-Operations.html — the old "Fill for a Vehicle Not Yet Listed"
+     bypass has been removed). -->
+<div class="modal-backdrop" id="markManifestPaidModal" style="display:none;" onclick="bdClose(event,'markManifestPaidModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-green"><i class="ti ti-receipt" aria-hidden="true"></i></div>
+      <div><h2>Manifest Bill</h2><div class="modal-sub" id="markPaidModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('markManifestPaidModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Bill Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Bill No. <span class="req">*</span></label><input type="text" id="markPaidBillNo" placeholder="Bill No." /></div>
+        <div class="form-field"><label>Bill Basic Amount (₹) <span class="req">*</span></label><input type="number" min="0" onwheel="this.blur()" id="markPaidBillAmount" placeholder="Basic amount" oninput="calcManifestBillTotal()" /></div>
+        <div class="form-field"><label>GST 18% (₹) <span style="font-weight:400;color:var(--color-text-tertiary);">— fixed</span></label><input type="number" id="markPaidGst" readonly /></div>
+        <div class="form-field"><label>TDS (₹) <span style="font-weight:400;color:var(--color-text-tertiary);">— debit</span></label><input type="number" min="0" onwheel="this.blur()" id="markPaidTds" placeholder="0" oninput="calcManifestBillTotal()" /></div>
+        <div class="form-field"><label>Deduction Amount (₹) <span style="font-weight:400;color:var(--color-text-tertiary);">— from Received at Plant, editable</span></label><input type="number" min="0" onwheel="this.blur()" id="markPaidDeduction" placeholder="0" oninput="calcManifestBillTotal()" /></div>
+        <div class="form-field"><label>Other Deduction (₹)</label><input type="number" min="0" onwheel="this.blur()" id="markPaidOtherDeduction" placeholder="0" oninput="calcManifestBillTotal()" /></div>
+        <div class="form-field fg-full"><label>Other Deduction Reason</label><input type="text" id="markPaidOtherDeductionReason" placeholder="Optional" /></div>
+        <div class="form-field"><label>Total Payable (₹)</label><input type="number" id="markPaidTotal" readonly style="font-weight:700;" /></div>
+        <div class="form-field"><label>Upload Bill</label><input type="file" id="markPaidBillFile" class="upload-field-input" /></div>
+      </div>
+    </div>
+      </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('markManifestPaidModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitMarkManifestPaid())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Save Bill</button>
+  </div>
+</div></div>

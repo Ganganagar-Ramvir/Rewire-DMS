@@ -1,0 +1,2118 @@
+<script>
+// OPERATIONS: Omini Pay, Accessories Check, Received at Plant, Crane Charges.
+// ------------------------------------------------------------
+// OMINI PAY — appears once Price Negotiation is saved with Payment
+// Type = Omini Pay. Back Office 2 / Manager pays it, then it archives.
+// ------------------------------------------------------------
+async function renderOminiPaySection() {
+  initTableFilterBar('ominipay', renderOminiPaySection);
+  // Paginated defensively — a Pending queue that backs up past 1000 (e.g.
+  // during a busy period or a processing delay) would otherwise silently
+  // hide the oldest entries with no error, same class of bug fixed
+  // elsewhere this session.
+  const data = await fetchAllRows((from, to) => sb.from('rewire_omini_pay')
+    .select(`*, lead:rewire_master_data!rewire_omini_pay_lead_id_fkey(id, lead_no, customer_name, phone, ud_vehicle_parking, ud_vehicle_sub_parking,
+      val_vehicle_type, val_vehicle_number, val_make, val_model_variant, pn_payment_type, pn_total_offer_price, ud_total_offer_price,
+      rewire_partners(partner_name),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name))`)
+    .eq('status', 'Pending').order('created_at', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const filteredOp = filterRowsByTableFilter(data || [], 'ominipay',
+    o => (o.lead && o.lead.pe) ? o.lead.pe.id : null,
+    o => (o.lead && o.lead.manager) ? o.lead.manager.id : null,
+    o => o.created_at ? o.created_at.slice(0, 10) : null);
+  document.getElementById('countOminiPay').textContent = filteredOp.length + ' pending';
+  document.getElementById('badgeOminiPay').textContent = (data || []).length;
+  document.getElementById('tbodyOminiPay').innerHTML = (filteredOp && filteredOp.length) ? filteredOp.map(o => `<tr>
+    <td>${o.lead ? `<span class="lid" style="cursor:pointer;text-decoration:underline;" onclick="viewLeadDetails('${o.lead.id}')">${o.lead.lead_no}</span>` : '—'}</td>
+    <td style="font-weight:500;">${o.lead ? o.lead.customer_name : '—'}</td>
+    <td>${o.lead ? o.lead.phone : '—'}</td>
+    <td>${o.lead ? o.lead.ud_vehicle_parking || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.ud_vehicle_sub_parking || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_vehicle_type || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_vehicle_number || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_make || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_model_variant || '—' : '—'}</td>
+    <td>${o.lead && o.lead.rewire_partners ? o.lead.rewire_partners.partner_name : '—'}</td>
+    <td>${o.lead && o.lead.pe ? o.lead.pe.name : '—'}</td>
+    <td>${o.lead && o.lead.manager ? o.lead.manager.name : '—'}</td>
+    <td>${o.lead ? o.lead.pn_payment_type || '—' : '—'}</td>
+    <td>${o.lead && (o.lead.ud_total_offer_price || o.lead.pn_total_offer_price) ? '₹' + (o.lead.ud_total_offer_price || o.lead.pn_total_offer_price) : '—'}</td>
+    <td><span class="badge badge-na">${o.status}</span></td>
+    <td>${o.created_at ? new Date(o.created_at).toLocaleDateString() : '—'}</td>
+    <td><button class="ab ab-form" style="background:#7c3aed;color:#fff;" onclick="openOminiPay('${o.id}','${o.lead_id}','${o.lead ? o.lead.lead_no : ''}')"><i class="ti ti-credit-card" style="font-size:11px;" aria-hidden="true"></i> Pay</button></td>
+  </tr>`).join('') : '<tr><td colspan="17" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No pending Omini Pay entries.</td></tr>';
+}
+
+let activeOminiPayId = null;
+function openOminiPay(opId, leadId, leadNo) {
+  activeOminiPayId = opId;
+  activeLeadId = leadId;
+  document.getElementById('ominiPayModalSub').textContent = leadNo;
+  // Whoever is actually processing this payment picks their own name here —
+  // it doesn't have to be the logged-in user (e.g. one person shares a
+  // login, or is entering a payment a colleague physically made). Only
+  // Manager/Head/Admin/Accounts actually process Omini Pay (PE and Back
+  // Office never touch this screen — PE has no ominipay access at all, and
+  // Back Office's role was moved off it), so the list is limited to those,
+  // not every active user.
+  const OMINI_PAY_PAYER_ROLES = ['Manager', 'Head', 'Admin', 'Accounts'];
+  const opByNameSel = document.getElementById('opByName');
+  const payerOptions = allActiveUsers.filter(u => OMINI_PAY_PAYER_ROLES.includes(u.role));
+  opByNameSel.innerHTML = '<option value="">Select who is paying</option>' +
+    payerOptions.map(u => `<option value="${u.name}">${u.name}${currentProfile && u.id === currentProfile.id ? ' (You)' : ''}</option>`).join('');
+  opByNameSel.value = currentProfile && OMINI_PAY_PAYER_ROLES.includes(currentProfile.role) ? currentProfile.name : '';
+  document.getElementById('opTxnId').value = '';
+  document.getElementById('opReferenceId').value = '';
+  document.getElementById('opAmountPaid').value = '';
+  openModal('ominiPayModal');
+}
+
+async function submitOminiPay() {
+  const byName = document.getElementById('opByName').value.trim();
+  const txnId = document.getElementById('opTxnId').value.trim();
+  const refId = document.getElementById('opReferenceId').value.trim();
+  const amount = document.getElementById('opAmountPaid').value;
+  if (!byName || !txnId || !refId || !amount) { notify('Please fill all fields', { icon: 'error', title: 'Missing fields' }); return; }
+
+  const { error } = await sb.from('rewire_omini_pay').update({
+    omni_payments_by_name: byName,
+    txn_id: txnId, reference_id: refId, amount_paid: amount,
+    status: 'Paid', paid_by: currentProfile.id, paid_on: new Date().toISOString(),
+  }).eq('id', activeOminiPayId);
+  if (error) { notify('Error saving payment: ' + error.message, { icon: 'error' }); return; }
+
+  notify('Omini Pay completed and moved to Archive.');
+  closeModal('ominiPayModal');
+  await renderOminiPaySection();
+}
+
+async function renderOminiPayArchiveSection() {
+  // Archive tables only ever grow — same silent-1000-row-cap bug already
+  // found and fixed for rewire_payments_archive (fetchPaymentsRaw et al,
+  // JS-Payments.html). Paginated via fetchAllRows so old rows never fall
+  // off once this passes 1000.
+  initTableFilterBar('ominipayarchive', renderOminiPayArchiveSection);
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_omini_pay_archive')
+    .select(`*, lead:rewire_master_data!rewire_omini_pay_archive_lead_id_fkey(id, lead_no, customer_name, phone, ud_vehicle_parking, ud_vehicle_sub_parking,
+      val_vehicle_type, val_vehicle_number, val_make, val_model_variant, rewire_partners(partner_name),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name))`)
+    .order('archived_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const data = filterRowsByTableFilter(rawData || [], 'ominipayarchive',
+    o => (o.lead && o.lead.pe) ? o.lead.pe.id : null,
+    o => (o.lead && o.lead.manager) ? o.lead.manager.id : null,
+    o => o.paid_on ? o.paid_on.slice(0, 10) : null);
+  document.getElementById('countOminiPayArchive').textContent = (data || []).length + ' completed';
+  document.getElementById('tbodyOminiPayArchive').innerHTML = (data && data.length) ? data.map(o => `<tr>
+    <td>${o.lead ? `<span class="lid" style="cursor:pointer;text-decoration:underline;" onclick="viewLeadDetails('${o.lead.id}')">${o.lead.lead_no}</span>` : '—'}</td>
+    <td style="font-weight:500;">${o.lead ? o.lead.customer_name : '—'}</td>
+    <td>${o.lead ? o.lead.phone : '—'}</td>
+    <td>${o.lead ? o.lead.ud_vehicle_parking || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.ud_vehicle_sub_parking || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_vehicle_type || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_vehicle_number || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_make || '—' : '—'}</td>
+    <td>${o.lead ? o.lead.val_model_variant || '—' : '—'}</td>
+    <td>${o.lead && o.lead.rewire_partners ? o.lead.rewire_partners.partner_name : '—'}</td>
+    <td>${o.lead && o.lead.pe ? o.lead.pe.name : '—'}</td>
+    <td>${o.lead && o.lead.manager ? o.lead.manager.name : '—'}</td>
+    <td>${o.omni_payments_by_name || '—'}</td>
+    <td>${o.txn_id || '—'}</td>
+    <td>${o.reference_id || '—'}</td>
+    <td>${o.amount_paid ? '₹' + o.amount_paid : '—'}</td>
+    <td>${o.paid_on ? new Date(o.paid_on).toLocaleDateString() : '—'}</td>
+  </tr>`).join('') : '<tr><td colspan="17" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No completed Omini Pay entries yet.</td></tr>';
+}
+
+
+// ------------------------------------------------------------
+// ACCESSORIES CHECK — Back Office cross-checks Valuation vs Delivery
+// condition fields before Head Approval can proceed
+// ------------------------------------------------------------
+async function renderAccessoriesSection(page = 0) {
+  initTableFilterBar('accessories', () => renderAccessoriesSection(page));
+  const af = tableFilterState.accessories || {};
+  const buildAccessoriesQuery = () => {
+    let q = sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, phone, ud_vehicle_parking, ud_vehicle_sub_parking, val_vehicle_type, val_vehicle_number, val_make,
+        val_model_variant, ma_status, pn_payment_type, accessories_check_status, created_at, rewire_partners(partner_name),
+        pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+        manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)`)
+      // Post Delivery + Advance Payment/Omini Pay all go through Manager
+      // Approval before Accessories Check ever becomes relevant — keep
+      // requiring ma_status='Approved' for those. Instant Payments SKIPS
+      // Manager Approval entirely (ma_status never gets set), so requiring
+      // it here would permanently hide every Instant Payments lead from
+      // this tab — excluded from the ma_status check instead.
+      .or('ma_status.eq.Approved,pn_payment_type.eq.Instant Payments')
+      // Comparing Valuation vs Delivery condition here only makes sense once
+      // the Delivery form has actually been filled — before that, every
+      // Delivery-side value is genuinely empty, so the comparison shows a
+      // false "Mismatch" on every single item. ud_status = 'Complete' alone
+      // isn't enough to trust, though — the historical bulk import set that
+      // flag on a lot of leads without any real Delivery data behind it (same
+      // root cause as several other batches this session). ud_filled_on is
+      // only ever set by the actual Upload Delivery submit in the app, never
+      // by that import, so requiring it too is what actually proves this
+      // lead's Delivery form was genuinely filled.
+      .eq('ud_status', 'Complete')
+      .not('ud_filled_on', 'is', null)
+      // accessories_check_status is only ever written once (submitAccessoriesCheck
+      // sets it to 'Confirmed') — a lead that's never been through this
+      // step has it NULL, not 'Pending'. A plain .neq(...,'Confirmed')
+      // never matches a NULL column in Postgres (same NULL-exclusion bug
+      // class already fixed for payment_release_status elsewhere), so
+      // paired with .is.null to actually catch every not-yet-confirmed lead.
+      .or('accessories_check_status.neq.Confirmed,accessories_check_status.is.null')
+      .order('created_at', { ascending: false });
+    if (af.pe) q = q.eq('pe_id', af.pe);
+    if (af.manager) q = q.eq('manager_id', af.manager);
+    if (af.from) q = q.gte('created_at', istDayStart(af.from));
+    if (af.to) q = q.lte('created_at', istDayEnd(af.to));
+    return q;
+  };
+  // Paginated — the previous version requested {count:'exact'} but never
+  // actually applied .range() or used the count, so it silently capped at
+  // 1000 with no error and no visible sign anything was missing.
+  const data = await fetchAllRows((from, to) => buildAccessoriesQuery().range(from, to))
+    .catch(err => { console.error(err); return []; });
+  document.getElementById('countAccessories').textContent = (data || []).length + ' pending';
+  document.getElementById('badgeAccessories').textContent = (data || []).length;
+  document.getElementById('tbodyAccessories').innerHTML = (data && data.length) ? data.map(l => `<tr>
+    <td><span class="lid">${l.lead_no}</span></td>
+    <td style="font-weight:500;">${l.customer_name}</td>
+    <td>${l.phone}</td>
+    <td>${l.ud_vehicle_parking || '—'}</td>
+    <td>${l.ud_vehicle_sub_parking || '—'}</td>
+    <td>${l.val_vehicle_type || '—'}</td>
+    <td>${l.val_vehicle_number || '—'}</td>
+    <td>${l.val_make || '—'}</td>
+    <td>${l.val_model_variant || '—'}</td>
+    <td>${l.rewire_partners ? l.rewire_partners.partner_name : '—'}</td>
+    <td>${l.pe ? l.pe.name : '—'}</td>
+    <td><span class="badge badge-q">${l.ma_status}</span></td>
+    <td>${l.created_at ? new Date(l.created_at).toLocaleDateString() : '—'}</td>
+    <td><button class="ab ab-form" style="background:#d97706;color:#fff;" onclick="openAccessoriesCheck('${l.id}','${l.lead_no}')"><i class="ti ti-list-check" style="font-size:11px;" aria-hidden="true"></i> Review</button></td>
+  </tr>`).join('') : '<tr><td colspan="14" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No leads pending Accessories Check.</td></tr>';
+}
+
+// ------------------------------------------------------------
+// ACCESSORIES REVIEW (Ramvir, Sept 2026) — Manager reviews a lead whose
+// Accessories Check deduction is > 0 and adds a remark before it's
+// eligible for Head Approval. Manager does NOT approve/reject the
+// deduction here — that decision still belongs to Head Approval; this step
+// only makes sure a Manager has actually looked at it and left context
+// (see haModal's display of accessories_manager_remarks, JS-Wiring.html).
+// A Manager only sees their OWN team's leads here (manager_id filter) —
+// Admin sees everyone's, same convention as every other Manager-scoped tab.
+// ------------------------------------------------------------
+async function renderAccessoriesReviewSection(page = 0) {
+  initTableFilterBar('accreview', () => renderAccessoriesReviewSection(page));
+  const arf = tableFilterState.accreview || {};
+  const buildQuery = () => {
+    let q = sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, phone, val_vehicle_type, val_vehicle_number, val_make, val_model_variant,
+        accessories_deduction_amount, accessories_deduction_reason, accessories_check_on, created_at,
+        pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+        manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)`)
+      .eq('accessories_manager_review_status', 'Pending')
+      .order('accessories_check_on', { ascending: true });
+    if (currentProfile && currentProfile.role === 'Manager') q = q.eq('manager_id', currentProfile.id);
+    if (arf.from) q = q.gte('accessories_check_on', istDayStart(arf.from));
+    if (arf.to) q = q.lte('accessories_check_on', istDayEnd(arf.to));
+    return q;
+  };
+  const data = await fetchAllRows((from, to) => buildQuery().range(from, to))
+    .catch(err => { console.error(err); return []; });
+  document.getElementById('countAccReview').textContent = (data || []).length + ' pending';
+  const badge = document.getElementById('badgeAccReview'); if (badge) badge.textContent = (data || []).length;
+  document.getElementById('tbodyAccReview').innerHTML = (data && data.length) ? data.map(l => `<tr>
+    <td><span class="lid">${l.lead_no}</span></td>
+    <td style="font-weight:500;">${l.customer_name}</td>
+    <td>${l.val_vehicle_number || '—'}</td>
+    <td>${l.val_make || '—'} ${l.val_model_variant || ''}</td>
+    <td>${l.pe ? l.pe.name : '—'}</td>
+    <td style="font-weight:700;color:#dc2626;">₹${(l.accessories_deduction_amount || 0).toLocaleString('en-IN')}</td>
+    <td>${l.accessories_deduction_reason || '—'}</td>
+    <td>${l.accessories_check_on ? new Date(l.accessories_check_on).toLocaleDateString() : '—'}</td>
+    <td><button class="ab ab-form" style="background:#d97706;color:#fff;" onclick="openAccessoriesReview('${l.id}','${l.lead_no}')"><i class="ti ti-message-2" style="font-size:11px;" aria-hidden="true"></i> Review</button></td>
+  </tr>`).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No leads pending your review.</td></tr>';
+}
+
+async function openAccessoriesReview(leadId, leadNo) {
+  activeLeadId = leadId;
+  document.getElementById('accReviewModalSub').textContent = leadNo;
+  const { data: lead, error } = await sb.from('rewire_master_data').select('*').eq('id', leadId).single();
+  if (error || !lead) { notify('Could not load lead details.', { icon: 'error' }); return; }
+  document.getElementById('accReviewModalSub').textContent = leadNo + (lead.val_vehicle_number ? ' · ' + lead.val_vehicle_number : '');
+
+  // Same Valuation-vs-Delivery comparison Accessories Check itself showed,
+  // so the Manager doesn't have to go dig up that screen separately to see
+  // WHY a shortage/excess was flagged.
+  const rows = computeAccessoryComparisons(lead).filter(r => r.kind !== 'match');
+  document.getElementById('accReviewCompareBody').innerHTML = rows.length ? rows.map(({ label, valVal, udVal, kind }) => `<tr>
+    <td style="font-weight:500;">${label}</td>
+    <td>${valVal || '—'}</td>
+    <td style="color:#dc2626;font-weight:700;">${udVal || '—'}</td>
+    <td>${accessoryKindBadge(kind)}</td>
+  </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--color-text-tertiary);padding:12px;">No mismatches recorded.</td></tr>';
+
+  document.getElementById('accReviewDeductionAmount').value = lead.accessories_deduction_amount ? '₹' + lead.accessories_deduction_amount.toLocaleString('en-IN') : '—';
+  document.getElementById('accReviewDeductionReason').value = lead.accessories_deduction_reason || '—';
+  document.getElementById('accReviewRemarks').value = lead.accessories_manager_remarks || '';
+  openModal('accReviewModal');
+}
+
+async function submitAccessoriesReview() {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+  const remarks = document.getElementById('accReviewRemarks').value.trim();
+  if (!remarks) { notify('Please add a remark before sending to Head Approval.', { icon: 'error', title: 'Missing field' }); return; }
+
+  const { error } = await sb.from('rewire_master_data').update({
+    accessories_manager_review_status: 'Reviewed',
+    accessories_manager_remarks: remarks,
+    accessories_manager_reviewed_by: currentProfile.id,
+    accessories_manager_reviewed_on: new Date().toISOString(),
+    last_updated_by: currentProfile.id,
+  }).eq('id', activeLeadId);
+  if (error) { notify('Error saving review: ' + error.message, { icon: 'error' }); return; }
+
+  notify('Sent to Head Approval with your remarks.');
+  closeModal('accReviewModal');
+  await renderAccessoriesReviewSection();
+  await refreshLeadsTable();
+}
+
+// uploadFileToDrive() (Code.gs) stores files as normal Google Drive share
+// links, e.g. https://drive.google.com/file/d/FILE_ID/view?usp=drivesdk —
+// that's an HTML viewer page, not a raw image, so it can never render
+// inside an <img> tag directly. This pulls the file ID out of that link
+// and points at Drive's public thumbnail endpoint instead, which *does*
+// serve actual image bytes for anyone-with-the-link files (exactly the
+// sharing mode uploadFileToDrive sets). Non-Drive URLs pass through
+// unchanged. No Supabase/schema change involved — this is purely a
+// client-side URL conversion.
+// Shared truthy check for every "does this lead actually have a file
+// uploaded" decision in the app (Purchased's Aadhar/PAN/GST/Cheque/RC/
+// Delivery/Form-2A/Authorization-Letter "View" links, Lead Details modal's
+// document rows, Partner cheque photo, Accessories Check photos, etc.).
+// A plain `url ? ... : '—'` check already covers null/undefined/empty
+// string correctly, but old/imported data sometimes has the URL column
+// filled with junk placeholder text instead of actually being empty
+// (whitespace, "NA", "N/A", "-", "null") — which is truthy and would
+// otherwise still show a "View" link for a document that was never really
+// uploaded. This treats all of those the same as "no file".
+function isRealFileUrl(url) {
+  if (!url) return false;
+  const v = String(url).trim().toLowerCase();
+  if (!v) return false;
+  return !['na', 'n/a', '-', '--', 'null', 'undefined', 'none'].includes(v);
+}
+
+function driveThumbUrl(url, size) {
+  if (!url) return url;
+  // NOTE: deliberately avoids a regex literal containing an escaped
+  // slash character before "d" — Apps Script's IFRAME_SANDBOX bundling
+  // has been observed to mangle that exact character sequence when it
+  // packages the page as a JS string for the client, silently corrupting
+  // everything after it in this file. indexOf()-based parsing sidesteps
+  // the issue entirely.
+  let id = null;
+  const dIdx = url.indexOf('/d/');
+  if (dIdx !== -1) {
+    const rest = url.slice(dIdx + 3);
+    const idMatch = rest.match(/^[a-zA-Z0-9_-]+/);
+    id = idMatch ? idMatch[0] : null;
+  }
+  if (!id) {
+    const idParamMatch = url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    id = idParamMatch ? idParamMatch[1] : null;
+  }
+  if (!id) return url;
+  var base = 'https:' + '/' + '/drive.google.com/thumbnail';
+  return base + '?id=' + id + '&sz=w' + (size || 200);
+}
+
+// If even the thumbnail endpoint can't load (private file, offline, etc.)
+// swap the broken <img> for a plain "View Photo" link to the original
+// Drive URL instead of leaving a broken-image icon on screen.
+function photoImgFallback(imgEl, url) {
+  const a = document.createElement('a');
+  a.href = url; a.target = '_blank'; a.rel = 'noopener';
+  a.textContent = 'View Photo';
+  a.className = 'sub';
+  a.style.fontSize = '11px';
+  a.onclick = (e) => e.stopPropagation(); // don't also trigger the parent card's onclick
+  imgEl.replaceWith(a);
+}
+
+// Same id-extraction as driveThumbUrl() (see its comment on why this is
+// indexOf()-based rather than a regex with an escaped slash) — turns a
+// normal Drive "view" link into the uc?export=download endpoint, which
+// actually triggers a save/download instead of just opening the viewer
+// page again.
+function driveDownloadUrl(url) {
+  if (!url) return url;
+  let id = null;
+  const dIdx = url.indexOf('/d/');
+  if (dIdx !== -1) {
+    const rest = url.slice(dIdx + 3);
+    const idMatch = rest.match(/^[a-zA-Z0-9_-]+/);
+    id = idMatch ? idMatch[0] : null;
+  }
+  if (!id) {
+    const idParamMatch = url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    id = idParamMatch ? idParamMatch[1] : null;
+  }
+  if (!id) return url;
+  var base = 'https:' + '/' + '/drive.google.com/uc';
+  return base + '?export=download&id=' + id;
+}
+
+// Opens a larger view of a delivery photo/document — used everywhere a
+// "View" link on a photo/document appears (per-item Photo columns, the
+// Documents grid, View Lead's rowLink(), Accounts' Cancelled Cheque links,
+// etc.) so every one of those gets this same in-app popup instead of
+// however many were previously just `<a target="_blank">` straight to the
+// Drive link (Transporter Bill and the Documents Management RC link were
+// the two found still doing that — fixed to call this instead). Preloads
+// the big thumbnail first; if that fails, just opens the original Drive
+// link in a new tab instead of showing a broken-image popup. Always
+// includes a real Download link/button — the popup wasn't offering one
+// before, only "view".
+function viewAccessoryPhoto(url, label) {
+  if (!isRealFileUrl(url)) return;
+  const big = driveThumbUrl(url, 1200);
+  const downloadUrl = driveDownloadUrl(url);
+  const footerHtml = `<a href="${downloadUrl}" target="_blank" rel="noopener" style="color:#1d4ed8;text-decoration:underline;font-weight:600;"><i class="ti ti-download" aria-hidden="true"></i> Download</a>`;
+  const preload = new Image();
+  preload.onload = () => Swal.fire({ imageUrl: big, imageAlt: label, title: label, footer: footerHtml, showConfirmButton: false, showCloseButton: true, width: 'auto' });
+  preload.onerror = () => Swal.fire({
+    icon: 'error', title: label, text: "Couldn't load a preview of this file.",
+    footer: footerHtml, showConfirmButton: false, showCloseButton: true,
+  });
+  preload.src = big;
+}
+
+// Live-sums the four "Deduct (₹)" inputs into the read-only Total
+// Deduction field, so Back Office always sees the running total.
+function calcAccessoriesDeductionTotal() {
+  const ids = ['accDeduct_pnCustomer', 'accDeduct_pnBroker', 'accDeduct_pnCod', 'accDeduct_pnCash'];
+  const total = ids.reduce((sum, id) => {
+    const el = document.getElementById(id);
+    return sum + (el ? (parseFloat(el.value) || 0) : 0);
+  }, 0);
+  document.getElementById('accessoriesDeductionAmount').value = total || '';
+}
+
+// Shared by the Accessories Check modal AND the Head Approval summary
+// (JS-Wiring.html) so both read the exact same comparison logic instead
+// of two copies drifting apart. Returns one row per checklist item with
+// a resolved `kind`:
+//   'shortage' — Valuation said the vehicle HAD it, Delivery says it
+//                doesn't (customer received less than what was valued).
+//   'excess'   — the reverse: Delivery has it but Valuation never
+//                recorded it.
+//   'match'    — both sides agree.
+// Alloy Wheel (Yes/No at Valuation vs an exact 0–5 count at Delivery) and
+// Cylinder Type (Valuation only ever records Fuel Type, not a cylinder
+// presence flag — CNG at Valuation is treated as "expected a cylinder";
+// CNG/LPG at Delivery is treated as "has one") both need a derived
+// has-it boolean instead of a raw string compare.
+function computeAccessoryComparisons(lead) {
+  const items = [
+    ['Spare Wheel', lead.val_spare_wheel, lead.ud_spare_wheel, lead.ud_spare_wheel_photo_url],
+    ['Stereo', lead.val_stereo, lead.ud_stereo, lead.ud_stereo_photo_url],
+    ['Speakers', lead.val_speakers, lead.ud_speakers, lead.ud_speakers_photo_url],
+    ['Tool Kit', lead.val_tool_kit, lead.ud_tool_kit, lead.ud_tool_kit_photo_url],
+    ['Battery', lead.val_battery, lead.ud_battery, lead.ud_battery_photo_url],
+    ['Alloy Wheel', lead.val_alloy_wheel, lead.ud_alloy_wheel, lead.ud_alloy_wheel_photo_url],
+    ['Cylinder Type', lead.val_fuel_type, lead.ud_cylinder_type, lead.ud_cylinder_photo_url],
+    ['Vehicle Operational', lead.val_vehicle_operational, lead.ud_vehicle_operational, null],
+    ['Vehicle Accidental', lead.val_vehicle_accidental, lead.ud_vehicle_accidental, null],
+  ];
+  return items.map(([label, valVal, udVal, photoUrl]) => {
+    let valHas, udHas;
+    if (label === 'Alloy Wheel') {
+      const udCount = parseInt(udVal, 10);
+      valHas = valVal === 'Yes';
+      udHas = !isNaN(udCount) && udCount > 0;
+    } else if (label === 'Speakers') {
+      // Both Valuation and Delivery capture this as a count (0/2/4/6/8/10),
+      // not Yes/No — "has speakers" means a non-zero count on each side.
+      const valCount = parseInt(valVal, 10);
+      const udCount = parseInt(udVal, 10);
+      valHas = !isNaN(valCount) && valCount > 0;
+      udHas = !isNaN(udCount) && udCount > 0;
+    } else if (label === 'Cylinder Type') {
+      valHas = valVal === 'CNG';
+      udHas = udVal === 'CNG' || udVal === 'LPG';
+    } else if (label === 'Vehicle Accidental') {
+      // Inverted vs every other item here (Ramvir, Sept 2026): for a real
+      // possession like Spare Wheel, "Yes" is the good/expected state, so
+      // Yes-at-Valuation-but-No-at-Delivery ("lost it") is correctly a
+      // Shortage. Accidental is the opposite — "Yes" is the BAD state. If
+      // Valuation said No (not accidental) but Delivery says Yes (became
+      // accidental in between — often just a PE mistake at Valuation
+      // caught later), that's the vehicle losing value, exactly what
+      // Shortage means for this workflow (it should be deduction-eligible
+      // below), not "Excess". So valHas/udHas here track "not accidental"
+      // (the good condition) instead of a literal Yes match.
+      valHas = valVal === 'No';
+      udHas = udVal === 'No';
+    } else {
+      valHas = valVal === 'Yes';
+      udHas = udVal === 'Yes';
+    }
+    let kind = 'match';
+    if (valHas && !udHas) kind = 'shortage';
+    else if (!valHas && udHas) kind = 'excess';
+    return { label, valVal, udVal, photoUrl, valHas, udHas, kind };
+  });
+}
+
+// Badge markup for a comparison row's kind — Shortage in red, Excess in
+// green (an unexpected extra item is a good thing, not a problem), Match
+// unchanged from before.
+function accessoryKindBadge(kind) {
+  if (kind === 'shortage') return '<span class="badge" style="background:#fee2e2;color:#dc2626;">Shortage</span>';
+  if (kind === 'excess') return '<span class="badge" style="background:#dcfce7;color:#16a34a;">Excess</span>';
+  return '<span class="badge badge-q">Match</span>';
+}
+
+async function openAccessoriesCheck(leadId, leadNo) {
+  activeLeadId = leadId;
+  document.getElementById('accessoriesModalSub').textContent = leadNo;
+  const { data: lead, error } = await sb.from('rewire_master_data').select('*').eq('id', leadId).single();
+  if (error || !lead) { notify('Could not load lead details.', { icon: 'error' }); return; }
+  // Vehicle No. shown alongside Lead No. (Ramvir, Sept 2026) — every
+  // pipeline popup should make it obvious which vehicle this is, not just
+  // which lead.
+  document.getElementById('accessoriesModalSub').textContent = leadNo + (lead.val_vehicle_number ? ' · ' + lead.val_vehicle_number : '');
+  if (lead.ud_status !== 'Complete' || !lead.ud_filled_on) {
+    notify('Upload Delivery form is not filled for this lead yet — Accessories Check cannot be reviewed until Delivery is complete.', { icon: 'error', title: 'Delivery pending' });
+    return;
+  }
+
+  const rows = computeAccessoryComparisons(lead);
+  document.getElementById('accessoriesCompareBody').innerHTML = rows.map(({ label, valVal, udVal, photoUrl, kind }) => {
+    const mismatch = kind !== 'match';
+    const photoCell = isRealFileUrl(photoUrl)
+      ? `<img src="${driveThumbUrl(photoUrl, 120)}" alt="${label}" title="Click to enlarge" style="width:44px;height:44px;object-fit:cover;border-radius:6px;cursor:pointer;border:0.5px solid var(--color-border-tertiary);" onclick="viewAccessoryPhoto('${photoUrl}','${label} — Delivery Photo')" onerror="photoImgFallback(this,'${photoUrl}')" />`
+      : '<span class="sub">—</span>';
+    return `<tr ${mismatch ? 'style="background:#fef2f2;"' : ''}>
+      <td style="font-weight:500;">${label}</td>
+      <td>${valVal || '—'}</td>
+      <td style="${mismatch ? 'color:#dc2626;font-weight:700;' : ''}">${udVal || '—'}</td>
+      <td>${photoCell}</td>
+      <td>${accessoryKindBadge(kind)}</td>
+    </tr>`;
+  }).join('');
+
+  const docs = [
+    ['Inventory Slip', lead.ud_inventory_slip_url],
+    ['Delivery Photo', lead.ud_delivery_photo_url],
+  ].filter(([, url]) => isRealFileUrl(url));
+  document.getElementById('accessoriesPhotosGrid').innerHTML = docs.length ? docs.map(([label, url]) => `
+    <div style="border:0.5px solid var(--color-border-tertiary);border-radius:8px;padding:8px;text-align:center;cursor:pointer;" onclick="viewAccessoryPhoto('${url}','${label}')" title="Click to enlarge">
+      <img src="${driveThumbUrl(url, 300)}" alt="${label}" style="width:100%;height:90px;object-fit:cover;border-radius:6px;" onerror="photoImgFallback(this,'${url}')" />
+      <div style="font-size:11px;color:var(--color-text-secondary);margin-top:6px;">${label}</div>
+    </div>`).join('') : '<div style="color:var(--color-text-tertiary);font-size:12px;grid-column:1/-1;">No documents uploaded at Delivery.</div>';
+
+  // Price Negotiation payment split, each with its own editable "Deduct"
+  // amount so Back Office can pick exactly which bucket (customer/broker/
+  // COD/cash) an accessory shortfall gets recovered from.
+  const pnSplit = [
+    ['Customer Payment', 'pnCustomer', lead.pn_customer_payment],
+    ['Broker Payment', 'pnBroker', lead.pn_broker_payment],
+    ['COD Payment', 'pnCod', lead.pn_cod_payment],
+    ['Cash Commission', 'pnCash', lead.pn_cash_commission],
+  ];
+  // Transporter Freight bucket (Ramvir, Oct 2026) — only shown when this
+  // vehicle actually came in via a transporter (logistics_transporter_name
+  // set). A shortage on a transporter-delivered vehicle is recovered from
+  // the Transporter's freight payable, not from customer/broker/COD/cash —
+  // separate Debit Register tab reads accessories_deduct_transporter.
+  if (lead.logistics_transporter_name) {
+    pnSplit.push([`Transporter Freight (${lead.logistics_transporter_name})`, 'pnTransporter', lead.logistics_freight_amount]);
+  }
+  document.getElementById('accessoriesPnSplitBody').innerHTML = pnSplit.map(([label, key, orig]) => `
+    <tr>
+      <td style="font-weight:500;">${label}</td>
+      <td>${orig ? '₹' + orig : '—'}</td>
+      <td><input type="number" id="accDeduct_${key}" min="0" onwheel="this.blur()" placeholder="0" style="width:110px;border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 7px;font-size:12px;" oninput="calcAccessoriesDeductionTotal()" /></td>
+    </tr>`).join('');
+
+  // Accessories Check always runs after Upload Delivery, so ud_total_offer_price
+  // (the Delivery-time, final price) is the correct "Deal Total" to deduct
+  // against here -- pn_total_offer_price is only a fallback for the rare
+  // case Delivery hasn't actually saved a total yet.
+  document.getElementById('accessoriesDealTotalAmount').value = (lead.ud_total_offer_price || lead.pn_total_offer_price) ? '₹' + (lead.ud_total_offer_price || lead.pn_total_offer_price) : '—';
+  document.getElementById('accessoriesDeductionAmount').value = lead.accessories_deduction_amount || '';
+  document.getElementById('accessoriesDeductionReason').value = lead.accessories_deduction_reason || '';
+  document.getElementById('accessoriesRemarks').value = '';
+  openModal('accessoriesModal');
+}
+
+async function submitAccessoriesCheck() {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+
+  // Roll the four per-bucket deduction inputs into one total + a reason
+  // string that spells out exactly which bucket(s) were reduced — this is
+  // what makes it traceable later that a deduction happened because of
+  // Accessories Check, and from where.
+  const buckets = [
+    ['Customer Payment', 'accDeduct_pnCustomer'],
+    ['Broker Payment', 'accDeduct_pnBroker'],
+    ['COD Payment', 'accDeduct_pnCod'],
+    ['Cash Commission', 'accDeduct_pnCash'],
+    ['Transporter Freight', 'accDeduct_pnTransporter'],
+  ];
+  let total = 0;
+  const parts = [];
+  // Bucket amounts now ALSO saved individually (accessories_deduct_*,
+  // Ramvir Sept 2026) — previously only the rolled-up total + this text
+  // reason survived, so nothing downstream could tell WHICH bucket to
+  // actually dock. sync_pending_payment_amounts() (DB trigger) reads
+  // these to correct the real payable rewire_payments row once Head
+  // Approval sets a final deduction — see RJ20CA5411/L7102935 (broker
+  // paid the full ₹22,000 instead of the approved ₹20,000 net) and
+  // L7103005 (payment row frozen at the ORIGINAL PN amount, missing a
+  // later GST/amount edit) — both were the same underlying gap: the
+  // deduction/edit only ever updated rewire_master_data, never the
+  // actual payment row Accounts pays from.
+  const bucketAmounts = { pnCustomer: 0, pnBroker: 0, pnCod: 0, pnCash: 0, pnTransporter: 0 };
+  buckets.forEach(([label, id]) => {
+    const el = document.getElementById(id);
+    const val = el ? (parseFloat(el.value) || 0) : 0;
+    const key = id.replace('accDeduct_', '');
+    if (bucketAmounts.hasOwnProperty(key)) bucketAmounts[key] = val;
+    if (val > 0) { total += val; parts.push(`${label}: -₹${val}`); }
+  });
+  const manualReason = (document.getElementById('accessoriesDeductionReason').value || '').trim();
+  const composedReason = [parts.join('; '), manualReason].filter(Boolean).join(' — ');
+
+  // current_stage only advances here for Post Delivery — Advance Payment/
+  // Omini Pay/Instant Payments have Accessories Check decoupled from
+  // current_stage entirely (same as Delivery, see loadQualTab's comments,
+  // JS-Dashboard.html), which stays parked earlier for these while
+  // Delivery/Accessories Check happen in parallel; submitUploadDelivery()
+  // already respects this same isAlt guard, this was the one write site
+  // that didn't. Bumping it here for Alt types would have pulled
+  // current_stage away from the value every other part of the app expects
+  // for them (e.g. the Payment Release tab's own current_stage===6 check).
+  let leadForAcc = findLeadInAnyPage(activeLeadId);
+  if (!leadForAcc || !leadForAcc.pn_payment_type) {
+    const { data: freshAccLead } = await sb.from('rewire_master_data').select('pn_payment_type').eq('id', activeLeadId).single();
+    leadForAcc = freshAccLead;
+  }
+  const isAltFlowAcc = isAltFlowPaymentType(leadForAcc && leadForAcc.pn_payment_type);
+  const accPayload = {
+    accessories_check_status: 'Confirmed',
+    accessories_check_by: currentProfile.id,
+    accessories_check_on: new Date().toISOString(),
+    accessories_check_remarks: document.getElementById('accessoriesRemarks').value.trim(),
+    accessories_deduction_amount: total || null,
+    accessories_deduction_reason: composedReason || null,
+    accessories_deduct_customer: bucketAmounts.pnCustomer || null,
+    accessories_deduct_broker: bucketAmounts.pnBroker || null,
+    accessories_deduct_cod: bucketAmounts.pnCod || null,
+    accessories_deduct_cash: bucketAmounts.pnCash || null,
+    accessories_deduct_transporter: bucketAmounts.pnTransporter || null,
+    last_updated_by: currentProfile.id,
+  };
+  if (!isAltFlowAcc) accPayload.current_stage = 7;
+  // Accessories Deduction -> Manager Review (Ramvir, Sept 2026) — a
+  // deduction > 0 now has to wait for the lead's Manager to add a remark
+  // (Accessories Review section) before it's eligible for Head Approval;
+  // see the .or('accessories_manager_review_status...') exclusion added to
+  // the Head Approval queue (loadQualTab, JS-Dashboard.html). No
+  // deduction at all skips this entirely — status stays null, straight to
+  // Head Approval exactly as before.
+  if (total > 0) {
+    accPayload.accessories_manager_review_status = 'Pending';
+    accPayload.accessories_manager_remarks = null;
+    accPayload.accessories_manager_reviewed_by = null;
+    accPayload.accessories_manager_reviewed_on = null;
+  }
+  const { error } = await sb.from('rewire_master_data').update(accPayload).eq('id', activeLeadId);
+  if (error) { notify('Error confirming: ' + error.message, { icon: 'error' }); return; }
+
+  if (total > 0) {
+    // Fetch the lead's Manager email fresh (not in the cached lead object
+    // used to populate this modal) — fire-and-forget, same pattern as the
+    // Instant Payment email elsewhere in this app. A missing manager_email
+    // just skips the email silently rather than failing the whole save —
+    // the lead still correctly sits in Accessories Review either way.
+    const { data: accMgrLead } = await sb.from('rewire_master_data')
+      .select('lead_no, customer_name, val_vehicle_number, accessories_deduction_amount, accessories_deduction_reason, manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name, manager_email)')
+      .eq('id', activeLeadId).single();
+    const mgrEmail = accMgrLead && accMgrLead.manager ? accMgrLead.manager.manager_email : null;
+    if (mgrEmail) {
+      google.script.run
+        .withSuccessHandler(() => {})
+        .withFailureHandler((err) => console.error('Accessories deduction review email failed: ' + err.message))
+        .sendAccessoriesDeductionReviewEmail({
+          managerEmail: mgrEmail,
+          managerName: accMgrLead.manager.name || '',
+          leadNo: accMgrLead.lead_no, customerName: accMgrLead.customer_name,
+          vehicleNumber: accMgrLead.val_vehicle_number,
+          deductionAmount: accMgrLead.accessories_deduction_amount,
+          deductionReason: accMgrLead.accessories_deduction_reason,
+        });
+    }
+  }
+
+  notify(total > 0 ? 'Accessories Check confirmed — sent to Manager for review before Head Approval.' : 'Accessories Check confirmed. Lead moved to Head Approval.');
+  closeModal('accessoriesModal');
+  await renderAccessoriesSection();
+  await refreshLeadsTable();
+}
+
+
+
+// ------------------------------------------------------------
+// LOCATION TRACKING — every delivered vehicle not yet sent to plant
+// (same pool as Logistics: ud_status='Complete', logistics_status still
+// null). Back Office updates ud_vehicle_parking directly here as the
+// vehicle physically moves between locations before eventual dispatch.
+// Once Logistics sends it to plant, it drops off this list — its
+// location is then driven by logistics_status/rst_no instead (see
+// renderPurchasedSection in JS-Tracking.html).
+// ------------------------------------------------------------
+let locTrackEditingId = null;
+async function renderLocationTrackingSection() {
+  initTableFilterBar('loctrack', renderLocationTrackingSection);
+  // .neq('overall_status','Closed Lost') — same fix as Logistics tab: a
+  // lead closed out (e.g. duplicate vehicle) after Upload Delivery still
+  // has ud_status='Complete' + logistics_status=null, so it would otherwise
+  // sit here forever asking Back Office to track a dead lead's location.
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, city, val_vehicle_type, val_vehicle_number, val_make,
+      val_model_variant, ud_vehicle_parking, ud_vehicle_sub_parking, ud_filled_on,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name)`)
+    .eq('ud_status', 'Complete')
+    .is('logistics_status', null)
+    .neq('overall_status', 'Closed Lost')
+    // Scrapped/Reserved/"Scrapped - Provisionally" are terminal disposal
+    // outcomes (set from the Vehicle Disposal tab, or via the old bulk
+    // parking-location import) — not an in-transit location to keep
+    // tracking here. Those vehicles belong in Vehicle Disposal instead.
+    // Also excluding "Jaipur Plant" itself — ~71 leads from the old bulk
+    // import already sit at Jaipur Plant despite logistics_status still
+    // being null (never actually dispatched via the live Send to Plant
+    // flow); they've arrived, so there's no "current location" left to
+    // update here — same as how Dashboard's Location Wise Summary already
+    // treats them as landed, not in-transit.
+    // (See .not(col,'in',...) gotcha note in JS-Tracking.html/
+    // HEALTH_CHECKS — no quotes needed per-value, just the outer parens.)
+    .not('ud_vehicle_parking', 'in', '(Scrapped,Scrapped - Provisionally,Reserved,Jaipur Plant)')
+    .order('ud_filled_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const data = filterRowsByTableFilter(rawData || [], 'loctrack',
+    l => l.pe ? l.pe.id : null,
+    l => l.manager ? l.manager.id : null,
+    l => l.ud_filled_on ? l.ud_filled_on.slice(0, 10) : null);
+
+  document.getElementById('countLoctrack').textContent = (data || []).length + ' vehicles';
+  loctrackPageCache = data || [];
+  document.getElementById('tbodyLoctrack').innerHTML = (data && data.length) ? data.map(l => `<tr>
+    <td data-col="lead_no"><span class="lid">${l.lead_no}</span></td>
+    <td data-col="customer" style="font-weight:500;">${l.customer_name}</td>
+    <td data-col="vehicle_type">${l.val_vehicle_type || '—'}</td>
+    <td data-col="vehicle_no">${l.val_vehicle_number || '—'}</td>
+    <td data-col="make">${l.val_make || '—'}</td>
+    <td data-col="model">${l.val_model_variant || '—'}</td>
+    <td data-col="location">${l.ud_vehicle_parking || '—'}</td>
+    <td data-col="sub_location">${l.ud_vehicle_sub_parking || '—'}</td>
+    <td data-col="pe">${l.pe ? l.pe.name : '—'}</td>
+    <td data-col="manager">${l.manager ? l.manager.name : '—'}</td>
+    <td data-col="delivered_on">${l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '—'}</td>
+    <td><button class="btn btn-outline" style="padding:4px 10px;font-size:12px;" onclick="openLocationUpdateModal('${l.id}','${(l.lead_no || '').replace(/'/g, "\\'")}','${(l.ud_vehicle_parking || '').replace(/'/g, "\\'")}','${(l.val_vehicle_number || '').replace(/'/g, "\\'")}','${(l.ud_vehicle_sub_parking || '').replace(/'/g, "\\'")}')"><i class="ti ti-map-pin" style="font-size:12px;" aria-hidden="true"></i> Update</button></td>
+  </tr>`).join('') : '<tr><td colspan="12" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No vehicles to track — everything is either not yet delivered or already sent to plant.</td></tr>';
+  initColumnPicker('loctrack', LOCTRACK_COLUMNS, 'loctrackColumnPicker', 'tableLoctrack');
+}
+
+let loctrackPageCache = [];
+const LOCTRACK_COLUMNS = [
+  { key: 'lead_no', label: 'Lead No.', get: l => l.lead_no || '' },
+  { key: 'customer', label: 'Customer', get: l => l.customer_name || '' },
+  { key: 'vehicle_type', label: 'Vehicle Type', get: l => l.val_vehicle_type || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: l => l.val_vehicle_number || '' },
+  { key: 'make', label: 'Make', get: l => l.val_make || '' },
+  { key: 'model', label: 'Model', get: l => l.val_model_variant || '' },
+  { key: 'location', label: 'Current Location', get: l => l.ud_vehicle_parking || '' },
+  { key: 'sub_location', label: 'Sub Location', get: l => l.ud_vehicle_sub_parking || '' },
+  { key: 'pe', label: 'PE', get: l => l.pe ? l.pe.name : '' },
+  { key: 'manager', label: 'Manager', get: l => l.manager ? l.manager.name : '' },
+  { key: 'delivered_on', label: 'Delivered On', get: l => l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '' },
+];
+function exportLoctrackTabExcel() {
+  if (!loctrackPageCache.length) { notify('No vehicles to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('loctrack', loctrackPageCache, LOCTRACK_COLUMNS, 'rewire-dms-location-tracking.xlsx', 'Location Tracking');
+}
+
+function openLocationUpdateModal(id, leadNo, currentValue, vehicleNo, currentSubValue) {
+  locTrackEditingId = id;
+  // Vehicle No. shown alongside Lead No. (Ramvir, Sept 2026) — Back Office
+  // was updating location by Lead No. alone, easy to mix up on a busy list.
+  document.getElementById('locUpdateModalSub').textContent = (leadNo || '—') + (vehicleNo ? ' · ' + vehicleNo : '');
+  const input = document.getElementById('locUpdateValue');
+  input.value = currentValue || '';
+  refreshSubLocationSelect('locUpdateSubValue', currentValue || '', currentSubValue || '');
+  openModal('locationUpdateModal');
+}
+
+async function submitLocationUpdate() {
+  if (!locTrackEditingId) return;
+  // Early-entry lock (Ramvir, Sept 2026) — a vehicle whose park location
+  // was set via "Fill for a Vehicle Not Yet Listed" (see
+  // lockEarlyPlantEntry()) can't have it manually changed here. In
+  // practice this lead's row won't even appear in Location Tracking once
+  // locked (that list already excludes ud_vehicle_parking='Jaipur Plant'),
+  // but this guard covers any stale-cache edge case.
+  const { data: lockCheck } = await sb.from('rewire_master_data').select('early_plant_entry').eq('id', locTrackEditingId).maybeSingle();
+  if (lockCheck && lockCheck.early_plant_entry) {
+    notify("This vehicle's park location was locked via early plant entry and can't be changed here.", { icon: 'error', title: 'Locked' });
+    return;
+  }
+  let value = document.getElementById('locUpdateValue').value.trim();
+  if (!value) { notify('Please select a location.', { icon: 'error', title: 'Missing field' }); return; }
+  // "Jaipur Plant" is reached only via Logistics' own "Send to Plant" flow
+  // (see data-exclude on this field, Modals-General.html) — block it here
+  // too in case it's typed in manually rather than picked from the list.
+  if (value.toLowerCase() === 'jaipur plant') {
+    notify('"Jaipur Plant" can only be set via Logistics → Send to Plant, not here.', { icon: 'error', title: 'Not allowed here' });
+    return;
+  }
+  if (!isValidMasterValue('location', value)) {
+    notify('"' + value + '" is not in the Location master list. Ask Admin to add it in Settings → Master Data, or pick an existing option.', { icon: 'error', title: 'Invalid Location' });
+    return;
+  }
+  // Normalize to the master list's own casing (Ramvir, Sept 2026) — this
+  // is exactly the bug that let "Alwar"/"ALWAR"/"alwar" pile up as 3
+  // separate values in the Location Tracking filter: the check above only
+  // ever compared case-insensitively, but this line used to save
+  // whatever the user actually typed.
+  value = normalizeMasterValue('location', value);
+  const subValue = document.getElementById('locUpdateSubValue').value || null;
+  const { error } = await sb.from('rewire_master_data').update({ ud_vehicle_parking: value, ud_vehicle_sub_parking: subValue }).eq('id', locTrackEditingId);
+  if (error) { notify('Error updating location: ' + error.message, { icon: 'error' }); return; }
+  notify('Location updated.');
+  closeModal('locationUpdateModal');
+  locTrackEditingId = null;
+  await renderLocationTrackingSection();
+}
+
+// ------------------------------------------------------------
+// VEHICLE DISPOSAL — every vehicle currently parked at "Jaipur Plant"
+// (ud_vehicle_parking), waiting on a final Scrapped/Reserved call. Marking
+// it either moves ud_vehicle_parking away from "Jaipur Plant", so — same
+// pattern as Location Tracking — it naturally drops off this list once
+// actioned; no separate "processed" flag needed.
+// Scrapped requires dismantle evidence: min 4 / max 10 photos AND min 4 /
+// max 10 videos, both mandatory, uploaded to Drive via the existing
+// uploadFile() helper (JS-Core.html) before the DB row is updated.
+// Reserved needs no evidence — just the status change.
+// ------------------------------------------------------------
+let disposalEditingId = null;
+let disposalEditingLeadNo = null;
+const DISPOSAL_PHOTO_MIN = 4, DISPOSAL_PHOTO_MAX = 10;
+const DISPOSAL_VIDEO_MIN = 4, DISPOSAL_VIDEO_MAX = 10;
+
+// Scrap Contractors (Ramvir, Oct 2026) — Vehicle Scrapping Module: some
+// vehicles are allocated to an outside Contractor who scraps them on
+// REWIRE's behalf instead of it happening in-house. A small reference
+// list (rewire_scrap_contractors), same pattern as rewire_transporters.
+let scrapContractorsCache = [];
+async function loadScrapContractors() {
+  scrapContractorsCache = await fetchAllRows((from, to) => sb.from('rewire_scrap_contractors')
+    .select('*').order('name').range(from, to))
+    .catch(err => { console.error(err); return []; });
+}
+
+function openAddContractorModal() {
+  ['contractorName', 'contractorPhone', 'contractorLocation'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  openModal('addContractorModal');
+}
+
+async function submitAddContractor() {
+  const name = document.getElementById('contractorName').value.trim();
+  if (!name) { notify('Contractor name is required.', { icon: 'error', title: 'Missing field' }); return; }
+  const payload = {
+    name,
+    phone: document.getElementById('contractorPhone').value.trim() || null,
+    location: document.getElementById('contractorLocation').value.trim() || null,
+    created_by: currentProfile.id,
+  };
+  const { error } = await sb.from('rewire_scrap_contractors').insert(payload);
+  if (error) { notify('Error adding contractor: ' + error.message, { icon: 'error' }); return; }
+  notify('Contractor added.');
+  closeModal('addContractorModal');
+  await loadScrapContractors();
+  // If the Allocate modal is what led here, refresh its dropdown too.
+  populateAllocateContractorSelect();
+}
+
+function populateAllocateContractorSelect() {
+  const sel = document.getElementById('allocateContractorSelect');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">Select…</option>' +
+    scrapContractorsCache.map(c => `<option value="${c.id}">${c.name}${c.location ? ' — ' + c.location : ''}</option>`).join('');
+}
+
+// ------------------------------------------------------------
+// VEHICLE DISPOSAL · MULTI-SELECT + BULK ACTIONS (Ramvir, Oct 2026) —
+// "Pending Disposal me multiple select ka option do ... Allocate col table
+// se remove kar do ... Contractor or Reserved tab me bhi multiple select
+// karke Contractor se Reserved and Reserved se Contractor and Contractor se
+// Pending Disposal and Reserved se Pending Disposal ho sakti hai". One Set
+// of checked lead ids per sub-tab (keyed by table-filter prefix), shared by
+// the Allocate/Reserve/Deallocate bulk actions below. The old single-row
+// openAllocateModal(id,...) is gone — Allocate is bulk-only now, reached via
+// the bulk bar that appears once ≥1 row is checked.
+// ------------------------------------------------------------
+const disposalSelection = { disposal: new Set(), disposalallocated: new Set(), disposalreserved: new Set(), rc: new Set() };
+
+function toggleDisposalRowSelect(prefix, id, checked) {
+  if (checked) disposalSelection[prefix].add(id); else disposalSelection[prefix].delete(id);
+  updateDisposalBulkBar(prefix);
+}
+// Select-all works like Excel's: it only touches rows currently VISIBLE after
+// column-header / search filters (Ramvir, Oct 2026 — filtered 471 of 515, but
+// select-all used to tick all 515). Rows hidden by a filter are always
+// un-selected so a bulk action can never hit a vehicle the user can't see.
+function toggleSelectAllDisposalRows(prefix, masterCb) {
+  document.querySelectorAll(`.${prefix}-select-cb`).forEach(cb => {
+    const tr = cb.closest('tr');
+    const hidden = tr && (tr.dataset.twColFiltered === '1' || tr.dataset.twFiltered === '1');
+    if (hidden) { cb.checked = false; disposalSelection[prefix].delete(cb.value); return; }
+    cb.checked = masterCb.checked;
+    if (masterCb.checked) disposalSelection[prefix].add(cb.value); else disposalSelection[prefix].delete(cb.value);
+  });
+  updateDisposalBulkBar(prefix);
+}
+// Called whenever a table's filters change — drops any now-hidden row from
+// the selection so the "N selected" count and bulk actions stay honest.
+function pruneHiddenDisposalSelection(table) {
+  const prefix = table && table.dataset ? table.dataset.filterPrefix : null;
+  if (!prefix || !disposalSelection[prefix]) return;
+  table.querySelectorAll(`.${prefix}-select-cb`).forEach(cb => {
+    const tr = cb.closest('tr');
+    if (tr && (tr.dataset.twColFiltered === '1' || tr.dataset.twFiltered === '1')) {
+      cb.checked = false; disposalSelection[prefix].delete(cb.value);
+    }
+  });
+  const master = document.getElementById(prefix + 'SelectAll');
+  if (master) master.checked = false;
+  updateDisposalBulkBar(prefix);
+}
+function updateDisposalBulkBar(prefix) {
+  const bar = document.getElementById(prefix + 'BulkBar');
+  const n = disposalSelection[prefix].size;
+  if (bar) bar.style.display = n > 0 ? 'flex' : 'none';
+  const countEl = document.getElementById(prefix + 'BulkCount');
+  if (countEl) countEl.textContent = n + ' selected';
+}
+function clearDisposalSelection(prefix) {
+  disposalSelection[prefix].clear();
+  document.querySelectorAll(`.${prefix}-select-cb`).forEach(cb => cb.checked = false);
+  const master = document.getElementById(prefix + 'SelectAll');
+  if (master) master.checked = false;
+  updateDisposalBulkBar(prefix);
+}
+// Re-renders whichever of the 3 disposal sub-tabs is currently visible,
+// after a bulk action moves vehicles between them.
+async function refreshVisibleDisposalTab() {
+  if (document.getElementById('section-vehicle-disposal').style.display !== 'none') return renderVehicleDisposalSection();
+  if (document.getElementById('section-vehicle-disposal-allocated').style.display !== 'none') return renderVehicleDisposalAllocatedSection();
+  if (document.getElementById('section-vehicle-disposal-reserved').style.display !== 'none') return renderVehicleDisposalReservedSection();
+}
+
+// --- Bulk: Allocate to Contractor (from Pending Disposal or Reserved tab) ---
+let bulkAllocateSourcePrefix = null;
+function openBulkAllocateModal(prefix) {
+  const ids = [...disposalSelection[prefix]];
+  if (!ids.length) { notify('Select at least one vehicle first.', { icon: 'info' }); return; }
+  bulkAllocateSourcePrefix = prefix;
+  document.getElementById('allocateModalSub').textContent = ids.length + ' vehicle(s) selected';
+  populateAllocateContractorSelect();
+  document.getElementById('allocateContractorSelect').value = '';
+  openModal('allocateContractorModal');
+}
+async function submitAllocateContractor() {
+  if (!bulkAllocateSourcePrefix) return;
+  const ids = [...disposalSelection[bulkAllocateSourcePrefix]];
+  if (!ids.length) return;
+  const contractorId = document.getElementById('allocateContractorSelect').value;
+  if (!contractorId) { notify('Select a Contractor.', { icon: 'error', title: 'Missing field' }); return; }
+  // Moving in from Reserved clears its Reserved fields too, so the vehicle
+  // doesn't keep showing in both tabs (Reserved tab filters strictly on
+  // ud_vehicle_parking = 'Reserved').
+  const payload = {
+    scrap_allocated_contractor_id: contractorId,
+    scrap_allocated_by: currentProfile.id,
+    scrap_allocated_on: new Date().toISOString(),
+  };
+  if (bulkAllocateSourcePrefix === 'disposalreserved') {
+    payload.ud_vehicle_parking = 'Jaipur Plant';
+    payload.scrap_reserved_reason = null;
+    payload.scrap_reserved_by = null;
+  }
+  const { error } = await sb.from('rewire_master_data').update(payload).in('id', ids);
+  if (error) { notify('Error allocating vehicles: ' + error.message, { icon: 'error' }); return; }
+  notify(ids.length + ' vehicle(s) allocated to Contractor.');
+  closeModal('allocateContractorModal');
+  clearDisposalSelection(bulkAllocateSourcePrefix);
+  bulkAllocateSourcePrefix = null;
+  await refreshVisibleDisposalTab();
+}
+
+// --- Bulk: Reserve (from Pending Disposal or Contractor tab) ---
+let bulkReserveSourcePrefix = null;
+function openBulkReserveModal(prefix) {
+  const ids = [...disposalSelection[prefix]];
+  if (!ids.length) { notify('Select at least one vehicle first.', { icon: 'info' }); return; }
+  bulkReserveSourcePrefix = prefix;
+  document.getElementById('bulkReserveCount').textContent = ids.length + ' vehicle(s) selected';
+  document.getElementById('bulkReserveReason').value = '';
+  openModal('bulkReserveModal');
+}
+async function submitBulkReserve() {
+  if (!bulkReserveSourcePrefix) return;
+  const ids = [...disposalSelection[bulkReserveSourcePrefix]];
+  if (!ids.length) return;
+  const reason = (document.getElementById('bulkReserveReason').value || '').trim();
+  if (!reason) { notify('Reason for reserving is required.', { icon: 'error', title: 'Missing field' }); return; }
+  const { error } = await sb.from('rewire_master_data').update({
+    ud_vehicle_parking: 'Reserved',
+    scrap_marked_by: currentProfile.id,
+    scrap_marked_on: new Date().toISOString(),
+    scrap_reserved_reason: reason,
+    scrap_reserved_by: currentProfile.id,
+    // Moving in from Contractor clears the allocation fields too, so the
+    // vehicle doesn't keep showing in both tabs (Contractor tab filters on
+    // scrap_allocated_contractor_id being set).
+    scrap_allocated_contractor_id: null,
+    scrap_allocated_by: null,
+    scrap_allocated_on: null,
+  }).in('id', ids);
+  if (error) { notify('Error reserving vehicles: ' + error.message, { icon: 'error' }); return; }
+  notify(ids.length + ' vehicle(s) marked Reserved.');
+  closeModal('bulkReserveModal');
+  clearDisposalSelection(bulkReserveSourcePrefix);
+  bulkReserveSourcePrefix = null;
+  await refreshVisibleDisposalTab();
+}
+
+// --- Bulk: Move back to Pending Disposal (from Contractor or Reserved tab) ---
+async function bulkMoveToPending(prefix) {
+  const ids = [...disposalSelection[prefix]];
+  if (!ids.length) { notify('Select at least one vehicle first.', { icon: 'info' }); return; }
+  const confirmed = await confirmDialog(`Move ${ids.length} vehicle(s) back to Pending Disposal?`, 'Move to Pending Disposal');
+  if (!confirmed) return;
+  const { error } = await sb.from('rewire_master_data').update({
+    ud_vehicle_parking: 'Jaipur Plant',
+    scrap_allocated_contractor_id: null,
+    scrap_allocated_by: null,
+    scrap_allocated_on: null,
+    scrap_reserved_reason: null,
+    scrap_reserved_by: null,
+  }).in('id', ids);
+  if (error) { notify('Error moving vehicles: ' + error.message, { icon: 'error' }); return; }
+  notify(ids.length + ' vehicle(s) moved back to Pending Disposal.');
+  clearDisposalSelection(prefix);
+  await refreshVisibleDisposalTab();
+}
+
+// Small stock cards on the Disposal tabs (Ramvir, Oct 2026): where the Jaipur Plant stock is sitting.
+// Plant / Yard-2 / Yard-3 = not yet with a Contractor; Contractor = allocated; Total = all of them.
+async function renderDisposalSummaryCards() {
+  const wraps = document.querySelectorAll('.disposal-summary-cards');
+  if (!wraps.length) return;
+  // Mirrors the four tab lists exactly (so card numbers == "N vehicles" counts on the tabs):
+  //   Pending  = parking Jaipur Plant, not Closed Lost, not allocated  (split by sub-location)
+  //   Contractor = allocated to a contractor (not Reserved / Scrapped)
+  //   Reserved = parking Reserved
+  const sel = 'id, ud_vehicle_parking, ud_vehicle_sub_parking, scrap_allocated_contractor_id, overall_status, ud_status';
+  const [plantRows, allocRows, resRows] = await Promise.all([
+    fetchAllRows((from, to) => sb.from('rewire_master_data').select(sel).eq('ud_vehicle_parking', 'Jaipur Plant').neq('overall_status', 'Closed Lost').is('scrap_allocated_contractor_id', null).range(from, to)).catch(() => []),
+    fetchAllRows((from, to) => sb.from('rewire_master_data').select(sel).not('scrap_allocated_contractor_id', 'is', null).not('ud_vehicle_parking', 'in', '("Reserved","Scrapped","Scrapped - Provisionally")').range(from, to)).catch(() => []),
+    fetchAllRows((from, to) => sb.from('rewire_master_data').select(sel).eq('ud_vehicle_parking', 'Reserved').range(from, to)).catch(() => []),
+  ]);
+  const c = { plant: 0, y2: 0, y3: 0 };
+  plantRows.forEach(r => {
+    const sub = (r.ud_vehicle_sub_parking || 'Jaipur Plant').trim();
+    if (/yard-?\s*2/i.test(sub)) c.y2++; else if (/yard-?\s*3/i.test(sub)) c.y3++; else c.plant++;
+  });
+  const contractor = allocRows.length, reserved = resRows.length;
+  const total = c.plant + c.y2 + c.y3 + contractor + reserved;
+  // Dashboard > Location Wise Summary only counts Delivery Complete + Purchased vehicles.
+  const notDash = plantRows.concat(allocRows, resRows).filter(r => !(r.overall_status === 'Purchased' && r.ud_status === 'Complete')).length;
+  const card = (label, n, color, tip) => `<div title="${tip || ''}" style="background:#fff;border:1px solid var(--color-border-tertiary);border-radius:8px;padding:8px 12px;border-left:3px solid ${color};">
+    <div style="font-size:10px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.04em;font-weight:600;">${label}</div><div style="font-size:19px;font-weight:700;color:${color};">${n}</div></div>`;
+  const html = card('Jaipur Plant', c.plant, '#2563eb') + card('Yard-2', c.y2, '#7c3aed') + card('Yard-3', c.y3, '#d97706')
+    + card('Contractor', contractor, '#059669') + card('Reserved', reserved, '#db2777')
+    + card('Total Stock', total, '#0f172a', 'Plant + Yard-2 + Yard-3 + Contractor + Reserved')
+    + card('Delivery / Approval Pending', notDash, '#94a3b8', 'Included in the cards above, but not yet Delivery Complete + Purchased, so the Dashboard does not count them');
+  wraps.forEach(w => { w.innerHTML = html; });
+}
+
+async function renderVehicleDisposalSection() {
+  initTableFilterBar('disposal', renderVehicleDisposalSection);
+  renderDisposalSummaryCards();
+  // Deliberately just ud_vehicle_parking = 'Jaipur Plant', NOT also gated
+  // on logistics_status = 'Sent to Plant' — 110 of the 394 current
+  // "Jaipur Plant" leads have logistics_status still null (they're from
+  // the Sept 2026 bulk parking-location import, not the live Send-to-Plant
+  // flow), and those are just as real/actionable for disposal as the ones
+  // that did go through Logistics. Gating on logistics_status would hide
+  // those 110 genuine vehicles from this tab entirely.
+  // (Ramvir, Oct 2026) — ALSO now includes every lead still pending at
+  // "Received at Plant" (same base set that screen/Material Entry use:
+  // ud_status=Complete + logistics_status='Sent to Plant', or
+  // early_plant_entry) even before its plant/RST paperwork is filled.
+  // Many of these are already physically scrapped — the RST/plant-check
+  // details just haven't been backfilled yet — so Ramvir wants them
+  // workable in Vehicle Disposal now rather than waiting on that paperwork.
+  //
+  // (Ramvir, Oct 2026 — correction, then reverted) — a plant/scrap-location
+  // whitelist was briefly added here, same as Material Entry/Received at
+  // Plant. Reverted per explicit instruction: whatever vehicles show in
+  // Received at Plant must ALSO show in Vehicle Disposal — so this stays
+  // in lockstep with that tab's base set, no independent location filter.
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_type, val_vehicle_number, val_make,
+      val_model_variant, ud_filled_on, ud_vehicle_parking, ud_vehicle_sub_parking, early_plant_entry, scrap_allocated_contractor_id,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name)`)
+    // ud_status=Complete dropped from the 2nd clause so this stays in
+    // lockstep with Received at Plant (Oct 2026): every 'Sent to Plant'
+    // vehicle shows there AND here AND in Material Entry.
+    // (Ramvir, Oct 2026 - final) ONLY vehicles whose Location is Jaipur Plant. The old
+    // 'Sent to Plant' / early_plant_entry clauses pulled in vehicles still in transit or
+    // sitting at Alwar / Bikaner / Delhi etc. (and with a blank Sub Location).
+    .eq('ud_vehicle_parking', 'Jaipur Plant')
+    .neq('overall_status', 'Closed Lost')
+    // (Ramvir, Oct 2026) — explicitly exclude Reserved/Scrapped here now
+    // that those are reachable via bulk actions from this tab. Without this,
+    // a vehicle whose logistics_status='Sent to Plant' would keep matching
+    // the .or(...) above even after being marked Reserved/Scrapped, and
+    // reappear here alongside its own dedicated tab — found while building
+    // the multi-select bulk-move feature below.
+    .not('ud_vehicle_parking', 'in', '("Reserved","Scrapped","Scrapped - Provisionally")')
+    .order('ud_filled_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  // (Ramvir, Oct 2026) — once allocated to a Contractor, a vehicle moves
+  // out of Pending Disposal into its own "Allocated" tab
+  // (renderVehicleDisposalAllocatedSection) — it isn't Scrapped/Reserved
+  // yet, so it stays visible, just on a different list.
+  const notAllocated = (rawData || []).filter(l => !l.scrap_allocated_contractor_id);
+  const data = filterRowsByTableFilter(notAllocated, 'disposal',
+    l => l.pe ? l.pe.id : null,
+    l => l.manager ? l.manager.id : null,
+    l => l.ud_filled_on ? l.ud_filled_on.slice(0, 10) : null);
+
+  // COD Date — rewire_cod_cvs is keyed by registration_number (text), not
+  // a real FK, so no relational embed; fetch the COD rows for exactly the
+  // vehicle numbers on screen and match client-side by registration
+  // number, same pattern renderCodCvsSection() already uses.
+  const regNos = [...new Set((data || []).map(l => (l.val_vehicle_number || '').toUpperCase()).filter(Boolean))];
+  let codDateByReg = {};
+  if (regNos.length) {
+    const { data: codRows } = await fetchByIds(ch => sb.from('rewire_cod_cvs')
+      .select('registration_number, cod_cvs_date').eq('upload_type', 'COD').in('registration_number', ch), regNos, 100);
+    (codRows || []).forEach(r => { codDateByReg[r.registration_number.toUpperCase()] = r.cod_cvs_date; });
+  }
+  const now = new Date();
+  await loadScrapContractors();
+
+  document.getElementById('countDisposal').textContent = (data || []).length + ' vehicles';
+  disposalPageCache = (data || []).map(l => ({ ...l, _codDate: codDateByReg[(l.val_vehicle_number || '').toUpperCase()] || null }));
+  document.getElementById('tbodyDisposal').innerHTML = (data && data.length) ? data.map(l => {
+    const codDate = codDateByReg[(l.val_vehicle_number || '').toUpperCase()] || null;
+    const days = codDate ? Math.floor((now - new Date(codDate)) / 86400000) : null;
+    // (Ramvir, Oct 2026) — ud_filled_on is genuinely NULL for a batch of
+    // bulk-imported leads (e.g. the Sept 27 2026 import) — it was never
+    // captured for those, not a display bug. "Delivery Days" is simply
+    // blank for them until/unless that date is backfilled.
+    const deliveryDays = l.ud_filled_on ? Math.floor((now - new Date(l.ud_filled_on)) / 86400000) : null;
+    const checked = disposalSelection.disposal.has(l.id) ? 'checked' : '';
+    return `<tr>
+    <td><input type="checkbox" class="disposal-select-cb" value="${l.id}" ${checked} onchange="toggleDisposalRowSelect('disposal', this.value, this.checked)" /></td>
+    <td data-col="lead_no"><span class="lid">${l.lead_no}</span></td>
+    <td data-col="customer" style="font-weight:500;">${l.customer_name}</td>
+    <td data-col="vehicle_type">${l.val_vehicle_type || '—'}</td>
+    <td data-col="vehicle_no">${l.val_vehicle_number || '—'}</td>
+    <td data-col="make">${l.val_make || '—'}</td>
+    <td data-col="model">${l.val_model_variant || '—'}</td>
+    <td data-col="location">${l.ud_vehicle_parking || '—'}</td>
+    <td data-col="sub_location">${l.ud_vehicle_sub_parking || '—'}</td>
+    <td data-col="pe">${l.pe ? l.pe.name : '—'}</td>
+    <td data-col="cod_date">${codDate ? new Date(codDate).toLocaleDateString() : '—'}</td>
+    <td data-col="days">${days !== null ? days + ' days' : '—'}</td>
+    <td data-col="delivered_on">${l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '—'}</td>
+    <td data-col="delivery_days">${deliveryDays !== null ? deliveryDays + ' days' : '—'}</td>
+    <td><button class="btn btn-outline" style="padding:4px 10px;font-size:12px;" onclick="openDisposalModal('${l.id}','${(l.lead_no || '').replace(/'/g, "\\'")}','${(l.val_vehicle_number || '').replace(/'/g, "\\'")}')"><i class="ti ti-recycle" style="font-size:12px;" aria-hidden="true"></i> Update</button></td>
+  </tr>`;
+  }).join('') : '<tr><td colspan="15" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No vehicles at Jaipur Plant awaiting disposal.</td></tr>';
+  updateDisposalBulkBar('disposal');
+  initColumnPicker('disposal', DISPOSAL_COLUMNS, 'disposalColumnPicker', 'tableDisposal');
+}
+
+let disposalPageCache = [];
+const DISPOSAL_COLUMNS = [
+  { key: 'lead_no', label: 'Lead No.', get: l => l.lead_no || '' },
+  { key: 'customer', label: 'Customer', get: l => l.customer_name || '' },
+  { key: 'vehicle_type', label: 'Vehicle Type', get: l => l.val_vehicle_type || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: l => l.val_vehicle_number || '' },
+  { key: 'make', label: 'Make', get: l => l.val_make || '' },
+  { key: 'model', label: 'Model', get: l => l.val_model_variant || '' },
+  { key: 'location', label: 'Location', get: l => l.ud_vehicle_parking || '' },
+  { key: 'sub_location', label: 'Sub Location', get: l => l.ud_vehicle_sub_parking || '' },
+  { key: 'pe', label: 'PE', get: l => l.pe ? l.pe.name : '' },
+  { key: 'cod_date', label: 'COD Date', get: l => l._codDate ? new Date(l._codDate).toLocaleDateString() : '' },
+  { key: 'days', label: 'Days', get: l => l._codDate ? Math.floor((new Date() - new Date(l._codDate)) / 86400000) + ' days' : '' },
+  { key: 'delivered_on', label: 'Delivered On', get: l => l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '' },
+  { key: 'delivery_days', label: 'Delivery Days', get: l => l.ud_filled_on ? Math.floor((new Date() - new Date(l.ud_filled_on)) / 86400000) + ' days' : '' },
+];
+function exportDisposalTabExcel() {
+  if (!disposalPageCache.length) { notify('No vehicles to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('disposal', disposalPageCache, DISPOSAL_COLUMNS, 'rewire-dms-vehicle-disposal.xlsx', 'Vehicle Disposal');
+}
+
+function openDisposalModal(id, leadNo, vehicleNo) {
+  disposalEditingId = id;
+  disposalEditingLeadNo = leadNo;
+  // Vehicle No. shown alongside Lead No. (Ramvir, Sept 2026).
+  document.getElementById('disposalModalSub').textContent = (leadNo || '—') + (vehicleNo ? ' · ' + vehicleNo : '');
+  document.getElementById('disposalStatus').value = '';
+  document.getElementById('disposalPhotos').value = '';
+  document.getElementById('disposalVideos').value = '';
+  const reasonEl = document.getElementById('disposalReservedReason');
+  if (reasonEl) reasonEl.value = '';
+  handleDisposalStatusChange('');
+  openModal('vehicleDisposalModal');
+}
+
+// Toggles the mandatory-evidence fields on/off depending on the dropdown —
+// Scrapped needs dismantle photos/videos, Reserved needs a reason
+// (Ramvir, Oct 2026 — "Reserved karne per reason add karo").
+function handleDisposalStatusChange(v) {
+  document.getElementById('disposalEvidenceFields').style.display = (v === 'Scrapped') ? '' : 'none';
+  const reservedFields = document.getElementById('disposalReservedFields');
+  if (reservedFields) reservedFields.style.display = (v === 'Reserved') ? '' : 'none';
+}
+
+async function submitVehicleDisposal() {
+  if (!disposalEditingId) return;
+  const status = document.getElementById('disposalStatus').value;
+  if (!status) { notify('Select what the status should be set to.', { icon: 'error', title: 'Missing field' }); return; }
+
+  let reservedReason = '';
+  if (status === 'Reserved') {
+    reservedReason = (document.getElementById('disposalReservedReason').value || '').trim();
+    if (!reservedReason) { notify('Reason for reserving this vehicle is required.', { icon: 'error', title: 'Missing field' }); return; }
+  }
+
+  let photoUrls = [], videoUrls = [];
+  if (status === 'Scrapped') {
+    const photoFiles = Array.from(document.getElementById('disposalPhotos').files || []);
+    const videoFiles = Array.from(document.getElementById('disposalVideos').files || []);
+    if (photoFiles.length < DISPOSAL_PHOTO_MIN) { notify(`At least ${DISPOSAL_PHOTO_MIN} dismantle photos are required (${photoFiles.length} selected).`, { icon: 'error', title: 'Not enough photos' }); return; }
+    if (photoFiles.length > DISPOSAL_PHOTO_MAX) { notify(`At most ${DISPOSAL_PHOTO_MAX} dismantle photos are allowed (${photoFiles.length} selected).`, { icon: 'error', title: 'Too many photos' }); return; }
+    if (videoFiles.length < DISPOSAL_VIDEO_MIN) { notify(`At least ${DISPOSAL_VIDEO_MIN} dismantle videos are required (${videoFiles.length} selected).`, { icon: 'error', title: 'Not enough videos' }); return; }
+    if (videoFiles.length > DISPOSAL_VIDEO_MAX) { notify(`At most ${DISPOSAL_VIDEO_MAX} dismantle videos are allowed (${videoFiles.length} selected).`, { icon: 'error', title: 'Too many videos' }); return; }
+
+    const folderName = disposalEditingLeadNo || 'Unsorted';
+    notify(`Uploading ${photoFiles.length} photo(s) and ${videoFiles.length} video(s) — this can take a bit for videos, please wait…`, { icon: 'info' });
+    photoUrls = await Promise.all(photoFiles.map(f => uploadFile(f, folderName, 'dismantle_photo')));
+    videoUrls = await Promise.all(videoFiles.map(f => uploadFile(f, folderName, 'dismantle_video')));
+    if (photoUrls.some(u => !u) || videoUrls.some(u => !u)) {
+      notify('One or more files failed to upload — please try again.', { icon: 'error' });
+      return;
+    }
+  }
+
+  const payload = {
+    ud_vehicle_parking: status,
+    scrap_marked_by: currentProfile.id,
+    scrap_marked_on: new Date().toISOString(),
+  };
+  if (status === 'Scrapped') {
+    payload.scrap_dismantle_photos_urls = photoUrls.join(',');
+    payload.scrap_dismantle_videos_urls = videoUrls.join(',');
+  }
+  if (status === 'Reserved') {
+    payload.scrap_reserved_reason = reservedReason;
+    payload.scrap_reserved_by = currentProfile.id;
+  }
+  const { error } = await sb.from('rewire_master_data').update(payload).eq('id', disposalEditingId);
+  if (error) { notify('Error updating vehicle status: ' + error.message, { icon: 'error' }); return; }
+  notify(`Vehicle marked ${status}.`);
+  closeModal('vehicleDisposalModal');
+  disposalEditingId = null;
+  disposalEditingLeadNo = null;
+  // Update can now be fired from Pending Disposal AND the Contractor tab - refresh both lists.
+  await renderVehicleDisposalSection();
+  if (typeof renderVehicleDisposalAllocatedSection === 'function') await renderVehicleDisposalAllocatedSection();
+}
+
+// VEHICLE DISPOSAL · RESERVED — vehicles marked Reserved from the tab
+// above, kept here for reference instead of disappearing entirely once
+// actioned. Multi-select + bulk Move to Contractor / Move to Pending
+// Disposal (Ramvir, Oct 2026) — see the disposalSelection block above.
+async function renderVehicleDisposalReservedSection() {
+  initTableFilterBar('disposalreserved', renderVehicleDisposalReservedSection);
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_type, val_vehicle_number, val_make,
+      val_model_variant, ud_filled_on, scrap_marked_on, scrap_reserved_reason,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name),
+      reserved_by:rewire_user_profiles!rewire_master_data_scrap_reserved_by_fkey(id,name)`)
+    .eq('ud_vehicle_parking', 'Reserved')
+    .order('scrap_marked_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const data = filterRowsByTableFilter(rawData || [], 'disposalreserved',
+    l => l.pe ? l.pe.id : null,
+    l => l.manager ? l.manager.id : null,
+    l => l.scrap_marked_on ? l.scrap_marked_on.slice(0, 10) : null);
+
+  document.getElementById('countDisposalReserved').textContent = (data || []).length + ' vehicles';
+  disposalReservedPageCache = data || [];
+  document.getElementById('tbodyDisposalReserved').innerHTML = (data && data.length) ? data.map(l => {
+    const checked = disposalSelection.disposalreserved.has(l.id) ? 'checked' : '';
+    return `<tr>
+    <td><input type="checkbox" class="disposalreserved-select-cb" value="${l.id}" ${checked} onchange="toggleDisposalRowSelect('disposalreserved', this.value, this.checked)" /></td>
+    <td><span class="lid">${l.lead_no}</span></td>
+    <td style="font-weight:500;">${l.customer_name}</td>
+    <td>${l.val_vehicle_type || '—'}</td>
+    <td>${l.val_vehicle_number || '—'}</td>
+    <td>${l.val_make || '—'}</td>
+    <td>${l.val_model_variant || '—'}</td>
+    <td>${l.pe ? l.pe.name : '—'}</td>
+    <td>${l.manager ? l.manager.name : '—'}</td>
+    <td>${l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '—'}</td>
+    <td>${l.scrap_marked_on ? new Date(l.scrap_marked_on).toLocaleDateString() : '—'}</td>
+    <td>${l.scrap_reserved_reason || '—'}</td>
+    <td>${l.reserved_by ? l.reserved_by.name : '—'}</td>
+  </tr>`;
+  }).join('') : '<tr><td colspan="13" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No vehicles marked Reserved yet.</td></tr>';
+  updateDisposalBulkBar('disposalreserved');
+}
+
+let disposalReservedPageCache = [];
+const DISPOSAL_RESERVED_COLUMNS = [
+  { key: 'lead_no', label: 'Lead No.', get: l => l.lead_no || '' },
+  { key: 'customer', label: 'Customer', get: l => l.customer_name || '' },
+  { key: 'vehicle_type', label: 'Vehicle Type', get: l => l.val_vehicle_type || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: l => l.val_vehicle_number || '' },
+  { key: 'make', label: 'Make', get: l => l.val_make || '' },
+  { key: 'model', label: 'Model', get: l => l.val_model_variant || '' },
+  { key: 'pe', label: 'PE', get: l => l.pe ? l.pe.name : '' },
+  { key: 'manager', label: 'Manager', get: l => l.manager ? l.manager.name : '' },
+  { key: 'delivered_on', label: 'Delivered On', get: l => l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '' },
+  { key: 'reserved_on', label: 'Reserved On', get: l => l.scrap_marked_on ? new Date(l.scrap_marked_on).toLocaleDateString() : '' },
+  { key: 'reason', label: 'Reason', get: l => l.scrap_reserved_reason || '' },
+  { key: 'reserved_by', label: 'Reserved By', get: l => l.reserved_by ? l.reserved_by.name : '' },
+];
+function exportDisposalReservedTabExcel() {
+  if (!disposalReservedPageCache.length) { notify('No vehicles to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('disposalreserved', disposalReservedPageCache, DISPOSAL_RESERVED_COLUMNS, 'rewire-dms-vehicle-disposal-reserved.xlsx', 'Reserved');
+}
+
+// VEHICLE DISPOSAL · CONTRACTOR (Ramvir, Oct 2026) — vehicles allocated to a
+// Contractor from Pending Disposal (scrap_allocated_contractor_id set). One
+// shared tab with a Contractor filter, rather than a literal tab per
+// Contractor — see the design note left for the user when this was built.
+async function renderVehicleDisposalAllocatedSection() {
+  initTableFilterBar('disposalallocated', renderVehicleDisposalAllocatedSection);
+  renderDisposalSummaryCards();
+  await loadScrapContractors();
+
+  // Populate the Contractor filter dropdown (kept in sync with the cache).
+  const filterSel = document.getElementById('allocatedContractorFilter');
+  if (filterSel) {
+    const prevVal = filterSel.value;
+    filterSel.innerHTML = '<option value="">All Contractors</option>' +
+      scrapContractorsCache.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+    if (prevVal) filterSel.value = prevVal;
+  }
+  const contractorFilterId = filterSel ? filterSel.value : '';
+
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_type, val_vehicle_number, val_make,
+      val_model_variant, scrap_allocated_contractor_id, scrap_allocated_on,
+      contractor:rewire_scrap_contractors!rewire_master_data_scrap_allocated_contractor_id_fkey(id,name,phone,location),
+      allocated_by:rewire_user_profiles!rewire_master_data_scrap_allocated_by_fkey(id,name)`)
+    .not('scrap_allocated_contractor_id', 'is', null)
+    .not('ud_vehicle_parking', 'in', '("Reserved","Scrapped","Scrapped - Provisionally")')
+    .order('scrap_allocated_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+
+  let data = filterRowsByTableFilter(rawData || [], 'disposalallocated',
+    null, null,
+    l => l.scrap_allocated_on ? l.scrap_allocated_on.slice(0, 10) : null);
+  if (contractorFilterId) data = data.filter(l => l.scrap_allocated_contractor_id === contractorFilterId);
+
+  document.getElementById('countDisposalAllocated').textContent = (data || []).length + ' vehicles';
+  disposalAllocatedPageCache = data || [];
+  document.getElementById('tbodyDisposalAllocated').innerHTML = (data && data.length) ? data.map(l => {
+    const checked = disposalSelection.disposalallocated.has(l.id) ? 'checked' : '';
+    return `<tr>
+    <td><input type="checkbox" class="disposalallocated-select-cb" value="${l.id}" ${checked} onchange="toggleDisposalRowSelect('disposalallocated', this.value, this.checked)" /></td>
+    <td><span class="lid">${l.lead_no}</span></td>
+    <td style="font-weight:500;">${l.customer_name}</td>
+    <td>${l.val_vehicle_type || '—'}</td>
+    <td>${l.val_vehicle_number || '—'}</td>
+    <td>${l.val_make || '—'}</td>
+    <td>${l.val_model_variant || '—'}</td>
+    <td>${l.contractor ? l.contractor.name : '—'}</td>
+    <td>${l.contractor ? (l.contractor.phone || '—') : '—'}</td>
+    <td>${l.contractor ? (l.contractor.location || '—') : '—'}</td>
+    <td>${l.scrap_allocated_on ? new Date(l.scrap_allocated_on).toLocaleDateString() : '—'}</td>
+    <td>${l.allocated_by ? l.allocated_by.name : '—'}</td>
+    <td style="white-space:nowrap;"><button class="btn btn-outline" style="padding:4px 10px;font-size:12px;" onclick="openDisposalModal('${l.id}','${(l.lead_no || '').replace(/'/g, "\\'")}','${(l.val_vehicle_number || '').replace(/'/g, "\\'")}')"><i class="ti ti-recycle" style="font-size:12px;" aria-hidden="true"></i> Update</button> <button class="btn btn-outline" style="font-size:11px;padding:4px 10px;" onclick="deallocateVehicle('${l.id}')">Deallocate</button></td>
+  </tr>`;
+  }).join('') : '<tr><td colspan="13" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No vehicles allocated to a Contractor yet.</td></tr>';
+  updateDisposalBulkBar('disposalallocated');
+}
+
+let disposalAllocatedPageCache = [];
+const DISPOSAL_ALLOCATED_COLUMNS = [
+  { key: 'lead_no', label: 'Lead No.', get: l => l.lead_no || '' },
+  { key: 'customer', label: 'Customer', get: l => l.customer_name || '' },
+  { key: 'vehicle_type', label: 'Vehicle Type', get: l => l.val_vehicle_type || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: l => l.val_vehicle_number || '' },
+  { key: 'make', label: 'Make', get: l => l.val_make || '' },
+  { key: 'model', label: 'Model', get: l => l.val_model_variant || '' },
+  { key: 'contractor', label: 'Contractor', get: l => l.contractor ? l.contractor.name : '' },
+  { key: 'contractor_phone', label: 'Contractor Phone', get: l => l.contractor ? (l.contractor.phone || '') : '' },
+  { key: 'contractor_location', label: 'Contractor Location', get: l => l.contractor ? (l.contractor.location || '') : '' },
+  { key: 'allocated_on', label: 'Allocated On', get: l => l.scrap_allocated_on ? new Date(l.scrap_allocated_on).toLocaleDateString() : '' },
+  { key: 'allocated_by', label: 'Allocated By', get: l => l.allocated_by ? l.allocated_by.name : '' },
+];
+function exportDisposalAllocatedTabExcel() {
+  if (!disposalAllocatedPageCache.length) { notify('No vehicles to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('disposalallocated', disposalAllocatedPageCache, DISPOSAL_ALLOCATED_COLUMNS, 'rewire-dms-vehicle-disposal-contractor.xlsx', 'Contractor');
+}
+
+// Returns a vehicle from the Contractor list back to Pending Disposal.
+async function deallocateVehicle(id) {
+  const confirmed = await confirmDialog('Move this vehicle back to Pending Disposal?', 'Deallocate Vehicle');
+  if (!confirmed) return;
+  const { error } = await sb.from('rewire_master_data').update({
+    scrap_allocated_contractor_id: null,
+    scrap_allocated_by: null,
+    scrap_allocated_on: null,
+  }).eq('id', id);
+  if (error) { notify('Error deallocating vehicle: ' + error.message, { icon: 'error' }); return; }
+  notify('Vehicle moved back to Pending Disposal.');
+  await renderVehicleDisposalAllocatedSection();
+}
+
+// VEHICLE DISPOSAL · SCRAPPED — same pattern as the Reserved tab above,
+// but for ud_vehicle_parking IN ('Scrapped','Scrapped - Provisionally').
+// The two are kept distinguishable via their own Status column — plain
+// "Scrapped" is the live app's own disposal outcome (dismantle photos/
+// videos required, see submitVehicleDisposal above); "Scrapped -
+// Provisionally" only ever came from the old bulk parking-location import
+// and has no evidence attached. View-only, same as Reserved.
+async function renderVehicleDisposalScrappedSection() {
+  initTableFilterBar('disposalscrapped', renderVehicleDisposalScrappedSection);
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_type, val_vehicle_number, val_make,
+      val_model_variant, ud_vehicle_parking, ud_filled_on, scrap_marked_on, scrap_dismantle_photos_urls, scrap_dismantle_videos_urls,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name)`)
+    .in('ud_vehicle_parking', ['Scrapped', 'Scrapped - Provisionally'])
+    .order('scrap_marked_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const data = filterRowsByTableFilter(rawData || [], 'disposalscrapped',
+    l => l.pe ? l.pe.id : null,
+    l => l.manager ? l.manager.id : null,
+    l => l.scrap_marked_on ? l.scrap_marked_on.slice(0, 10) : null);
+
+  document.getElementById('countDisposalScrapped').textContent = (data || []).length + ' vehicles';
+  disposalScrappedPageCache = data || [];
+  document.getElementById('tbodyDisposalScrapped').innerHTML = (data && data.length) ? data.map(l => {
+    const photoUrls = (l.scrap_dismantle_photos_urls || '').split(',').filter(isRealFileUrl);
+    const videoUrls = (l.scrap_dismantle_videos_urls || '').split(',').filter(isRealFileUrl);
+    const evidence = (photoUrls.length || videoUrls.length)
+      ? `${photoUrls.map((u, i) => `<a href="javascript:void(0)" onclick="viewAccessoryPhoto('${u}','Dismantle Photo ${i + 1}')" style="color:#1d4ed8;text-decoration:underline;font-size:11px;">Photo ${i + 1}</a>`).join(' ')} ${videoUrls.map((u, i) => `<a href="${u}" target="_blank" style="color:#1d4ed8;text-decoration:underline;font-size:11px;">Video ${i + 1}</a>`).join(' ')}`
+      : '—';
+    return `<tr>
+    <td><span class="lid">${l.lead_no}</span></td>
+    <td style="font-weight:500;">${l.customer_name}</td>
+    <td>${l.val_vehicle_type || '—'}</td>
+    <td>${l.val_vehicle_number || '—'}</td>
+    <td>${l.val_make || '—'}</td>
+    <td>${l.val_model_variant || '—'}</td>
+    <td><span class="badge ${l.ud_vehicle_parking === 'Scrapped' ? 'badge-na' : 'badge-l'}">${l.ud_vehicle_parking}</span></td>
+    <td>${l.pe ? l.pe.name : '—'}</td>
+    <td>${l.manager ? l.manager.name : '—'}</td>
+    <td>${l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '—'}</td>
+    <td>${l.scrap_marked_on ? new Date(l.scrap_marked_on).toLocaleDateString() : '—'}</td>
+    <td>${evidence}</td>
+  </tr>`;
+  }).join('') : '<tr><td colspan="12" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No vehicles marked Scrapped yet.</td></tr>';
+}
+
+let disposalScrappedPageCache = [];
+const DISPOSAL_SCRAPPED_COLUMNS = [
+  { key: 'lead_no', label: 'Lead No.', get: l => l.lead_no || '' },
+  { key: 'customer', label: 'Customer', get: l => l.customer_name || '' },
+  { key: 'vehicle_type', label: 'Vehicle Type', get: l => l.val_vehicle_type || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: l => l.val_vehicle_number || '' },
+  { key: 'make', label: 'Make', get: l => l.val_make || '' },
+  { key: 'model', label: 'Model', get: l => l.val_model_variant || '' },
+  { key: 'status', label: 'Status', get: l => l.ud_vehicle_parking || '' },
+  { key: 'pe', label: 'PE', get: l => l.pe ? l.pe.name : '' },
+  { key: 'manager', label: 'Manager', get: l => l.manager ? l.manager.name : '' },
+  { key: 'delivered_on', label: 'Delivered On', get: l => l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '' },
+  { key: 'scrapped_on', label: 'Scrapped On', get: l => l.scrap_marked_on ? new Date(l.scrap_marked_on).toLocaleDateString() : '' },
+  { key: 'evidence', label: 'Evidence', get: l => {
+    const photoUrls = (l.scrap_dismantle_photos_urls || '').split(',').filter(isRealFileUrl);
+    const videoUrls = (l.scrap_dismantle_videos_urls || '').split(',').filter(isRealFileUrl);
+    return (photoUrls.length || videoUrls.length) ? `${photoUrls.length} photo(s), ${videoUrls.length} video(s)` : '';
+  } },
+];
+function exportDisposalScrappedTabExcel() {
+  if (!disposalScrappedPageCache.length) { notify('No vehicles to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('disposalscrapped', disposalScrappedPageCache, DISPOSAL_SCRAPPED_COLUMNS, 'rewire-dms-vehicle-disposal-scrapped.xlsx', 'Scrapped');
+}
+
+
+// ------------------------------------------------------------
+// RECEIVED AT PLANT — Vehicle Receipt Form for Purchased vehicles,
+// preceded by a Plant Accessories Check popup (see below). Only shows
+// vehicles that have actually been dispatched from Logistics (see above)
+// — ud_status alone isn't enough anymore.
+// ------------------------------------------------------------
+// Accessories Check and RST/Vehicle Receipt Details are filled by two
+// different people at the plant and no longer block each other — each
+// saves straight to rewire_vehicle_receipt independently (upsert on
+// lead_id), whichever one happens first creates the row.
+
+// Same items compared in the (Manager Approval-stage) Accessories Check
+// screen — [label, Valuation column, Delivery column, column to store the
+// plant answer under on rewire_vehicle_receipt, answer type]. Answer type
+// is 'yesno' for a plain presence check, 'count' for Speakers, which —
+// same as Valuation/Delivery — is captured as an actual count (0/2/4/6/
+// 8/10), or 'count15' for Alloy Wheel — a 1-5 count of alloy wheels
+// actually present at the plant (was 'yesno' — a plain Yes/No didn't say
+// HOW MANY of the vehicle's alloy wheels made it to the plant, which is
+// what Back Office actually needs when reconciling against Valuation's
+// count).
+const PLANT_ACCESSORY_ITEMS = [
+  ['Spare Wheel', 'val_spare_wheel', 'ud_spare_wheel', 'plant_spare_wheel', 'yesno'],
+  ['Stereo', 'val_stereo', 'ud_stereo', 'plant_stereo', 'yesno'],
+  ['Speakers', 'val_speakers', 'ud_speakers', 'plant_speakers', 'count'],
+  ['Tool Kit', 'val_tool_kit', 'ud_tool_kit', 'plant_tool_kit', 'yesno'],
+  ['Battery', 'val_battery', 'ud_battery', 'plant_battery', 'yesno'],
+  ['Alloy Wheel', 'val_alloy_wheel', 'ud_alloy_wheel', 'plant_alloy_wheel', 'count15'],
+  ['Cylinder Type', 'val_fuel_type', 'ud_cylinder_type', 'plant_cylinder_type', 'yesno'],
+  ['Vehicle Operational', 'val_vehicle_operational', 'ud_vehicle_operational', 'plant_vehicle_operational', 'yesno'],
+  ['Vehicle Accidental', 'val_vehicle_accidental', 'ud_vehicle_accidental', 'plant_vehicle_accidental', 'yesno'],
+];
+
+// Which items actually have a Delivery-time photo column to re-upload
+// over (Vehicle Operational/Accidental never had a photo field at all —
+// see computeAccessoryComparisons' photoUrl argument, null for both).
+// Cylinder Type is the one irregular name (ud_cylinder_photo_url, not
+// ud_cylinder_type_photo_url — matches the column used everywhere else,
+// e.g. the Upload Delivery form's own upload field).
+const PLANT_ACCESSORY_PHOTO_COL = {
+  'Spare Wheel': 'ud_spare_wheel_photo_url', 'Stereo': 'ud_stereo_photo_url',
+  'Speakers': 'ud_speakers_photo_url', 'Tool Kit': 'ud_tool_kit_photo_url',
+  'Battery': 'ud_battery_photo_url', 'Alloy Wheel': 'ud_alloy_wheel_photo_url',
+  'Cylinder Type': 'ud_cylinder_photo_url',
+};
+
+let activePlantReceipt = null; // existing rewire_vehicle_receipt row for the open plantModal, if any — see openVehicleReceipt()/submitVehicleReceipt() fix below
+let activePlantReceiveMode = false; // true when opened from Pending Receipt > Receive (also asks Received Location)
+async function openPlantAccessoriesCheck(leadId, leadNo, vehicleNo, receiveMode) {
+  activeLeadId = leadId;
+  activeLeadNo = leadNo;
+  activePlantReceiveMode = !!receiveMode;
+  document.getElementById('plantReceiveLocationField').style.display = receiveMode ? '' : 'none';
+  document.getElementById('plantReceiveLocation').value = '';
+  refreshSubLocationSelect('plantReceiveSubLocation', '');
+  document.getElementById('plantAccessoriesConfirmLabel').textContent = receiveMode ? 'Confirm & Mark Received' : 'Confirm & Continue to Receipt Form';
+  document.getElementById('plantAccessoriesModalSub').textContent = leadNo + (vehicleNo ? ' • ' + vehicleNo : '');
+  const { data: lead, error } = await sb.from('rewire_master_data').select('*').eq('id', leadId).single();
+  if (error || !lead) { notify('Could not load lead details.', { icon: 'error' }); return; }
+
+  // If accessories were already filled once, pre-fill the saved answers
+  // so this doubles as an edit screen, not just a first-fill form.
+  const { data: existing } = await sb.from('rewire_vehicle_receipt').select('*').eq('lead_id', leadId).maybeSingle();
+
+  // Reference column — what the EARLIER (Manager-Approval-stage)
+  // Accessories Check already found (Match/Shortage/Excess + photo, from
+  // Valuation vs Delivery), so whoever confirms "Present at Plant?" isn't
+  // deciding blind — reuses the exact same comparison logic as the
+  // standalone Accessories Check screen, keyed by label.
+  const checkByLabel = {};
+  computeAccessoryComparisons(lead).forEach(c => { checkByLabel[c.label] = c; });
+
+  document.getElementById('plantAccessoriesBody').innerHTML = PLANT_ACCESSORY_ITEMS.map(([label, valKey, udKey, plantKey, optType]) => {
+    const chk = checkByLabel[label];
+    const checkCell = chk
+      ? accessoryKindBadge(chk.kind) + (isRealFileUrl(chk.photoUrl) ? ` <a href="javascript:void(0)" onclick="viewAccessoryPhoto('${chk.photoUrl}','${label}')" style="color:#1d4ed8;text-decoration:underline;font-size:11px;">Photo</a>` : '')
+      : '—';
+    // Re-upload option (Ramvir, Sept 2026) — lets whoever's checking at the
+    // plant replace the original Delivery-stage photo (e.g. it was blurry,
+    // or the item's actual condition needs fresh evidence at the plant).
+    // Overwrites the SAME column the Delivery photo lives in
+    // (ud_<item>_photo_url on the lead itself), so every other screen that
+    // shows this photo — the standalone Accessories Check, Accessories
+    // Register report, View Lead — automatically shows the replacement
+    // too, rather than creating a second parallel "plant photo" nobody
+    // else would see. Optional — only wired up for items that actually
+    // have a photo column (see PLANT_ACCESSORY_PHOTO_COL above).
+    const photoCol = PLANT_ACCESSORY_PHOTO_COL[label];
+    const reuploadCell = photoCol
+      ? `<input type="file" accept="image/*" id="plantReupload_${plantKey}" data-photocol="${photoCol}" style="font-size:10px;max-width:130px;" title="Re-upload ${label} photo" />`
+      : '<span class="sub">—</span>';
+    const savedVal = existing ? existing[plantKey] : '';
+    const options = optType === 'count'
+      ? '<option value="">Count</option>' + ['0', '2', '4', '6', '8', '10'].map(n => `<option value="${n}" ${savedVal === n ? 'selected' : ''}>${n}</option>`).join('')
+      : optType === 'count15'
+      ? '<option value="">Count</option>' + ['0', '1', '2', '3', '4', '5'].map(n => `<option value="${n}" ${savedVal === n ? 'selected' : ''}>${n}</option>`).join('')
+      : `<option value="">Select</option><option value="Yes" ${savedVal === 'Yes' ? 'selected' : ''}>Yes</option><option value="No" ${savedVal === 'No' ? 'selected' : ''}>No</option>`;
+    return `<tr>
+      <td style="font-weight:500;">${label}</td>
+      <td>${lead[valKey] || '—'}</td>
+      <td>${lead[udKey] || '—'}</td>
+      <td>${checkCell}</td>
+      <td>${reuploadCell}</td>
+      <td>
+        <select id="plantAcc_${plantKey}" style="border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 8px;font-size:12px;">
+          ${options}
+        </select>
+      </td>
+    </tr>`;
+  }).join('');
+  document.getElementById('plantAccessoriesRemarks').value = (existing && existing.plant_accessories_remarks) || '';
+  // Debit Amount/Reason — manually entered here when an item is found
+  // short at the plant; flows through to Transporter Payments' Debit
+  // Amount / Final Amount columns (see renderLogisticsPaymentsSection()).
+  document.getElementById('plantDebitAmount').value = (existing && existing.plant_debit_amount) || '';
+  document.getElementById('plantDebitReason').value = (existing && existing.plant_debit_reason) || '';
+  document.getElementById('plantOtherDebitAmount').value = (existing && existing.plant_other_debit_amount) || '';
+  document.getElementById('plantOtherDebitReason').value = (existing && existing.plant_other_debit_reason) || '';
+  openModal('plantAccessoriesModal');
+}
+
+async function confirmPlantAccessoriesCheck() {
+  // Receive mode: a Received Location is mandatory, validated against the
+  // Location master list before anything is saved.
+  let receiveLocation = null;
+  if (activePlantReceiveMode) {
+    receiveLocation = document.getElementById('plantReceiveLocation').value.trim();
+    if (!receiveLocation) { notify('Select the Received Location.', { icon: 'error', title: 'Missing field' }); return; }
+    if (!isValidMasterValue('location', receiveLocation)) {
+      notify('"' + receiveLocation + '" is not in the Location master list. Ask Admin to add it in Settings → Master Data, or pick an existing option.', { icon: 'error', title: 'Invalid Location' });
+      return;
+    }
+    receiveLocation = normalizeMasterValue('location', receiveLocation);
+  }
+  const values ={ lead_id: activeLeadId, accessories_filled_by: currentProfile.id, accessories_filled_on: new Date().toISOString() };
+  for (const [label, , , plantKey, optType] of PLANT_ACCESSORY_ITEMS) {
+    const el = document.getElementById('plantAcc_' + plantKey);
+    const v = el ? el.value : '';
+    if (!v) { notify(`Please select ${(optType === 'count' || optType === 'count15') ? 'a count' : 'Yes/No'} for "${label}".`, { icon: 'error', title: 'Missing field' }); return; }
+    values[plantKey] = v;
+  }
+  values.plant_accessories_remarks = document.getElementById('plantAccessoriesRemarks').value || null;
+  values.plant_debit_amount = document.getElementById('plantDebitAmount').value || null;
+  values.plant_debit_reason = document.getElementById('plantDebitReason').value.trim() || null;
+  values.plant_other_debit_amount = document.getElementById('plantOtherDebitAmount').value || null;
+  values.plant_other_debit_reason = document.getElementById('plantOtherDebitReason').value.trim() || null;
+
+  // Re-uploaded photos (optional, per item — see PLANT_ACCESSORY_PHOTO_COL)
+  // overwrite the SAME ud_<item>_photo_url column the original Delivery
+  // photo lives in, on the LEAD itself (rewire_master_data), not this
+  // rewire_vehicle_receipt row — every other screen showing that photo
+  // (Accessories Check, Accessories Register, View Lead) then automatically
+  // reflects the replacement. Uploaded in parallel, same pattern as Upload
+  // Delivery's own photo fields (JS-Pipeline.html submitUploadDelivery).
+  const vFolderPlant = getVehicleFolderName();
+  const photoUpdates = {};
+  await Promise.all(Object.values(PLANT_ACCESSORY_PHOTO_COL).map(async (photoCol) => {
+    const el = document.querySelector(`input[data-photocol="${photoCol}"]`);
+    if (el && el.files && el.files.length) {
+      const url = await uploadFile(el.files[0], vFolderPlant, photoCol);
+      if (url) photoUpdates[photoCol] = url;
+    }
+  }));
+
+  // Saves independently of the RST/Receipt step — whichever of the two
+  // is filled first creates the row, the other just fills in its own
+  // columns on top (onConflict: lead_id needs a unique index on that column).
+  const { error } = await sb.from('rewire_vehicle_receipt').upsert(values, { onConflict: 'lead_id' });
+  if (error) { notify('Error saving accessories check: ' + error.message, { icon: 'error' }); return; }
+  if (Object.keys(photoUpdates).length) {
+    const { error: photoErr } = await sb.from('rewire_master_data').update(photoUpdates).eq('id', activeLeadId);
+    if (photoErr) notify('Accessories Check saved, but re-uploaded photo(s) failed to save: ' + photoErr.message, { icon: 'error' });
+  }
+  if (activePlantReceiveMode) {
+    // Mark the vehicle RECEIVED: status -> Sent to Plant, received stamp,
+    // and its location updated to where it was received/unloaded.
+    const { data: leadRow } = await sb.from('rewire_master_data').select('logistics_manifest_id').eq('id', activeLeadId).maybeSingle();
+    // Destination = Plant -> "Sent to Plant" (shows in RST Pending/Disposal/Material).
+    // Destination = TLC Yard (anything but Jaipur Plant-type locations) -> status
+    // cleared so the vehicle shows again in Logistics for the onward Logistic
+    // Carrier leg to the plant (Ramvir, Oct 2026).
+    const recvSub = document.getElementById('plantReceiveSubLocation').value || null;
+    // The MANIFEST's destination decides plant-vs-onward, not the unload spot:
+    // a manifest sent to Jaipur Plant stays "Sent to Plant" even when the
+    // vehicle is unloaded at e.g. "Jaipur Yard-3" (Ramvir, Oct 2026 — GVUPLMAN/10/26/00134).
+    let manifestTo = '';
+    if (leadRow && leadRow.logistics_manifest_id) {
+      const { data: mRow } = await sb.from('rewire_logistics_manifests').select('to_location').eq('id', leadRow.logistics_manifest_id).maybeSingle();
+      manifestTo = (mRow && mRow.to_location) || '';
+    }
+    const isPlantName = v => ['Jaipur Plant', 'Jaipur'].includes(v) || /plant/i.test(v || '');
+    const plantLike = manifestTo ? isPlantName(manifestTo) : isPlantName(receiveLocation);
+    const { error: recvErr } = await sb.from('rewire_master_data').update({
+      logistics_status: plantLike ? 'Sent to Plant' : null, logistics_received_on: new Date().toISOString(), logistics_received_by: currentProfile.id,
+      logistics_unload_location: receiveLocation, ud_vehicle_parking: receiveLocation, ud_vehicle_sub_parking: recvSub,
+    }).eq('id', activeLeadId);
+    if (recvErr) { notify('Accessories saved, but marking Received failed: ' + recvErr.message, { icon: 'error' }); return; }
+    if (leadRow && leadRow.logistics_manifest_id) {
+      await sb.from('rewire_logistics_manifests').update({ unload_location: receiveLocation })
+        .eq('id', leadRow.logistics_manifest_id).is('unload_location', null);
+    }
+    notify('Vehicle received at ' + receiveLocation + '.');
+    activePlantReceiveMode = false;
+    closeModal('plantAccessoriesModal');
+    await renderReceivedPlantSection();
+    if (plantOpenManifestId) openPlantManifestModal(plantOpenManifestId);
+    return;
+  }
+  notify('Accessories Check saved.');
+  closeModal('plantAccessoriesModal');
+  await renderReceivedPlantSection();
+  if (plantOpenManifestId) openPlantManifestModal(plantOpenManifestId);
+}
+
+// NOTE (Ramvir, Oct 2026) — the "Fill for a Vehicle Not Yet Listed" early-
+// entry bypass (and lockEarlyPlantEntry(), which used to set
+// early_plant_entry=true here) has been removed entirely — a vehicle can
+// only reach Received at Plant once logistics_status='Sent to Plant' (see
+// renderReceivedPlantSection below). Vehicle Disposal/Material/Documents
+// still OR in `early_plant_entry = true` for any OLD leads that already
+// have that flag set from before this cleanup, but nothing sets it anymore.
+
+async function renderReceivedPlantSection() {
+  initTableFilterBar('plant', renderReceivedPlantSection);
+  // Every vehicle ever dispatched to plant — accumulates indefinitely,
+  // paginated defensively.
+  //
+  // (Ramvir, Oct 2026 — reverted) — a plant/scrap-location whitelist was
+  // briefly added here (matching Material Entry/Vehicle Disposal) to hide
+  // vehicles Location Tracking later moved to another city. Wrong call for
+  // THIS tab specifically: RST/plant-check paperwork is an administrative
+  // catch-up step, independent of where the vehicle currently sits — 136
+  // genuinely RST-pending vehicles (tracked to Alwar, Jodhpur, Bhilwara,
+  // etc.) got hidden by that whitelist (320 pending dropped to 184), which
+  // Ramvir flagged as wrong ("jinka rst fill nahi hua sare aane chahiye").
+  // So this tab goes back to showing every lead in the base set with
+  // either half still outstanding, with NO location filtering — unlike
+  // Material Entry/Vehicle Disposal, which keep the whitelist since those
+  // are physical-processing steps that genuinely require the vehicle to
+  // be at the plant.
+  //
+  // (Ramvir, Oct 2026) — the `early_plant_entry.eq.true` bypass is REMOVED.
+  // A vehicle can only land here once logistics_status='Sent to Plant' —
+  // either self-carried (direct at Send to Plant) or via a Logistic
+  // Carrier Manifest that's been marked Paid (see submitLogisticsSend /
+  // submitMarkManifestPaid, same file) — closing the gap where a vehicle
+  // without an updated delivery photo / without going through the
+  // Manifest-bill workflow could still show up here early.
+  const rawPurchased = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, phone, ud_vehicle_parking, ud_vehicle_sub_parking, val_vehicle_type, val_vehicle_number, val_make,
+      val_model_variant, created_at, logistics_vehicle_send_to, logistics_unload_location, logistics_status, logistics_received_on, overall_status,
+      logistics_dispatch_date, logistics_transporter_name,
+      manifest:rewire_logistics_manifests(manifest_no, transporter_name, dispatch_date, from_location), rewire_partners(partner_name),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name), manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name)`)
+    // (Ramvir, Oct 2026) — the old `ud_status='Complete'` (delivery done)
+    // validation is dropped HERE: that check now lives upstream in the
+    // Logistics tab (only delivered vehicles can be sent).
+    // Fetches BOTH dispatched states and splits client-side:
+    //   Received            = 'Sent to Plant' AND logistics_received_on set
+    //   Pending Receipt     = everything else dispatched ('In Transit', or
+    //                         'Sent to Plant' not yet received here)
+    // A vehicle moves to Received only via the Receive action (accessories
+    // check + received location) — so vehicles parked at other locations
+    // no longer sit in the Received list.
+    .in('logistics_status', ['In Transit', 'Sent to Plant']).order('created_at', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const isReceivedLead = l => l.logistics_status === 'Sent to Plant' && !!l.logistics_received_on;
+  const receivedBase = (rawPurchased || []).filter(isReceivedLead);
+  const purchased = filterRowsByTableFilter(receivedBase, 'plant', l => l.pe ? l.pe.id : null, l => l.manager ? l.manager.id : null, l => l.created_at ? l.created_at.slice(0, 10) : null);
+
+  // Deliberately NOT scoped with .in('lead_id', leadIds) — once `purchased`
+  // grows into the hundreds/thousands, packing that many UUIDs into one
+  // query's URL hits the same "TypeError: Failed to fetch" (URL too long)
+  // bug already found and fixed for the missing-payment-row check
+  // (JS-Tracking.html/JS-Payments.html). Paginating the whole receipts
+  // table instead sidesteps it entirely, same fix pattern.
+  const receipts = await fetchAllRows((from, to) => sb.from('rewire_vehicle_receipt').select('*').range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const receiptByLead = {};
+  (receipts || []).forEach(r => { receiptByLead[r.lead_id] = r; });
+
+  // Once BOTH halves are Done for a lead, it's fully processed at the
+  // plant — drop it from this working list entirely instead of leaving it
+  // sitting there with two "Done" badges forever (the completed record
+  // still exists in rewire_vehicle_receipt / is visible via Purchased).
+  const remaining = (purchased || []).filter(l => {
+    const r = receiptByLead[l.id];
+    const accessoriesDone = !!(r && r.plant_spare_wheel);
+    const rstDone = !!(r && r.rst_no);
+    return !(accessoriesDone && rstDone);
+  });
+
+  document.getElementById('countPlant').textContent = remaining.length + ' vehicles';
+  // "Pending" now means either half is still outstanding — matches the
+  // two independent action columns below.
+  const pendingCount = remaining.filter(l => {
+    const r = receiptByLead[l.id];
+    return !r || !r.plant_spare_wheel || !r.rst_no;
+  }).length;
+  document.getElementById('badgePlant').textContent = pendingCount;
+
+  // ---- Mode tabs (Logistic Carrier / Crane / Driver / Towing / Self Drop) ----
+  await loadPlantManifests();
+  renderPlantModeRows();
+
+  plantPageCache = (remaining || []).map(l => ({ ...l, _receipt: receiptByLead[l.id] }));
+  document.getElementById('tbodyPlant').innerHTML = remaining.length ? remaining.map(l => {
+    const r = receiptByLead[l.id];
+    const accessoriesDone = !!(r && r.plant_spare_wheel);
+    const rstDone = !!(r && r.rst_no);
+    const vNoEsc = (l.val_vehicle_number || '').replace(/'/g, "\\'");
+    return `<tr>
+      <td data-col="lead_no"><span class="lid">${l.lead_no}</span></td>
+      <td data-col="customer" style="font-weight:500;">${l.customer_name}</td>
+      <td data-col="phone">${l.phone}</td>
+      <td data-col="location">${l.ud_vehicle_parking || '—'}</td>
+      <td data-col="sub_location">${l.ud_vehicle_sub_parking || '—'}</td>
+      <td data-col="vehicle_type">${l.val_vehicle_type || '—'}</td>
+      <td data-col="vehicle_no">${l.val_vehicle_number || '—'}</td>
+      <td data-col="make">${l.val_make || '—'}</td>
+      <td data-col="model">${l.val_model_variant || '—'}</td>
+      <td data-col="partner">${l.rewire_partners ? l.rewire_partners.partner_name : '—'}</td>
+      <td data-col="rst_no">${rstDone ? (r.rst_no || '—') : '—'}</td>
+      <td data-col="weight">${rstDone ? (r.weight_kg || '—') : '—'}</td>
+      <td data-col="received_date">${rstDone ? (r.rst_receipt_date || '—') : '—'}</td>
+      <td data-col="unload_location">${l.logistics_unload_location || '—'}</td>
+      <td data-col="pe">${l.pe ? l.pe.name : '—'}</td>
+      <td data-col="manager">${l.manager ? l.manager.name : '—'}</td>
+      <td>${accessoriesDone
+        ? '<span class="badge badge-q">Done</span>'
+        : `<button class="ab ab-form" onclick="openPlantAccessoriesCheck('${l.id}','${l.lead_no}','${vNoEsc}')"><i class="ti ti-list-check" style="font-size:11px;" aria-hidden="true"></i> Fill</button>`}</td>
+      <td>${rstDone
+        ? '<span class="badge badge-q">Done</span>'
+        : `<button class="ab ab-form" onclick="openVehicleReceipt('${l.id}','${l.lead_no}','${(l.logistics_vehicle_send_to || '').replace(/'/g, "\\'")}','${vNoEsc}')"><i class="ti ti-clipboard-list" style="font-size:11px;" aria-hidden="true"></i> Fill</button>`}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="18" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No purchased vehicles yet.</td></tr>';
+  initColumnPicker('plant', PLANT_COLUMNS, 'plantColumnPicker', 'tablePlant');
+}
+
+
+let plantPageCache = [];
+const PLANT_COLUMNS = [
+  { key: 'lead_no', label: 'Lead No.', get: l => l.lead_no || '' },
+  { key: 'customer', label: 'Customer', get: l => l.customer_name || '' },
+  { key: 'phone', label: 'Phone', get: l => l.phone || '' },
+  { key: 'location', label: 'Location', get: l => l.ud_vehicle_parking || '' },
+  { key: 'sub_location', label: 'Sub Location', get: l => l.ud_vehicle_sub_parking || '' },
+  { key: 'vehicle_type', label: 'Vehicle Type', get: l => l.val_vehicle_type || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: l => l.val_vehicle_number || '' },
+  { key: 'make', label: 'Make', get: l => l.val_make || '' },
+  { key: 'model', label: 'Model', get: l => l.val_model_variant || '' },
+  { key: 'partner', label: 'Partner', get: l => l.rewire_partners ? l.rewire_partners.partner_name : '' },
+  { key: 'rst_no', label: 'RST No.', get: l => l._receipt && l._receipt.rst_no ? l._receipt.rst_no : '' },
+  { key: 'weight', label: 'Weight (Kg)', get: l => l._receipt && l._receipt.rst_no ? (l._receipt.weight_kg || '') : '' },
+  { key: 'received_date', label: 'Received Date', get: l => l._receipt && l._receipt.rst_no ? (l._receipt.rst_receipt_date || '') : '' },
+  { key: 'unload_location', label: 'Unload Location', get: l => l.logistics_unload_location || '' },
+  { key: 'pe', label: 'PE', get: l => l.pe ? l.pe.name : '' },
+  { key: 'manager', label: 'Manager', get: l => l.manager ? l.manager.name : '' },
+];
+function exportPlantTabExcel() {
+  if (!plantPageCache.length) { notify('No vehicles to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('plant', plantPageCache, PLANT_COLUMNS, 'rewire-dms-received-at-plant.xlsx', 'Received at Plant');
+}
+
+async function openVehicleReceipt(leadId, leadNo, vehicleSendTo, vehicleNo) {
+  activeLeadId = leadId;
+  activeLeadNo = leadNo;
+  activePlantReceipt = null;
+  document.getElementById('plantModalSub').textContent = leadNo + (vehicleNo ? ' • ' + vehicleNo : '');
+  ['prReceivedFrom','prDroppingPerson','prRstNo','prRstDate','prWeight','prRemarks'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('prBridgeSlipPhoto').value = '';
+  document.getElementById('prVehiclePhoto').value = '';
+  document.getElementById('prBridgeSlipExisting').style.display = 'none';
+  document.getElementById('prVehiclePhotoExisting').style.display = 'none';
+  // Pre-fill Vehicle Dropping Person with whatever was picked as "Vehicle
+  // Send to" at Logistics dispatch time (submitLogisticsSend(),
+  // JS-Operations.html) — same person/carrier, no need to type it twice.
+  // Still freely editable here in case it changed hands in transit.
+  if (vehicleSendTo) document.getElementById('prDroppingPerson').value = vehicleSendTo;
+  openModal('plantModal');
+
+  // Fix (Ramvir, Sept 2026 — "form edit karte hai to upload option dobara
+  // mangta hai, re-upload ka option honi chahiye"): this form is reachable
+  // for a lead that ALREADY has a saved rewire_vehicle_receipt row (via the
+  // "Fill a Vehicle Not Yet Listed" RST button, regardless of whether rst_no
+  // is already filled) but used to always open blank and, on save,
+  // unconditionally wrote bridge_slip_photo_url/vehicle_photo_url as
+  // whatever uploadFile() returned — null when no new file was picked —
+  // silently wiping both previously uploaded photos on every re-save.
+  // Fetching and pre-filling the existing row here, and having
+  // submitVehicleReceipt() below only overwrite each photo when a NEW file
+  // is actually chosen, fixes both: nothing is lost by re-saving, and the
+  // text fields aren't blanked out either.
+  const { data: existing } = await sb.from('rewire_vehicle_receipt').select('*').eq('lead_id', leadId).maybeSingle();
+  if (!existing || activeLeadId !== leadId) return; // modal closed / a different lead opened before this resolved
+  activePlantReceipt = existing;
+  if (existing.received_from) document.getElementById('prReceivedFrom').value = existing.received_from;
+  if (existing.vehicle_dropping_person) document.getElementById('prDroppingPerson').value = existing.vehicle_dropping_person;
+  if (existing.rst_no) document.getElementById('prRstNo').value = existing.rst_no;
+  if (existing.rst_receipt_date) document.getElementById('prRstDate').value = existing.rst_receipt_date;
+  if (existing.weight_kg != null) document.getElementById('prWeight').value = existing.weight_kg;
+  if (existing.remarks) document.getElementById('prRemarks').value = existing.remarks;
+  if (isRealFileUrl(existing.bridge_slip_photo_url)) document.getElementById('prBridgeSlipExisting').style.display = '';
+  if (isRealFileUrl(existing.vehicle_photo_url)) document.getElementById('prVehiclePhotoExisting').style.display = '';
+}
+
+async function submitVehicleReceipt() {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+
+  let receivedFrom = document.getElementById('prReceivedFrom').value.trim();
+  let droppingPerson = document.getElementById('prDroppingPerson').value.trim();
+  if (receivedFrom && !isValidMasterValue('location', receivedFrom)) {
+    notify('"' + receivedFrom + '" is not in the Location master list. Ask Admin to add it in Settings → Master Data, or pick an existing option.', { icon: 'error', title: 'Invalid Location' });
+    return;
+  }
+  if (receivedFrom) receivedFrom = normalizeMasterValue('location', receivedFrom);
+  if (droppingPerson && !isValidMasterValue('vehicle_dropping_person', droppingPerson)) {
+    notify('"' + droppingPerson + '" is not in the Vehicle Dropping Person master list. Ask Admin to add it in Settings → Master Data, or pick an existing option.', { icon: 'error', title: 'Invalid Vehicle Dropping Person' });
+    return;
+  }
+  if (droppingPerson) droppingPerson = normalizeMasterValue('vehicle_dropping_person', droppingPerson);
+
+  const folder = getVehicleFolderName();
+  const bridgeFile = document.getElementById('prBridgeSlipPhoto');
+  const vehicleFile = document.getElementById('prVehiclePhoto');
+  const [bridgeUploadUrl, vehicleUploadUrl] = await Promise.all([
+    bridgeFile && bridgeFile.files.length ? uploadFile(bridgeFile.files[0], folder, 'Bridge_Slip') : Promise.resolve(null),
+    vehicleFile && vehicleFile.files.length ? uploadFile(vehicleFile.files[0], folder, 'Vehicle_Photo') : Promise.resolve(null),
+  ]);
+  // Only overwrite each photo when a NEW file was actually picked this time
+  // — otherwise keep whatever was already saved (see the fix comment in
+  // openVehicleReceipt() above).
+  const bridgeUrl = bridgeUploadUrl || (activePlantReceipt ? activePlantReceipt.bridge_slip_photo_url : null);
+  const vehicleUrl = vehicleUploadUrl || (activePlantReceipt ? activePlantReceipt.vehicle_photo_url : null);
+
+  // Saves independently of the Accessories Check step — see comment in
+  // confirmPlantAccessoriesCheck() above.
+  const { error } = await sb.from('rewire_vehicle_receipt').upsert({
+    lead_id: activeLeadId,
+    received_from: receivedFrom || null,
+    vehicle_dropping_person: droppingPerson || null,
+    rst_no: document.getElementById('prRstNo').value.trim(),
+    rst_receipt_date: document.getElementById('prRstDate').value || null,
+    weight_kg: document.getElementById('prWeight').value || null,
+    bridge_slip_photo_url: bridgeUrl,
+    vehicle_photo_url: vehicleUrl,
+    remarks: document.getElementById('prRemarks').value.trim(),
+    filled_by: currentProfile.id,
+    filled_on: new Date().toISOString(),
+  }, { onConflict: 'lead_id' });
+  if (error) { notify('Error saving receipt: ' + error.message, { icon: 'error' }); return; }
+  notify('RST / Vehicle Receipt Details saved.');
+  closeModal('plantModal');
+  await renderReceivedPlantSection();
+}
+
+
+// ------------------------------------------------------------
+// CRANE CHARGES — leads where Crane Status (from Delivery) is
+// Yes or Towing. Manager enters the actual amount per vehicle, plus
+// From/To Location and Crane Vendor — all three master-backed strict
+// searchable fields (see renderMasterSearchField / isValidMasterValue
+// in JS-Core.html) so a Manager can't type in a one-off location or
+// vendor name that never shows up consistently in reports.
+// ------------------------------------------------------------
+async function renderCraneChargesSection() {
+  initTableFilterBar('crane', renderCraneChargesSection);
+  const cf = tableFilterState.crane || {};
+  const buildCraneQuery = () => {
+    let q = sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, phone, val_vehicle_type, val_vehicle_number, val_make,
+        val_model_variant, ud_vehicle_parking, ud_vehicle_sub_parking, ud_crane_status, crane_charge_amount, crane_from_location,
+        crane_to_location, crane_vendor_name, created_at, pn_total_offer_price, ud_total_offer_price, rewire_partners(partner_name),
+        pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+        manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)`)
+      .in('ud_crane_status', ['Yes', 'Towing'])
+      .order('created_at', { ascending: false });
+    if (cf.pe) q = q.eq('pe_id', cf.pe);
+    if (cf.manager) q = q.eq('manager_id', cf.manager);
+    if (cf.from) q = q.gte('created_at', istDayStart(cf.from));
+    if (cf.to) q = q.lte('created_at', istDayEnd(cf.to));
+    return q;
+  };
+  // Every crane/towing vehicle ever — accumulates indefinitely, paginated
+  // defensively.
+  const data = await fetchAllRows((from, to) => buildCraneQuery().range(from, to))
+    .catch(err => { console.error(err); return []; });
+
+  document.getElementById('countCrane').textContent = (data || []).length + ' vehicles';
+  document.getElementById('badgeCrane').textContent = (data || []).filter(l => !l.crane_charge_amount).length;
+
+  const isManager = currentProfile && currentProfile.role === 'Manager';
+  const isAdmin = currentProfile && currentProfile.role === 'Admin';
+  document.getElementById('tbodyCrane').innerHTML = (data && data.length) ? data.map(l => {
+    // Once an amount has been entered, only Admin can change it — Manager
+    // gets one shot at filling it in the first time.
+    const rowEditable = isAdmin || (isManager && !l.crane_charge_amount);
+    return `<tr>
+    <td><span class="lid">${l.lead_no}</span></td>
+    <td style="font-weight:500;">${l.customer_name}</td>
+    <td>${l.phone}</td>
+    <td>${l.ud_vehicle_parking || '—'}</td>
+    <td>${l.ud_vehicle_sub_parking || '—'}</td>
+    <td>${l.val_vehicle_type || '—'}</td>
+    <td>${l.val_vehicle_number || '—'}</td>
+    <td>${l.val_make || '—'}</td>
+    <td>${l.val_model_variant || '—'}</td>
+    <td>${l.rewire_partners ? l.rewire_partners.partner_name : '—'}</td>
+    <td>${l.pe ? l.pe.name : '—'}</td>
+    <td>${l.manager ? l.manager.name : '—'}</td>
+    <td>${(l.ud_total_offer_price || l.pn_total_offer_price) ? '₹' + (l.ud_total_offer_price || l.pn_total_offer_price) : '—'}</td>
+    <td>${l.ud_vehicle_parking || '—'}</td>
+    <td><span class="badge ${l.ud_crane_status === 'Towing' ? 'badge-na' : 'badge-l'}">${l.ud_crane_status}</span></td>
+    <td>${rowEditable
+      ? `<input type="number" min="0" onwheel="this.blur()" value="${l.crane_charge_amount || ''}" id="craneAmt_${l.id}" placeholder="Enter amount" style="width:110px;border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 7px;font-size:12px;" />`
+      : (l.crane_charge_amount ? '₹' + l.crane_charge_amount + ' <span class="sub">(locked)</span>' : '<span class="sub">Not entered</span>')}</td>
+    <td>${rowEditable
+      ? renderMasterSearchField('craneFrom_' + l.id, 'location', l.crane_from_location, 'Search…', '120px')
+      : (l.crane_from_location || '—')}</td>
+    <td>${rowEditable
+      ? renderMasterSearchField('craneTo_' + l.id, 'location', l.crane_to_location, 'Search…', '120px')
+      : (l.crane_to_location || '—')}</td>
+    <td>${rowEditable
+      ? renderMasterSearchField('craneVendor_' + l.id, 'crane_vendor', l.crane_vendor_name, 'Search…', '130px')
+      : (l.crane_vendor_name || '—')}</td>
+    <td>${l.created_at ? new Date(l.created_at).toLocaleDateString() : '—'}</td>
+    <td>${rowEditable ? `<button class="ab ab-form" onclick="saveCraneCharge('${l.id}')"><i class="ti ti-device-floppy" style="font-size:11px;" aria-hidden="true"></i> Save</button>` : '—'}</td>
+  </tr>`;
+  }).join('') : '<tr><td colspan="21" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No vehicles with Crane/Towing charges yet.</td></tr>';
+}
+
+async function saveCraneCharge(leadId) {
+  const amount = document.getElementById('craneAmt_' + leadId).value;
+  if (!amount) { notify('Enter an amount first.', { icon: 'error' }); return; }
+  let fromLoc = document.getElementById('craneFrom_' + leadId).value.trim() || null;
+  let toLoc = document.getElementById('craneTo_' + leadId).value.trim() || null;
+  let vendorName = document.getElementById('craneVendor_' + leadId).value.trim() || null;
+  if (fromLoc && !isValidMasterValue('location', fromLoc)) { notify('"' + fromLoc + '" is not in the Location master list. Ask Admin to add it first.', { icon: 'error' }); return; }
+  if (toLoc && !isValidMasterValue('location', toLoc)) { notify('"' + toLoc + '" is not in the Location master list. Ask Admin to add it first.', { icon: 'error' }); return; }
+  if (vendorName && !isValidMasterValue('crane_vendor', vendorName)) { notify('"' + vendorName + '" is not a registered Crane Vendor. Use "Add Crane Vendor" first.', { icon: 'error' }); return; }
+  if (fromLoc) fromLoc = normalizeMasterValue('location', fromLoc);
+  if (toLoc) toLoc = normalizeMasterValue('location', toLoc);
+  if (vendorName) vendorName = normalizeMasterValue('crane_vendor', vendorName);
+  const { error } = await sb.from('rewire_master_data').update({
+    crane_charge_amount: amount, crane_charge_filled_by: currentProfile.id, crane_charge_filled_on: new Date().toISOString(),
+    crane_from_location: fromLoc, crane_to_location: toLoc, crane_vendor_name: vendorName,
+  }).eq('id', leadId);
+  if (error) { notify('Error saving amount: ' + error.message, { icon: 'error' }); return; }
+  notify('Crane charge saved.');
+  await renderCraneChargesSection();
+}
+
+// Guard against the DOMContentLoaded event having already fired by the
+// time this (last) inline script executes — a real risk in Apps
+// Script's IFRAME_SANDBOX delivery, where the whole page arrives via a
+// document.write() call rather than a normal streamed page load. If we
+// only ever add the listener, a late registration means it silently
+// never fires and initAuth() (and therefore the entire app) never starts.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initAuth);
+} else {
+  initAuth();
+}
+
+// Table sort/pagination/search wiring runs independently of initAuth() —
+// it only needs the static table skeletons already in Sections.html, not
+// a signed-in session or any data having loaded. Kept separate on purpose:
+// initAuth() is a long chain of awaited calls with nothing catching
+// errors, so if any one of them throws, everything after it (including a
+// call placed at the end of initAuth) would silently never run. This
+// can't be skipped that way.
+if (typeof wireTableEnhancements === 'function') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireTableEnhancements);
+  } else {
+    wireTableEnhancements();
+  }
+}
+
+
+// ------------------------------------------------------------
+// Vehicle Disposal: search in ANY sub-tab jumps to the sub-tab that really holds the vehicle (Ramvir, Oct 2026).
+// If the current tab has no match, look the vehicle up in the DB, switch to its tab and re-run the search there.
+// ------------------------------------------------------------
+const DISPOSAL_TAB_SECTIONS = ['vehicle-disposal', 'vehicle-disposal-allocated', 'vehicle-disposal-reserved', 'vehicle-disposal-scrapped'];
+let _disposalXTimer = null, _disposalXBusy = false;
+document.addEventListener('input', ev => {
+  const inp = ev.target;
+  if (!inp || inp.tagName !== 'INPUT' || !inp.closest || inp.dataset.disposalXsearch === 'skip') return;
+  const sec = inp.closest('[id^="section-vehicle-disposal"]');
+  if (!sec || !/^Search/i.test(inp.placeholder || '') || (inp.type && inp.type !== 'text' && inp.type !== 'search')) return;
+  clearTimeout(_disposalXTimer);
+  _disposalXTimer = setTimeout(() => disposalCrossTabSearch(sec, inp.value), 700);
+});
+async function disposalCrossTabSearch(sec, raw) {
+  const term = (raw || '').trim().replace(/[%,()]/g, '');
+  if (term.length < 3 || _disposalXBusy) return;
+  const rows = Array.from(sec.querySelectorAll('tbody tr')).filter(r => !r.querySelector('td[colspan]'));
+  if (rows.some(r => r.dataset.twFiltered !== '1' && r.dataset.twColFiltered !== '1')) return;   // current tab already has a match
+  _disposalXBusy = true;
+  try {
+    const { data, error } = await sb.from('rewire_master_data')
+      .select('lead_no, val_vehicle_number, ud_vehicle_parking, scrap_allocated_contractor_id, overall_status')
+      .or(`val_vehicle_number.ilike.%${term}%,lead_no.ilike.%${term}%,customer_name.ilike.%${term}%`).limit(5);
+    if (error || !data || !data.length) return;
+    const l = data[0];
+    const park = l.ud_vehicle_parking || '';
+    let target = null;
+    if (park === 'Reserved') target = 'vehicle-disposal-reserved';
+    else if (park === 'Scrapped' || park === 'Scrapped - Provisionally') target = 'vehicle-disposal-scrapped';
+    else if (l.scrap_allocated_contractor_id) target = 'vehicle-disposal-allocated';
+    else if (park === 'Jaipur Plant' && l.overall_status !== 'Closed Lost') target = 'vehicle-disposal';
+    if (!target) { notify((l.val_vehicle_number || l.lead_no) + ' is not in Vehicle Disposal (location: ' + (park || 'not set') + ').', { icon: 'info' }); return; }
+    if (target === sec.id.replace('section-', '')) return;
+    showSection(target);
+    // wait for the target tab to render its rows, then type the term into ITS search box
+    for (let i = 0; i < 25; i++) {
+      await new Promise(r => setTimeout(r, 250));
+      const ts = document.getElementById('section-' + target);
+      const tb = ts && ts.querySelector('tbody');
+      if (tb && tb.querySelector('tr') && !tb.querySelector('td[colspan]')) {
+        const box = ts.querySelector('input[placeholder^="Search"]');
+        if (box) { box.dataset.disposalXsearch = 'skip'; box.value = raw; box.dispatchEvent(new Event('input', { bubbles: true })); setTimeout(() => { delete box.dataset.disposalXsearch; }, 50); }
+        break;
+      }
+    }
+  } finally { _disposalXBusy = false; }
+}
+</script>

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>REWIRE DMS — Login</title>
+<link rel="manifest" href="/manifest.webmanifest"/>
+<link rel="icon" href="/icon.svg"/>
+<meta name="theme-color" content="#1d4ed8"/>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0f172a,#1e3a8a);padding:20px;}
+  .card{background:#fff;border-radius:16px;padding:32px 28px;width:100%;max-width:380px;box-shadow:0 20px 50px rgba(0,0,0,.35);}
+  .logo{width:52px;height:52px;border-radius:12px;background:#1d4ed8;color:#fff;font-weight:700;font-size:28px;display:flex;align-items:center;justify-content:center;margin-bottom:14px;}
+  h1{font-size:21px;color:#0f172a;margin-bottom:4px;} p.sub{color:#64748b;font-size:13px;margin-bottom:22px;}
+  label{display:block;font-size:12.5px;font-weight:600;color:#334155;margin:14px 0 6px;}
+  input{width:100%;height:44px;border:1px solid #cbd5e1;border-radius:8px;padding:0 12px;font-size:15px;outline:none;}
+  input:focus{border-color:#1d4ed8;box-shadow:0 0 0 3px rgba(29,78,216,.15);}
+  button{width:100%;height:46px;margin-top:22px;background:#1d4ed8;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;}
+  button:disabled{opacity:.6;cursor:default;}
+  .err{color:#b91c1c;font-size:13px;margin-top:12px;min-height:18px;}
+</style>
+</head>
+<body>
+<form class="card" id="f">
+  <div class="logo">R</div>
+  <h1>REWIRE DMS</h1><p class="sub">Sign in with your User ID</p>
+  <label for="uid">User ID</label><input id="uid" autocomplete="username" autofocus required/>
+  <label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password" required/>
+  <button id="btn" type="submit">Sign in</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+  const sb = supabase.createClient('{{SUPABASE_URL}}', '{{SUPABASE_ANON_KEY}}');
+  const DOMAIN = '{{LOGIN_EMAIL_DOMAIN}}';
+  sb.auth.getSession().then(({ data }) => { if (data.session) location.replace('/'); });
+  document.getElementById('f').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('btn'), err = document.getElementById('err');
+    err.textContent = ''; btn.disabled = true; btn.textContent = 'Signing in…';
+    const uid = document.getElementById('uid').value.trim();
+    const { error } = await sb.auth.signInWithPassword({ email: uid + DOMAIN, password: document.getElementById('pw').value });
+    if (error) { err.textContent = 'Wrong User ID or password.'; btn.disabled = false; btn.textContent = 'Sign in'; return; }
+    location.replace('/');
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,2126 @@
+<script>
+// DASHBOARD: All Leads / Qualified / Lost tables + pagination, plus the Dashboard analytics section.
+// ------------------------------------------------------------
+// READ + RENDER — loads leads for the current user's role
+// RLS already restricts PE to their own leads server-side.
+// ------------------------------------------------------------
+const PAGE_SIZE = 50;
+let naPage = 0, qualPage = 0, lostPage = 0;
+let naTotal = 0, qualTotal = 0, lostTotal = 0;
+let naSearch = '', qualSearch = '', lostSearch = '';
+let naPageCache = [], qualPageCache = [], lostPageCache = [];
+let searchDebounceTimer = null;
+
+const LEAD_SELECT = `
+    *, rewire_partners(partner_name, mobile),
+    pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+    manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)
+  `;
+
+// Refreshes whichever tables/badges are currently relevant. Never loads
+// the whole leads table into memory — only the current page of each tab
+// (max ~150 rows total) plus lightweight counts from Postgres.
+async function refreshLeadsTable() {
+  await Promise.all([loadNATab(naPage), loadQualTab(qualPage), loadLostTab(lostPage), updateSidebarBadges()]);
+  if (typeof renderDashboard === 'function' && document.getElementById('section-dashboard').style.display !== 'none') {
+    renderDashboard(true); // preserveTab — user is actively viewing the dashboard, don't yank them to Overview
+  }
+}
+
+async function updateSidebarBadges() {
+  const { data: stats, error } = await sb.rpc('get_dashboard_stats', { pe_id_filter: null, manager_id_filter: null });
+  if (error) { console.error(error); return; }
+  document.getElementById('badgeNA').textContent = stats.need_analysis;
+  document.getElementById('badgeQual').textContent = stats.qualified_active;
+  document.getElementById('badgeLost').textContent = stats.closed_lost;
+  const pb = document.getElementById('badgePayments');
+  if (pb) pb.textContent = stats.payments_pending ?? '–';
+}
+
+function withSearch(query, col_list, term) {
+  if (!term) return query;
+  const ors = col_list.map(c => `${c}.ilike.%${term}%`).join(',');
+  return query.or(ors);
+}
+
+// ---- ALL LEADS (Need Analysis + everything active) ----
+async function loadNATab(page = 0) {
+  naPage = page;
+  initTableFilterBar('na', () => loadNATab(0));
+  const nf = tableFilterState.na || {};
+  let query = sb.from('rewire_master_data').select(LEAD_SELECT, { count: 'exact' })
+    .eq('overall_status', 'Active')
+    .order('created_at', { ascending: false })
+    .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+  if (nf.pe) query = query.eq('pe_id', nf.pe);
+  if (nf.manager) query = query.eq('manager_id', nf.manager);
+  if (nf.from) query = query.gte('created_at', istDayStart(nf.from));
+  if (nf.to) query = query.lte('created_at', istDayEnd(nf.to));
+  query = withSearch(query, ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], naSearch);
+  const { data, error, count } = await query;
+  if (error) { console.error(error); return; }
+  naPageCache = data || [];
+  naTotal = count || 0;
+  renderNATable();
+}
+
+// PE previously had no way to move their own lead from "Need Analysis"
+// to "Qualified" themselves (openEditLead/canEditLeadDetails blocks PE
+// entirely) — this lets PE self-qualify their own leads without needing
+// a Manager to do it via Edit. Manager/Admin can do it for any lead.
+function canMarkQualified(lead) {
+  if (!currentProfile) return false;
+  if (lead.lead_status !== 'Need Analysis') return false;
+  if (currentProfile.role === 'Admin' || currentProfile.role === 'Manager') return true;
+  if (currentProfile.role === 'PE') return lead.pe_id === currentProfile.id;
+  return false;
+}
+
+async function markLeadQualified(leadId) {
+  const ok = await confirmDialog('Mark this lead as Qualified? It will move into the Qualified pipeline.');
+  if (!ok) return;
+  // sub_status must move in lockstep with lead_status — this quick-action
+  // button skipped it entirely, unlike the full Edit Lead form (which
+  // pairs Status with a dependent Sub-Status dropdown, see SM/handleST in
+  // JS-Wiring.html), leaving it stuck blank forever for any lead qualified
+  // this way instead of through Edit.
+  const { error } = await sb.from('rewire_master_data').update({
+    lead_status: 'Qualified', sub_status: 'Qualified', last_updated_by: currentProfile.id,
+  }).eq('id', leadId);
+  if (error) { notify('Error updating status: ' + error.message, { icon: 'error' }); return; }
+  notify('Lead marked Qualified.');
+  await refreshLeadsTable();
+}
+
+function renderNATable() {
+  document.getElementById('countNA').textContent = naTotal + ' entries';
+  const tbody = document.getElementById('tbodyNA');
+  tbody.innerHTML = naPageCache.length ? naPageCache.map(l => `
+    <div class="lead-card" onclick="viewLeadDetails('${l.id}')">
+      <div class="lead-card-header">
+        <div class="lead-card-title"><i class="ti ti-user" aria-hidden="true"></i> ${l.customer_name} <span class="lid">${l.lead_no}</span></div>
+        <div class="lead-card-actions">
+          <span class="badge ${l.lead_status === 'Qualified' ? 'badge-q' : 'badge-na'}" style="background:rgba(255,255,255,.9);">${l.lead_status}</span>
+          ${canMarkQualified(l) ? `<button class="lead-card-btn" style="background:#059669;color:#fff;" onclick="event.stopPropagation();markLeadQualified('${l.id}')"><i class="ti ti-check" aria-hidden="true"></i> Mark Qualified</button>` : ''}
+          <button class="lead-card-btn" onclick="event.stopPropagation();openEditLead('${l.id}')"><i class="ti ti-edit" aria-hidden="true"></i> Edit</button>
+        </div>
+      </div>
+      <div class="lead-card-body">
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-phone" aria-hidden="true"></i> Contact</div>
+          <div class="lead-card-block-value">${l.phone}<br><span class="sub">${l.email || 'No email'}</span></div>
+        </div>
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-map-pin" aria-hidden="true"></i> Location</div>
+          <div class="lead-card-block-value">${l.city}<br><span class="sub">${l.address ? l.address.slice(0, 40) + (l.address.length > 40 ? '…' : '') : '—'}</span></div>
+        </div>
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-git-branch" aria-hidden="true"></i> Classification</div>
+          <div class="lead-card-block-value">${l.lead_source} · ${l.lead_type}<br><span class="sub">${l.sub_status || '—'}</span></div>
+        </div>
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-briefcase" aria-hidden="true"></i> Partner</div>
+          <div class="lead-card-block-value">${l.rewire_partners ? l.rewire_partners.partner_name : '<span class="sub">— No partner</span>'}</div>
+        </div>
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-users-group" aria-hidden="true"></i> Team</div>
+          <div class="lead-card-block-value">PE: ${l.pe ? l.pe.name : '—'}<br><span class="sub">Mgr: ${l.manager ? l.manager.name : '—'}</span></div>
+        </div>
+        ${l.val_vehicle_number ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-car" aria-hidden="true"></i> Vehicle</div>
+          <div class="lead-card-block-value">${l.val_vehicle_number}<br><span class="sub">${l.val_make || ''} ${l.val_model_variant || ''}</span></div>
+        </div>` : ''}
+        ${(l.ud_total_offer_price || l.pn_total_offer_price) ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-currency-rupee" aria-hidden="true"></i> Offer Price</div>
+          <div class="lead-card-block-value">₹${l.ud_total_offer_price || l.pn_total_offer_price}</div>
+        </div>` : ''}
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-calendar" aria-hidden="true"></i> Created</div>
+          <div class="lead-card-block-value">${l.created_at ? new Date(l.created_at).toLocaleDateString() : '—'}<br><span class="sub">Updated: ${l.last_update ? new Date(l.last_update).toLocaleDateString() : '—'}</span></div>
+        </div>
+      </div>
+    </div>`).join('') : '<div style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No leads yet — click "Add Lead" to create one.</div>';
+  renderPaginationControls('paginationNA', naPage, naTotal, (p) => loadNATab(p));
+}
+
+function onSearchNA(val) {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => { naSearch = val.trim(); loadNATab(0); }, 350);
+}
+
+// ---- QUALIFIED PIPELINE (filtered by current stage) ----
+// Advance Payment / Omini Pay / Instant Payments follow a different stage
+// order than Post Delivery — VZ/Manager Approval/Payment Release happen
+// BEFORE Delivery instead of after it, and Delivery + the final Head
+// Approval are decoupled from the strict current_stage ladder for these
+// 3 types (Delivery can be filled any time once Bank KYC is done; final
+// Head Approval becomes due once Delivery + Accessories Check are BOTH
+// done, whatever current_stage happens to be). See
+// supabase-batch29-payment-type-flow-redesign.sql for the full design.
+const ALT_PAYMENT_TYPES = ['Advance Payment', 'Omini Pay', 'Instant Payments'];
+
+async function loadQualTab(page = 0) {
+  qualPage = page;
+  initTableFilterBar('qual', () => loadQualTab(0));
+  const qf = tableFilterState.qual || {};
+  // A Manager should only ever see leads that belong to their own mapped
+  // PEs — not every manager's leads company-wide. RLS currently grants
+  // Manager broad read access to rewire_master_data for other reasons
+  // (Payments/reporting), so this scoping happens here at the query
+  // level instead. Applied once in base() so it covers every tab (every
+  // curStage branch below builds off base()). Admin/Head/Back Office/
+  // Accounts are unaffected — they're meant to see everything.
+  // PE/Manager/date-range filter bar is applied here too, for the same
+  // reason — every curStage branch (4/5/6/7/8/10 and the default) builds
+  // off base(), so one filter application here covers the whole tab.
+  const base = () => {
+    let q = sb.from('rewire_master_data').select(LEAD_SELECT, { count: 'exact' })
+      .eq('lead_status', 'Qualified').eq('overall_status', 'Active')
+      .order('created_at', { ascending: false });
+    if (currentProfile && currentProfile.role === 'Manager') q = q.eq('manager_id', currentProfile.id);
+    if (qf.pe) q = q.eq('pe_id', qf.pe);
+    if (qf.manager) q = q.eq('manager_id', qf.manager);
+    if (qf.from) q = q.gte('created_at', istDayStart(qf.from));
+    if (qf.to) q = q.lte('created_at', istDayEnd(qf.to));
+    return q;
+  };
+
+  // Stages 4 (Upload Delivery), 5 (Verification & Zoho), 7 (Accessories
+  // Check) and 8 (Head Approval, final) need a DIFFERENT filter for Post
+  // Delivery leads vs the other 3 payment types, so those tabs fetch both
+  // branches separately (no .range() — capped instead) and merge+paginate
+  // on the client. Every other tab keeps the original single
+  // server-paginated query, unchanged.
+  if (curStage === 4 || curStage === 5 || curStage === 7 || curStage === 8) {
+    // Each branch below used to build postQuery/altQuery once and await
+    // them with no .range() at all — "capped instead" of paginated, per
+    // the original comment. That's the same silent-1000-row-cap pattern
+    // fixed everywhere else this session: fine while a stage's backlog
+    // stays under 1000, but a busy stage eventually hits it with zero
+    // error, silently dropping the tail. Restructured so each branch
+    // builds a FACTORY function ((from,to) => ...query...) instead of a
+    // single query object, and both sides are paginated via fetchAllRows.
+    let postQueryFn, altQueryFn;
+    // (Ramvir, Oct 2026) — 'Credit' is a real pn_payment_type (added Sept
+    // 2026) that follows the exact same stage progression as 'Post
+    // Delivery' — the app's own central rule, isAltFlowPaymentType()
+    // (JS-Core.html), explicitly excludes 'Credit' from the alt-flow
+    // leads alongside 'Post Delivery'. But every postQueryFn/altQueryFn
+    // branch below was still hardcoded to .eq('pn_payment_type','Post
+    // Delivery') only — so a Credit-type lead matched NEITHER branch the
+    // moment it moved past Bank KYC (current_stage 3), vanishing from
+    // every tab from Upload Delivery (4) through Head Approval (8)
+    // entirely (e.g. L7103457). POST_DELIVERY_LIKE_TYPES below is used
+    // everywhere the old literal 'Post Delivery' match was.
+    const POST_DELIVERY_LIKE_TYPES = ['Post Delivery', 'Credit'];
+    if (curStage === 4) {
+      // Upload Delivery — Post Delivery: due right after Bank KYC
+      // (current_stage 3), same as before. Advance/Omini/Instant: fillable
+      // ANY time once Bank KYC is done, until it's actually completed —
+      // not gated on current_stage at all.
+      postQueryFn = () => base().in('pn_payment_type', POST_DELIVERY_LIKE_TYPES).eq('current_stage', 3);
+      altQueryFn = () => base().in('pn_payment_type', ALT_PAYMENT_TYPES).eq('kyc_status', 'Complete')
+        .or('ud_status.is.null,ud_status.neq.Complete');
+    } else if (curStage === 5) {
+      // Verification & Zoho — Post Delivery: due after Delivery
+      // (current_stage 4, unchanged). Advance/Omini/Instant: due right
+      // after Bank KYC (current_stage 3) — Delivery isn't in their path
+      // at this point.
+      postQueryFn = () => base().in('pn_payment_type', POST_DELIVERY_LIKE_TYPES).eq('current_stage', 4);
+      altQueryFn = () => base().in('pn_payment_type', ALT_PAYMENT_TYPES).eq('current_stage', 3);
+    } else if (curStage === 7) {
+      // Accessories Check — Post Delivery: current_stage sits at 6 while
+      // this is pending (submitAccessoriesCheck advances it to 7 on
+      // confirm), so plain current_stage=6 already means "not yet done"
+      // for this type, same as before. Advance Payment/Omini Pay/Instant
+      // Payments: current_stage does NOT move for Accessories Check (it's
+      // decoupled, same as Delivery) — current_stage=6 for these actually
+      // means "Payment Release pending", a completely different stage, so
+      // the old un-branched `current_stage = curStage - 1` query wrongly
+      // matched every Alt-type lead sitting at Payment Release too (e.g.
+      // L7102554 — Advance Payment, current_stage 6, ud_status still
+      // Pending — showed up here despite Delivery not even being done).
+      // Mirrors the real gating already used by the Operations section's
+      // own Accessories Check queue (renderAccessoriesSection,
+      // JS-Operations.html): ma_status Approved (or Instant Payments,
+      // which skips Manager Approval), Delivery genuinely filled, and not
+      // already Confirmed.
+      postQueryFn = () => base().in('pn_payment_type', POST_DELIVERY_LIKE_TYPES).eq('current_stage', 6);
+      // accessories_check_status is only ever written once, by
+      // submitAccessoriesCheck() setting it to 'Confirmed' — nothing
+      // initializes it to any other string, so a lead that's never been
+      // through this step has it NULL, not 'Pending'. A plain .neq(...,
+      // 'Confirmed') never matches a NULL column in Postgres (same class
+      // of bug just fixed for payment_release_status), so paired with
+      // .is.null the same way to actually catch every not-yet-confirmed
+      // lead instead of silently excluding the NULL ones.
+      altQueryFn = () => base().in('pn_payment_type', ALT_PAYMENT_TYPES)
+        .or('ma_status.eq.Approved,pn_payment_type.eq.Instant Payments')
+        .eq('ud_status', 'Complete').not('ud_filled_on', 'is', null)
+        .or('accessories_check_status.neq.Confirmed,accessories_check_status.is.null');
+    } else {
+      // Head Approval (final closure) — Post Delivery: due after
+      // Accessories Check (current_stage 7, unchanged). Advance/Omini/
+      // Instant: due once Delivery + Accessories Check are BOTH done,
+      // regardless of current_stage (which stays parked earlier for these
+      // types while Delivery/Accessories happen independently).
+      // Accessories Review gate (Ramvir, Sept 2026): if the Accessories
+      // Check deduction was > 0, accessories_manager_review_status gets set
+      // to 'Pending' and must become 'Reviewed' before Head Approval sees
+      // the lead — a null status (no deduction, review step never
+      // triggered) is fine to pass straight through, same NULL-safe .or()
+      // pattern used for accessories_check_status above.
+      postQueryFn = () => base().in('pn_payment_type', POST_DELIVERY_LIKE_TYPES).eq('current_stage', 7)
+        .or('accessories_manager_review_status.is.null,accessories_manager_review_status.eq.Reviewed');
+      altQueryFn = () => base().in('pn_payment_type', ALT_PAYMENT_TYPES)
+        .eq('ud_status', 'Complete').not('ud_filled_on', 'is', null)
+        .eq('accessories_check_status', 'Confirmed')
+        .or('accessories_manager_review_status.is.null,accessories_manager_review_status.eq.Reviewed');
+    }
+    const [postData, altData] = await Promise.all([
+      fetchAllRows((from, to) => withSearch(postQueryFn(), ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], qualSearch).range(from, to))
+        .catch(err => { console.error(err); return []; }),
+      fetchAllRows((from, to) => withSearch(altQueryFn(), ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], qualSearch).range(from, to))
+        .catch(err => { console.error(err); return []; }),
+    ]);
+    const merged = [...postData, ...altData]
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    qualTotal = merged.length;
+    qualPageCache = merged.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+    renderQualTable();
+    return;
+  }
+
+  if (curStage === 6) {
+    // Manager Approval — every type except Instant Payments (which skips
+    // Manager Approval entirely) arrives here right after VZ. Used to be
+    // a single un-branched .eq('current_stage',5) query on the (wrong)
+    // assumption that VZ-complete lands every type on the same number —
+    // it doesn't: Post Delivery lands on 5 (Delivery already consumed 4),
+    // but Advance Payment/Omini Pay land on 4 (Delivery's slot is skipped
+    // for them — see submitVerificationZoho, JS-Pipeline.html). That
+    // meant Advance Payment/Omini Pay leads NEVER matched this query at
+    // all — permanently invisible here right after VZ, with no way for a
+    // Manager to even find them to approve (see
+    // supabase-batch64-fix-payment-release-gate.sql for the matching
+    // DB-trigger half of this bug — even a workaround attempt to approve
+    // one anyway would have been rejected by the trigger too).
+    // 'Credit' follows 'Post Delivery's exact progression (see
+    // isAltFlowPaymentType, JS-Core.html) — included here same as every
+    // other stage branch, for the same reason (L7103457 was invisible).
+    const [postData, altData] = await Promise.all([
+      fetchAllRows((from, to) => withSearch(base().in('pn_payment_type', ['Post Delivery', 'Credit']).eq('current_stage', 5),
+        ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], qualSearch).range(from, to))
+        .catch(err => { console.error(err); return []; }),
+      fetchAllRows((from, to) => withSearch(base().in('pn_payment_type', ['Advance Payment', 'Omini Pay']).eq('current_stage', 4),
+        ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], qualSearch).range(from, to))
+        .catch(err => { console.error(err); return []; }),
+    ]);
+    const merged = [...postData, ...altData]
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    qualTotal = merged.length;
+    qualPageCache = merged.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+    renderQualTable();
+    return;
+  }
+
+  if (curStage === 10) {
+    // NEW — Payment Release (Head, Advance Payment / Omini Pay only).
+    // Right after Manager Approval, before Delivery/Payment.
+    // payment_release_status is NULL (never explicitly set) for a lead
+    // that has never been through this step yet — a plain .eq(...,
+    // 'Pending') never matches a NULL column in Postgres, so every such
+    // lead was silently excluded from its own tab (L7102543/L7102554 —
+    // search correctly said "Payment Release" via the JS-side
+    // `(l.payment_release_status || 'Pending') === 'Pending'` fallback in
+    // describeLeadLocation, but the real query here required the literal
+    // string). .is.null added alongside .eq.Pending to catch both.
+    let query = base().in('pn_payment_type', ['Advance Payment', 'Omini Pay']).eq('current_stage', 6)
+      .or('payment_release_status.eq.Pending,payment_release_status.is.null')
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    query = withSearch(query, ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], qualSearch);
+    const { data, error, count } = await query;
+    if (error) { console.error(error); return; }
+    qualPageCache = data || [];
+    qualTotal = count || 0;
+    renderQualTable();
+    return;
+  }
+
+  if (curStage === 11) {
+    // NEW — Accessories Review (Ramvir, Sept 2026), Manager-only step. Same
+    // leads/scoping as renderAccessoriesReviewSection() (JS-Operations.html,
+    // the dedicated Compliance-group section) but surfaced here too, inside
+    // the Qualified Pipeline stepper, right between Accessories Check (7)
+    // and Head Approval (8) — so a Manager doesn't have to leave the
+    // pipeline view to find a lead waiting on their remarks.
+    let query = base().eq('accessories_manager_review_status', 'Pending')
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    query = withSearch(query, ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], qualSearch);
+    const { data, error, count } = await query;
+    if (error) { console.error(error); return; }
+    qualPageCache = data || [];
+    qualTotal = count || 0;
+    renderQualTable();
+    return;
+  }
+
+  // Valuation / Price Negotiation / Bank KYC (1-3), RC (9) — original
+  // behaviour, untouched. (Accessories Check, stage 7, now has its own
+  // branch above.)
+  // A lead lives in exactly ONE tab — the one it's currently due for.
+  // Editing the stage it just finished (e.g. Bank KYC once it's sitting
+  // in Upload Delivery) happens via the "Edit — <prev stage>" button on
+  // THIS card (see renderQualTable), not by also listing the lead a
+  // second time in the earlier tab.
+  let query = base().eq('current_stage', curStage - 1).range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+  query = withSearch(query, ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], qualSearch);
+  const { data, error, count } = await query;
+  if (error) { console.error(error); return; }
+  qualPageCache = data || [];
+  qualTotal = count || 0;
+  renderQualTable();
+}
+
+function renderQualTable() {
+  document.getElementById('countQual').textContent = qualTotal + ' leads';
+  const tbody = document.getElementById('tbodyQual');
+  const isPE = currentProfile && currentProfile.role === 'PE';
+  const isApprovalStage = curStage === 6 || curStage === 7 || curStage === 8 || curStage === 10 || curStage === 11; // Manager Approval / Accessories Check / Head Approval / Payment Release / Accessories Review
+  tbody.innerHTML = qualPageCache.length ? qualPageCache.map(l => {
+    // Accessories Review (11) opens accReviewModal directly via
+    // openAccessoriesReview() — it's not in STAGE_MODALS/openStageForm's
+    // dispatcher since it's a remarks-only step, not a data-entry form.
+    const actionBtn = (isPE && isApprovalStage)
+      ? `<span class="badge badge-na" style="background:rgba(255,255,255,.9);">Pending ${STAGE_LABELS[curStage]}</span>`
+      : curStage === 11
+        ? `<button class="lead-card-btn" onclick="event.stopPropagation();openAccessoriesReview('${l.id}','${l.lead_no}')"><i class="ti ti-message-2" aria-hidden="true"></i> Review</button>`
+        : `<button class="lead-card-btn" onclick="event.stopPropagation();openStageForm('${l.id}','${l.lead_no}',${curStage})"><i class="ti ti-clipboard-list" aria-hidden="true"></i> Fill Form — ${STAGE_LABELS[curStage]}</button>`;
+    // A lead now due for THIS tab just finished the previous PE-facing
+    // stage (Valuation → Price Negotiation → Bank KYC → Upload Delivery).
+    // Rather than also listing it a second time back in that earlier
+    // tab, this card gets a secondary button to fix that stage's data
+    // right here — canEditStageForm() (JS-Wiring.html) still governs
+    // whether it's actually still allowed (role, how far the lead has
+    // since moved on, etc); the button just doesn't render when it isn't.
+    // Manager Approval (6) for Post Delivery leads is a special case: the
+    // immediately-previous PE-facing stage is Upload Delivery (4), not 5
+    // (Verification & Zoho, which isn't a PE-facing form) — Manager asked
+    // to be able to fix Delivery data right from this tab before approving,
+    // same as the 2-4 "edit previous stage" pattern below. Alt-payment-type
+    // leads (Advance/Omini/Instant) don't need this: their Upload Delivery
+    // is already editable any time via canEditStageForm's separate branch,
+    // independent of current_stage/this tab.
+    const prevIdx = (curStage >= 2 && curStage <= 4) ? curStage - 1
+      : (curStage === 6 && (l.pn_payment_type === 'Post Delivery' || l.pn_payment_type === 'Credit')) ? 4
+      : null;
+    const prevEditable = prevIdx && typeof canEditStageForm === 'function' && canEditStageForm(l, prevIdx);
+    const prevEditBtn = prevEditable
+      ? `<button class="lead-card-btn" onclick="event.stopPropagation();openStageForm('${l.id}','${l.lead_no}',${prevIdx})" title="Edit — ${STAGE_LABELS[prevIdx]}"><i class="ti ti-edit" aria-hidden="true"></i> Edit</button>`
+      : '';
+    // Current Stage badge — reflects THIS TAB: the stage the card is due
+    // for, always suffixed "Pending" so it's unambiguous.
+    const stageName = (curStage === 4 && isAltFlowPaymentType(l.pn_payment_type)) ? 'Upload Delivery'
+      : (curStage === 10) ? 'Payment Release'
+      : (STAGE_LABELS[curStage] || l.lead_status);
+    const trueStageLabel = stageName + ' Pending';
+    // Only the Upload Delivery tab itself should suppress the popup's
+    // quick-edit button (see applyEditButtonPermission) — every other
+    // tab (Manager Approval, Payment Release, etc.) needs it available,
+    // including for Advance Payment/Omini Pay/Instant Payments leads
+    // that are simultaneously "due" for Delivery in the data sense
+    // (kyc done, ud not done) while ALSO due here — curStage is what
+    // actually tells us which tab this card is being shown in.
+    return `
+    <div class="lead-card" onclick="viewLeadDetails('${l.id}', ${curStage === 4})">
+      <div class="lead-card-header">
+        <div class="lead-card-title"><i class="ti ti-car" aria-hidden="true"></i> ${l.customer_name} <span class="lid">${l.lead_no}</span></div>
+        <div class="lead-card-actions">
+          ${actionBtn}
+          ${prevEditBtn}
+        </div>
+      </div>
+      <div class="lead-card-body">
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-phone" aria-hidden="true"></i> Contact</div>
+          <div class="lead-card-block-value">${l.phone}<br><span class="sub">${l.city}</span></div>
+        </div>
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-flag" aria-hidden="true"></i> Current Stage</div>
+          <div class="lead-card-block-value"><span class="badge badge-l">${trueStageLabel}</span></div>
+        </div>
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-briefcase" aria-hidden="true"></i> Partner</div>
+          <div class="lead-card-block-value">${l.rewire_partners ? l.rewire_partners.partner_name : '<span class="sub">— Direct</span>'}</div>
+        </div>
+        <div>
+          <div class="lead-card-block-label"><i class="ti ti-users-group" aria-hidden="true"></i> Team</div>
+          <div class="lead-card-block-value">PE: ${l.pe ? l.pe.name : '—'}<br><span class="sub">Mgr: ${l.manager ? l.manager.name : '—'}</span></div>
+        </div>
+        ${l.val_vehicle_number ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-car" aria-hidden="true"></i> Vehicle</div>
+          <div class="lead-card-block-value">${l.val_vehicle_number}<br><span class="sub">${l.val_make || ''} ${l.val_model_variant || ''} · ${l.val_rc_type || ''}</span></div>
+        </div>` : ''}
+        ${(l.ud_total_offer_price || l.pn_total_offer_price) ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-currency-rupee" aria-hidden="true"></i> Offer Price${l.ud_total_offer_price ? ' <span class="sub">(Final)</span>' : ''}</div>
+          <div class="lead-card-block-value">₹${l.ud_total_offer_price || l.pn_total_offer_price}</div>
+        </div>` : ''}
+        ${l.pn_payment_type ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-credit-card" aria-hidden="true"></i> Payment Type</div>
+          <div class="lead-card-block-value">${l.pn_payment_type}</div>
+        </div>` : ''}
+        ${l.pn_deal_type ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-file-description" aria-hidden="true"></i> Deal Type</div>
+          <div class="lead-card-block-value">${l.pn_deal_type}</div>
+        </div>` : ''}
+        <!-- Payment Details -- once Upload Delivery is filled, ud_* fields
+             are the FINAL confirmed split (can differ from what PN
+             originally negotiated — Ramvir: "delivery ke time jo price
+             hoga wahi final hoga"), so each line prefers its ud_
+             equivalent and only falls back to the pn_ value pre-Delivery.
+             ud_trader_payment is Delivery's COD-equivalent field (see
+             JS-Wiring.html — it's literally prefilled from pn_cod_payment),
+             so it's the right final source for the "COD" line too. -->
+        ${(l.ud_customer_payment || l.pn_customer_payment || l.ud_broker_payment || l.pn_broker_payment || l.ud_trader_payment || l.pn_cod_payment || l.ud_cash_commission || l.pn_cash_commission) ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-receipt" aria-hidden="true"></i> Payment Details${l.ud_status === 'Complete' ? ' <span class="sub">(Final)</span>' : ''}</div>
+          <div class="lead-card-block-value">${[
+            (l.ud_customer_payment || l.pn_customer_payment) ? `Customer: ₹${l.ud_customer_payment || l.pn_customer_payment}` : null,
+            (l.ud_broker_payment || l.pn_broker_payment) ? `Broker: ₹${l.ud_broker_payment || l.pn_broker_payment}` : null,
+            (l.ud_trader_payment || l.pn_cod_payment) ? `COD: ₹${l.ud_trader_payment || l.pn_cod_payment}` : null,
+            (l.ud_cash_commission || l.pn_cash_commission) ? `Cash: ₹${l.ud_cash_commission || l.pn_cash_commission}` : null,
+          ].filter(Boolean).join('<br>')}</div>
+        </div>` : ''}
+        ${l.kyc_bank_name ? `<div>
+          <div class="lead-card-block-label"><i class="ti ti-building-bank" aria-hidden="true"></i> Bank</div>
+          <div class="lead-card-block-value">${l.kyc_bank_name}<br><span class="sub">${l.kyc_status || ''}</span></div>
+        </div>` : ''}
+      </div>
+    </div>`;
+  }).join('') : '<div style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No leads in the Qualified pipeline yet.</div>';
+  renderPaginationControls('paginationQual', qualPage, qualTotal, (p) => loadQualTab(p));
+}
+
+function onSearchQual(val) {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => { qualSearch = val.trim(); loadQualTab(0); }, 350);
+}
+
+// ---- CLOSED LOST ----
+async function loadLostTab(page = 0) {
+  lostPage = page;
+  initTableFilterBar('lost', () => loadLostTab(0));
+  const lf = tableFilterState.lost || {};
+  let query = sb.from('rewire_master_data').select(LEAD_SELECT, { count: 'exact' })
+    .eq('overall_status', 'Closed Lost')
+    .order('created_at', { ascending: false })
+    .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+  if (lf.pe) query = query.eq('pe_id', lf.pe);
+  if (lf.manager) query = query.eq('manager_id', lf.manager);
+  if (lf.from) query = query.gte('created_at', istDayStart(lf.from));
+  if (lf.to) query = query.lte('created_at', istDayEnd(lf.to));
+  query = withSearch(query, ['customer_name', 'lead_no', 'phone', 'val_vehicle_number'], lostSearch);
+  const { data, error, count } = await query;
+  if (error) { console.error(error); return; }
+  lostPageCache = data || [];
+  lostTotal = count || 0;
+  renderLostTable();
+}
+
+function renderLostTable() {
+  document.getElementById('countLost').textContent = lostTotal + ' entries';
+  const tbody = document.getElementById('tbodyLost');
+  tbody.innerHTML = lostPageCache.length ? lostPageCache.map(l => `<tr>
+    <td><button class="ab ab-edit" onclick="openEditLead('${l.id}')"><i class="ti ti-edit" style="font-size:11px;" aria-hidden="true"></i> Edit</button></td>
+    <td><span class="lid" style="cursor:pointer;" onclick="viewLeadDetails('${l.id}')" title="Click for full details">${l.lead_no}</span></td>
+    <td style="font-weight:500;">${l.customer_name}</td><td>${l.phone}</td><td>${l.city}</td><td>${l.lead_type}</td>
+    <td>${l.rewire_partners ? l.rewire_partners.partner_name : '—'}</td>
+    <td><span class="badge badge-l">${l.lead_status}</span></td>
+    <td>${l.sub_status || '—'}</td>
+    <td>${l.pe ? l.pe.name : '—'}</td>
+    <td><span class="badge badge-na">${l.lost_at_stage || '—'}</span></td>
+    <td>${new Date(l.last_update || l.created_at).toLocaleString()}</td>
+  </tr>`).join('') : '<tr><td colspan="12" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No lost leads.</td></tr>';
+  renderPaginationControls('paginationLost', lostPage, lostTotal, (p) => loadLostTab(p));
+}
+
+function onSearchLost(val) {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => { lostSearch = val.trim(); loadLostTab(0); }, 350);
+}
+
+// ---- Shared pagination control renderer ----
+function renderPaginationControls(containerId, page, total, onPageChange) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const from = total === 0 ? 0 : page * PAGE_SIZE + 1;
+  const to = Math.min(total, (page + 1) * PAGE_SIZE);
+  window['_pgCb_' + containerId] = onPageChange;
+  el.innerHTML = `
+    <span class="pagi-info">Showing ${from}–${to} of ${total}</span>
+    <div class="pagi-btns">
+      <button class="pb" ${page <= 0 ? 'disabled style="opacity:.4;cursor:not-allowed;"' : ''} onclick="window['_pgCb_${containerId}'](${page - 1})">Previous</button>
+      <button class="pb active">${page + 1} / ${totalPages}</button>
+      <button class="pb" ${page + 1 >= totalPages ? 'disabled style="opacity:.4;cursor:not-allowed;"' : ''} onclick="window['_pgCb_${containerId}'](${page + 1})">Next</button>
+    </div>`;
+}
+
+function findLeadInAnyPage(leadId) {
+  return naPageCache.find(l => l.id === leadId)
+    || qualPageCache.find(l => l.id === leadId)
+    || lostPageCache.find(l => l.id === leadId)
+    || null;
+}
+
+
+// ------------------------------------------------------------
+// DASHBOARD
+// ------------------------------------------------------------
+// PE role sees an "own leads only" dashboard: top-line stats, monthly
+// summary and stage distribution are computed directly from
+// rewire_master_data filtered by pe_id (bypassing the org-wide RPC
+// functions), and the two inherently multi-PE comparison panels
+// (PE-wise Lead Count bar, Detailed Stage Breakdown by PE) are hidden
+// since a single-PE version of "compare PE against PE" isn't meaningful.
+async function getPeScopedStats(peId) {
+  const base = () => sb.from('rewire_master_data').select('id', { count: 'exact', head: true }).eq('pe_id', peId);
+  const [total, na, qual, lost, completed] = await Promise.all([
+    base(),
+    base().eq('lead_status', 'Need Analysis'),
+    base().eq('lead_status', 'Qualified').eq('overall_status', 'Active'),
+    base().eq('overall_status', 'Closed Lost'),
+    base().eq('ud_status', 'Complete').neq('overall_status', 'Closed Lost'),
+  ]);
+  return {
+    total_leads: total.count || 0, need_analysis: na.count || 0, qualified_active: qual.count || 0,
+    closed_lost: lost.count || 0, completed: completed.count || 0,
+  };
+}
+
+// Total Purchase / CoD / Incentive / Conveyance summary cards for the
+// Performance tab — own numbers for a PE, team totals for a Manager,
+// org-wide totals for Admin/everyone else (Ramvir, Oct 2026 — these used
+// to only show for PE/Manager, Ramvir wanted Admin to see them too).
+// Scoped to `perfMonth` ('YYYY-MM' or null for All Time) so it matches
+// whatever the Performance tab's own Month filter is set to.
+// Incentive/Conveyance figures come straight from
+// rewire_incentive_records / rewire_conveyance_trips (JS-Incentive.html /
+// JS-Conveyance.html own this data) rather than recomputing them here.
+async function renderPePerformanceCards(isPE, isManager, perfMonth) {
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  const isOrgWide = !isPE && !isManager;
+  let peIds = [];
+  if (isPE) peIds = [currentProfile.id];
+  else if (isManager) peIds = (allActiveUsers || []).filter(u => u.manager_id === currentProfile.id).map(u => u.id);
+  // else (Admin/others): peIds stays [] — unused, org-wide branches below skip the .in() filter entirely.
+
+  // Total Purchase + CoD — straight from rewire_master_data, month-filtered
+  // on ud_filled_on (same field Incentive's own monthly calc uses) when a
+  // month is picked, else all-time.
+  let purchaseQ = sb.from('rewire_master_data').select('id, ud_trader_payment', { count: 'exact' }).eq('ud_status', 'Complete').neq('overall_status', 'Closed Lost');
+  if (isPE) purchaseQ = purchaseQ.eq('pe_id', currentProfile.id);
+  else if (isManager) purchaseQ = purchaseQ.in('pe_id', peIds.length ? peIds : ['__none__']);
+  if (perfMonth) { purchaseQ = purchaseQ.gte('ud_filled_on', perfMonth + '-01').lt('ud_filled_on', nextMonthStr(perfMonth) + '-01'); }
+  const { data: purchaseRows, count: purchaseCount } = await purchaseQ;
+  const codCount = (purchaseRows || []).filter(r => (parseFloat(r.ud_trader_payment) || 0) > 0).length;
+  set('dashPerfTotalPurchase', purchaseCount ?? (purchaseRows || []).length);
+  set('dashPerfCod', codCount);
+
+  // Incentive — sum of final_amount from rewire_incentive_records. All-time
+  // sums across every period_month when no month is picked (period_month is
+  // always the 1st of a month, so an exact-month query is a straight .eq).
+  // Org-wide (Admin/others) sums every PE + Manager row for the month —
+  // no role/person filter.
+  let incQ = sb.from('rewire_incentive_records').select('final_amount');
+  if (isPE) incQ = incQ.eq('role', 'PE').eq('person_id', currentProfile.id);
+  else if (isManager) incQ = incQ.eq('role', 'Manager').eq('person_id', currentProfile.id);
+  if (perfMonth) incQ = incQ.eq('period_month', perfMonth + '-01');
+  const { data: incRows } = await incQ;
+  const incTotal = (incRows || []).reduce((s, r) => s + (Number(r.final_amount) || 0), 0);
+  set('dashPerfIncentive', '₹' + incTotal.toLocaleString('en-IN'));
+
+  // Conveyance — PE-only concept (Manager doesn't log trips), sum of
+  // amount from rewire_conveyance_trips for this PE / this PE's team / all
+  // PEs org-wide.
+  let convQ = sb.from('rewire_conveyance_trips').select('amount');
+  if (isPE) convQ = convQ.eq('pe_id', currentProfile.id);
+  else if (isManager) convQ = convQ.in('pe_id', peIds.length ? peIds : ['__none__']);
+  if (perfMonth) { convQ = convQ.gte('trip_date', perfMonth + '-01').lt('trip_date', nextMonthStr(perfMonth) + '-01'); }
+  const { data: convRows } = await convQ;
+  const convTotal = (convRows || []).reduce((s, r) => s + (Number(r.amount) || 0), 0);
+  set('dashPerfConveyance', '₹' + convTotal.toLocaleString('en-IN'));
+}
+
+function nextMonthStr(monthStr) {
+  const d = new Date(monthStr + '-01T00:00:00Z');
+  d.setUTCMonth(d.getUTCMonth() + 1);
+  return d.toISOString().slice(0, 7);
+}
+
+async function renderDashboard(preserveTab) {
+  // All numbers now come from Postgres aggregate functions (see
+  // performance-functions.sql) instead of looping over a full
+  // client-side lead list — stays fast no matter how much data exists.
+  // Exception: PE role, which is scoped to just their own leads via
+  // direct filtered queries (getPeScopedStats etc. below) since the org
+  // -wide RPCs don't take a per-PE filter.
+
+  const isPE = currentProfile && currentProfile.role === 'PE';
+  // Manager dashboard (Ramvir, Sept 2026) — was identical to Admin's full
+  // org-wide view; now scoped to just the Manager's own team (leads with
+  // manager_id = them, same scoping the Leads tab's Qualified Pipeline
+  // query already used) so it doesn't show every OTHER manager's numbers
+  // mixed in. Every RPC below that takes a manager_id_filter defaults it
+  // to NULL, so Admin (isManager and isPE both false) is completely
+  // unaffected — same org-wide behavior as before this change.
+  const isManager = currentProfile && currentProfile.role === 'Manager';
+
+  // Dashboard sub-tab visibility (Overview/Purchases/PE-Team Performance)
+  // is now driven by the ordinary data-role-gate/Permissions Editor system
+  // (dashboard-overview/dashboard-purchases/dashboard-performance — see
+  // PERMISSION_GATE_REGISTRY, JS-Core.html) instead of being hardcoded
+  // here to hide Performance for every PE regardless of what Admin grants.
+  // Always land back on Overview on re-render (e.g. after a role/profile
+  // switch) rather than leaving a stale tab selected. BUT skip this when
+  // preserveTab is true — used by call sites that re-render the dashboard
+  // while the user is actively looking at a specific tab (background data
+  // refresh, or the Performance month filter's onchange) so we don't yank
+  // them back to Overview mid-interaction (Ramvir, Sept 2026 bug report:
+  // "PE / Team Performance me month select karte hi Overview tab me move
+  // ho jata hai").
+  if (!preserveTab && typeof showDashboardTab === 'function') showDashboardTab('overview');
+
+  // Inventory dashboard sub-tab hidden for PE (Ramvir, Oct 2026) — stock/
+  // material-level numbers aren't a PE's own data, so nothing for them to
+  // act on there. Hardcoded here (not data-role-gate) since it's a flat
+  // PE-only rule, not something Admin needs to toggle per-role.
+  const dashMaterialNav = document.getElementById('dashnav-material');
+  if (dashMaterialNav) dashMaterialNav.style.display = isPE ? 'none' : '';
+  // CoD Trading dashboard tab (Ramvir, Oct 2026) — moved out of the Overview
+  // pane into its own sub-tab, same hide rule as Material/Inventory above:
+  // Back Office/Accounts-level data, not something a PE acts on.
+  const dashCodTradingNav = document.getElementById('dashnav-codtrading');
+  if (dashCodTradingNav) dashCodTradingNav.style.display = isPE ? 'none' : '';
+
+  if (currentProfile) {
+    const hour = new Date().getHours();
+    const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+    document.getElementById('dashGreeting').textContent = `${greeting}, ${currentProfile.name.split(' ')[0]} 👋`;
+    document.getElementById('dashGreetingSub').textContent = isPE ? `Here's your own leads overview` : isManager ? `Here's your team's overview` : `Here's your REWIRE DMS overview`;
+    document.getElementById('dashRoleBadge').textContent = currentProfile.role + ' Access';
+  }
+
+  // Header strip text (Ramvir, Sept 2026) — "<N> vehicles purchased · as of
+  // <today>", shared by both the PE and org-wide stats branches below.
+  const setDashHeaderInfo = (completedCount) => {
+    const el = document.getElementById('dashHeaderInfo');
+    if (el) el.textContent = `${completedCount ?? '–'} vehicles purchased · as of ${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
+  };
+
+  // 1. Top-line stats
+  if (isPE) {
+    const stats = await getPeScopedStats(currentProfile.id);
+    document.getElementById('dashTotalLeads').textContent = stats.total_leads;
+    document.getElementById('dashNA').textContent = stats.need_analysis;
+    document.getElementById('dashQual').textContent = stats.qualified_active;
+    document.getElementById('dashLost').textContent = stats.closed_lost;
+    document.getElementById('dashCompleted').textContent = stats.completed;
+    setDashHeaderInfo(stats.completed);
+    // Partners/Team/RC/Payments/COD are shared operational data, not
+    // per-lead — left as "–" for PE rather than showing org-wide figures
+    // that don't belong to "only apna" and that PE can't act on anyway.
+    document.getElementById('dashPartnerCount').textContent = '–';
+    document.getElementById('dashUserCount').textContent = '–';
+    document.getElementById('dashRcPending').textContent = '–';
+    document.getElementById('dashPaymentsPending').textContent = '–';
+    document.getElementById('dashCodPending').textContent = '–';
+  } else {
+    // manager_id_filter scopes every count to just this Manager's team when
+    // isManager — NULL (Admin/Head/Back Office/Accounts) keeps the exact
+    // same org-wide numbers as before. Partners/Users stay org-wide either
+    // way (see the RPC's own comment — neither table has a per-team concept).
+    const { data: stats, error: statsErr } = await sb.rpc('get_dashboard_stats', { manager_id_filter: isManager ? currentProfile.id : null });
+    if (statsErr) { console.error(statsErr); } else {
+      document.getElementById('dashTotalLeads').textContent = stats.total_leads;
+      document.getElementById('dashNA').textContent = stats.need_analysis;
+      document.getElementById('dashQual').textContent = stats.qualified_active;
+      document.getElementById('dashLost').textContent = stats.closed_lost;
+      document.getElementById('dashCompleted').textContent = stats.completed;
+      setDashHeaderInfo(stats.completed);
+      document.getElementById('dashPartnerCount').textContent = stats.partners_count;
+      document.getElementById('dashUserCount').textContent = stats.users_count;
+      document.getElementById('dashRcPending').textContent = stats.rc_pending;
+      document.getElementById('dashPaymentsPending').textContent = stats.payments_pending ?? '–';
+      document.getElementById('dashCodPending').textContent = stats.cod_cvs_pending ?? '–';
+    }
+  }
+
+  // 2. Monthly summary — last 6 months
+  const now = new Date();
+  const months = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    months.push({ year: d.getFullYear(), month: d.getMonth() + 1, label: d.toLocaleString('en', { month: 'short' }) });
+  }
+  let monthCounts;
+  if (isPE || isManager) {
+    // Same own-rows approach for both — Manager's WHERE clause just keys
+    // off manager_id instead of pe_id. No RPC needed since it's one simple
+    // filtered select, same as the PE branch already did.
+    const rangeStart = new Date(months[0].year, months[0].month - 1, 1).toISOString();
+    let ownQuery = sb.from('rewire_master_data').select('created_at').gte('created_at', rangeStart);
+    ownQuery = isPE ? ownQuery.eq('pe_id', currentProfile.id) : ownQuery.eq('manager_id', currentProfile.id);
+    const { data: ownRows } = await ownQuery;
+    monthCounts = months.map(m => (ownRows || []).filter(r => {
+      const d = new Date(r.created_at);
+      return d.getFullYear() === m.year && (d.getMonth() + 1) === m.month;
+    }).length);
+  } else {
+    const { data: monthlyRows } = await sb.rpc('get_monthly_summary', { months_back: 6 });
+    monthCounts = months.map(m => {
+      const row = (monthlyRows || []).find(r => r.yr === m.year && r.mo === m.month);
+      return row ? Number(row.cnt) : 0;
+    });
+  }
+  const monthTotal = monthCounts.reduce((s, c) => s + c, 0);
+  document.getElementById('dashMonthTotal').textContent = 'Total: ' + monthTotal;
+  document.getElementById('dashMonthGrid').innerHTML = months.map((m, i) => {
+    const isCurrent = i === months.length - 1;
+    return `<div onclick="showMonthDetails(${m.year},${m.month},'${m.label}')" style="background:${isCurrent ? '#dbeafe' : '#f8fafc'};border:1.5px solid ${isCurrent ? '#1d4ed8' : 'var(--color-border-tertiary)'};border-radius:8px;padding:12px 8px;text-align:center;cursor:pointer;">
+      <div style="font-size:10px;font-weight:700;color:${isCurrent ? '#1d4ed8' : 'var(--color-text-tertiary)'};text-transform:uppercase;letter-spacing:.05em;">${m.label}</div>
+      <div style="font-size:20px;font-weight:700;margin:4px 0;color:${isCurrent ? '#1d4ed8' : 'var(--color-text-primary)'};">${monthCounts[i]}</div>
+      <div style="font-size:9px;color:var(--color-text-tertiary);">leads</div>
+    </div>`;
+  }).join('');
+
+  // 2b. Total Purchase Summary (vehicle-type breakdown) — org-wide for
+  // Admin, scoped to just their own purchases for PE, scoped to their
+  // team's purchases for Manager (Ramvir, Sept 2026).
+  await renderPurchaseSummaryCards(isPE ? currentProfile.id : null, isManager ? currentProfile.id : null);
+
+  // 2b-2. GVUPL-style Purchase Analytics widget (category tabs + filters +
+  // KPI cards + monthly chart + PE-grouped table) — org-wide comparison
+  // across every PE, so hidden for PE same as the Performance tab (nothing
+  // to compare against for a single PE). Manager/Admin both see it,
+  // unscoped for now — a manager_id filter can be added later the same way
+  // the other widgets got one, if Ramvir wants team-only scoping here too.
+  const paCard = document.getElementById('paCard');
+  if (paCard) {
+    if (isPE) { paCard.style.display = 'none'; }
+    else { paCard.style.display = ''; await loadPurchaseAnalytics(); }
+  }
+
+  // 2c/2d. Location Wise Summary + CVS vs COD Monthly Summary — both
+  // genuinely org-wide operational data (where vehicles are physically
+  // parked; company-wide COD/CVS paperwork gap), not something an
+  // individual PE acts on day-to-day. Hidden entirely for PE to declutter
+  // their dashboard (Ramvir, Sept 2026) — Admin and Manager both still see
+  // them (Manager keeps the full org-wide view here deliberately, per
+  // Ramvir: these two are "optional, keep as-is" for Manager).
+  const locationSummaryCard = document.getElementById('dashLocationSummaryCard');
+  const cvsVsCodCard = document.getElementById('dashCvsVsCodSummaryCard');
+  if (isPE) {
+    if (locationSummaryCard) locationSummaryCard.style.display = 'none';
+    if (cvsVsCodCard) cvsVsCodCard.style.display = 'none';
+  } else {
+    if (locationSummaryCard) locationSummaryCard.style.display = '';
+    if (cvsVsCodCard) cvsVsCodCard.style.display = '';
+    await renderLocationWiseSummary();
+    // renderCvsVsCodMonthlySummary() lives in JS-Payments.html since
+    // that's already home to the CVS vs COD Excel export it complements.
+    if (typeof renderCvsVsCodMonthlySummary === 'function') renderCvsVsCodMonthlySummary('dashCvsVsCodSummary');
+    // CoD Trading widget (renderCodTradesSummaryWidget, in JS-CodTrading.html)
+    // moved out of this eager Overview render — it now lives on its own
+    // "CoD Trading" dashboard sub-tab, lazily rendered by showDashboardTab()
+    // in JS-Wiring.html, same pattern as the Material/Inventory tab.
+  }
+
+  // 3. PE-wise bar chart + Detailed Stage Breakdown by PE — both compare
+  // PE against PE, so hidden entirely for PE role (nothing to compare
+  // themselves against). Shown for Manager too now, but SCOPED to just
+  // their own team's PEs (manager_id_filter) instead of Admin's full
+  // org-wide top-10/every-PE view.
+  const peBarsCard = document.getElementById('dashPeBarsCard');
+  const breakdownCard = document.getElementById('dashBreakdownCard');
+
+  // Month filter (Ramvir, Sept 2026) — populated once with the last 12
+  // months (label + 'YYYY-MM' value), same pattern as Purchase Analytics'
+  // own month dropdown. Re-read on every render so the selection survives
+  // a re-render triggered by its own onchange. Moved above the isPE/else
+  // split (Ramvir, Oct 2026) so the new PE/Team summary cards below — which
+  // show for PE too, unlike peBarsCard/breakdownCard — can use the same
+  // month selection instead of each needing their own filter.
+  const perfMonthSelect = document.getElementById('dashPerfMonthFilter');
+  if (perfMonthSelect && perfMonthSelect.options.length <= 1) {
+    const now = new Date();
+    let opts = '<option value="">All Time</option>';
+    for (let i = 0; i < 12; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+      const label = d.toLocaleString('en', { month: 'short', year: 'numeric' });
+      opts += `<option value="${value}">${label}</option>`;
+    }
+    perfMonthSelect.innerHTML = opts;
+  }
+  const perfMonth = perfMonthSelect ? (perfMonthSelect.value || null) : null;
+
+  // Total Purchase / CoD / Incentive / Conveyance summary cards — own
+  // numbers for a PE, team totals for a Manager, org-wide totals for
+  // Admin/everyone else. Added (Ramvir, Oct 2026) because the Performance
+  // tab used to show NOTHING meaningful for a PE whose leads are all
+  // already completed, and Ramvir wanted these visible for Admin/Manager
+  // too, not just PE.
+  const perfCardsWrap = document.getElementById('dashPePerfCards');
+  if (perfCardsWrap) {
+    perfCardsWrap.style.display = 'grid';
+    await renderPePerformanceCards(isPE, isManager, perfMonth);
+  }
+
+  // PE-wise bar chart + Detailed Stage Breakdown — PE-vs-PE comparisons
+  // for Admin/Manager (team-scoped), but now also shown for a PE scoped to
+  // just themselves via pe_id_filter (Ramvir, Oct 2026 — "pending wali
+  // summary" below the cards wasn't showing for PE at all before this).
+  if (peBarsCard) peBarsCard.style.display = '';
+  if (breakdownCard) breakdownCard.style.display = '';
+  {
+    const managerFilter = isManager ? currentProfile.id : null;
+    const peIdFilter = isPE ? currentProfile.id : null;
+    const peBarsLabel = document.getElementById('dashPeBarsLabel');
+    if (peBarsLabel) peBarsLabel.textContent = isPE ? 'My Lead Count' : isManager ? 'My Team — PE-wise Lead Count' : 'PE-wise Lead Count';
+    const breakdownLabel = document.getElementById('dashBreakdownLabel');
+    if (breakdownLabel) breakdownLabel.textContent = isPE ? 'My Detailed Stage Breakdown (Pending)' : isManager ? 'My Team — Detailed Stage Breakdown by PE (Pending)' : 'Detailed Stage Breakdown by PE (Pending)';
+
+    // Assigned vs Purchased per PE, with a conversion % — was previously
+    // just raw assigned-lead count, which said nothing about actual
+    // performance/output per PE. No longer capped to top 10 here (that cap
+    // now only applies to the bar chart below) since the Detailed Stage
+    // Breakdown table needs Assign Lead/Purchased Vehicle for every PE, not
+    // just the top 10 by assigned count.
+    const { data: peRows } = await sb.rpc('get_pe_lead_counts', { manager_id_filter: managerFilter, month_filter: perfMonth, pe_id_filter: peIdFilter });
+    const peEntriesAll = (peRows || []).map(r => ({ name: r.pe_name, assigned: Number(r.assigned), purchased: Number(r.purchased) }));
+    const peCountsByName = {};
+    peEntriesAll.forEach(e => { peCountsByName[e.name] = e; });
+    const peEntries = peEntriesAll.slice(0, 10);
+    const maxAssigned = Math.max(1, ...peEntries.map(e => e.assigned));
+    document.getElementById('dashPeBars').innerHTML = peEntries.length ? peEntries.map(e => {
+      const pct = e.assigned > 0 ? ((e.purchased / e.assigned) * 100).toFixed(1) : '0.0';
+      return `
+      <div style="margin-bottom:11px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px;">
+          <span style="font-size:11px;color:var(--color-text-secondary);">${e.name}</span>
+          <span style="font-size:11px;"><span style="font-weight:700;">${e.purchased}</span><span style="color:var(--color-text-tertiary);"> / ${e.assigned} (${pct}%)</span></span>
+        </div>
+        <div style="background:#f1f5f9;border-radius:4px;height:8px;overflow:hidden;position:relative;">
+          <div style="position:absolute;inset:0;border-radius:4px;width:${(e.assigned/maxAssigned*100)}%;background:#e2e8f0;"></div>
+          <div style="position:absolute;inset:0;border-radius:4px;width:${(e.purchased/maxAssigned*100)}%;background:#1d4ed8;"></div>
+        </div>
+      </div>`;
+    }).join('') : '<div style="color:var(--color-text-tertiary);font-size:12px;">No leads yet</div>';
+
+    const { data: breakdown } = await sb.rpc('get_pe_stage_breakdown', { manager_id_filter: managerFilter, month_filter: perfMonth, pe_id_filter: peIdFilter });
+    const rows = breakdown || [];
+    // Total (Ramvir, Sept 2026 rework) = sum of only the 6 stage columns
+    // still shown here (val, pn, kyc, ud, vz, acc) — Mgr Approval and Head
+    // Approval leads are no longer displayed as their own columns (per his
+    // "ye pending me nahi hai" — once handed to Manager/Head, it's off the
+    // PE's plate) and are now excluded from Total too, so Total always
+    // equals the sum of the visible columns. RC Track stays independent as
+    // before (rc_status isn't tied to current_stage, so it's informational,
+    // not part of Total). Assign Lead / Purchased Vehicle come from
+    // peCountsByName (get_pe_lead_counts, fetched above) rather than this
+    // RPC, matched by pe_name.
+    const grand = rows.reduce((g, r) => ({
+      val: g.val + Number(r.val_count), pn: g.pn + Number(r.pn_count),
+      kyc: g.kyc + Number(r.kyc_count), ud: g.ud + Number(r.ud_count), vz: g.vz + Number(r.vz_count),
+      acc: g.acc + Number(r.acc_count), rc: g.rc + Number(r.rc_count),
+    }), { val: 0, pn: 0, kyc: 0, ud: 0, vz: 0, acc: 0, rc: 0 });
+    let grandAssigned = 0, grandPurchased = 0;
+    // Grand Total's Avg Days Pending is a weighted average across every PE's
+    // pending leads (not a plain average of the per-PE averages, which would
+    // over-weight PEs with few pending leads) — accumulated below as we loop
+    // rows, using each row's rowTotal as the weight.
+    let avgDaysWeightedSum = 0, avgDaysWeight = 0;
+    // Every non-zero cell (including Total) is clickable — opens a popup
+    // listing the actual leads behind that count via
+    // get_pe_stage_breakdown_detail() (Ramvir, Sept 2026 request), which
+    // re-implements the exact same bucketing logic as this RPC so the
+    // drill-down list always matches the number shown here. peName is
+    // escaped into a data attribute (not inlined into the onclick string)
+    // since PE names can contain characters (apostrophes) that would
+    // otherwise break the handler.
+    // managerFilter passed via a data attribute (not inlined into the
+    // onclick string) too — inlining a UUID string there would need its
+    // own quotes nested inside the double-quoted onclick="...", which
+    // breaks the attribute; reading it back out of dataset sidesteps that
+    // entirely. dataset gives back the literal string 'null' when there's
+    // no manager filter, hence the explicit check in showPeStageDetailPopup().
+    const cellAttrs = (peName, bucketKey) => `data-pe="${String(peName).replace(/"/g, '&quot;')}" data-bucket="${bucketKey}" data-mgr="${managerFilter || ''}" onclick="showPeStageDetailPopup(this.dataset.pe, this.dataset.bucket, this.dataset.mgr)"`;
+    const cell = (v, peName, bucketKey) => v > 0 ? `<span ${cellAttrs(peName, bucketKey)} style="cursor:pointer;background:#dbeafe;color:#1d4ed8;padding:2px 7px;border-radius:4px;font-weight:700;font-size:11px;" title="Click to view leads">${v}</span>` : '<span style="color:var(--color-text-tertiary);">—</span>';
+    const plain = (v) => v > 0 ? `<span style="font-weight:700;">${v}</span>` : '<span style="color:var(--color-text-tertiary);">—</span>';
+    // Purchased Vehicle count — clickable like the stage-count cells above,
+    // opens showPeVehiclePopup() (Ramvir, Sept 2026 request) which lists the
+    // actual vehicles purchased via get_pe_purchased_detail(), scoped to the
+    // same Month filter (ud_filled_on) that drives the count itself so the
+    // list can never disagree with the number shown.
+    const purchasedCell = (v, peName) => v > 0 ? `<span data-pe="${String(peName).replace(/"/g, '&quot;')}" data-mgr="${managerFilter || ''}" data-month="${perfMonth || ''}" onclick="showPeVehiclePopup(this.dataset.pe, this.dataset.mgr, this.dataset.month)" style="cursor:pointer;background:#dcfce7;color:#15803d;padding:2px 7px;border-radius:4px;font-weight:700;font-size:11px;" title="Click to view purchased vehicles">${v}</span>` : '<span style="color:var(--color-text-tertiary);">—</span>';
+    document.getElementById('dashBreakdownBody').innerHTML =
+      (rows.length ? rows.map(r => {
+        const peCounts = peCountsByName[r.pe_name] || { assigned: 0, purchased: 0 };
+        grandAssigned += peCounts.assigned; grandPurchased += peCounts.purchased;
+        const rowTotal = Number(r.val_count) + Number(r.pn_count) + Number(r.kyc_count) + Number(r.ud_count) + Number(r.vz_count) + Number(r.acc_count);
+        const avgDays = r.avg_days_pending !== null && r.avg_days_pending !== undefined ? Number(r.avg_days_pending) : null;
+        if (avgDays !== null && rowTotal > 0) { avgDaysWeightedSum += avgDays * rowTotal; avgDaysWeight += rowTotal; }
+        // >30 days pending flagged amber, >60 red — quick visual triage of which PE's backlog is going stale.
+        const avgDaysColor = avgDays === null ? 'var(--color-text-tertiary)' : avgDays > 60 ? '#dc2626' : avgDays > 30 ? '#d97706' : 'var(--color-text-secondary)';
+        return `<tr>
+        <td style="padding:9px 12px;font-weight:600;border-bottom:0.5px solid #f1f5f9;">${r.pe_name}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;border-right:1px solid #f1f5f9;">${plain(peCounts.assigned)}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;">${cell(Number(r.val_count), r.pe_name, 'val')}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;">${cell(Number(r.pn_count), r.pe_name, 'pn')}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;">${cell(Number(r.kyc_count), r.pe_name, 'kyc')}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;">${cell(Number(r.ud_count), r.pe_name, 'ud')}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;">${cell(Number(r.vz_count), r.pe_name, 'vz')}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;">${cell(Number(r.acc_count), r.pe_name, 'acc')}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;border-left:1px solid #f1f5f9;">${cell(Number(r.rc_count), r.pe_name, 'rc')}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;border-left:1px solid #f1f5f9;">${purchasedCell(peCounts.purchased, r.pe_name)}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;border-left:1px solid #f1f5f9;font-weight:600;color:${avgDaysColor};">${avgDays === null ? '—' : avgDays + 'd'}</td>
+        <td style="padding:9px 12px;text-align:center;border-bottom:0.5px solid #f1f5f9;border-left:1px solid #f1f5f9;font-weight:700;">${rowTotal || '—'}</td>
+      </tr>`;
+      }).join('') : '<tr><td colspan="12" style="text-align:center;color:var(--color-text-tertiary);padding:16px;">No leads yet</td></tr>') +
+      `<tr style="background:#1d4ed8;color:#fff;">
+        <td style="padding:10px 12px;font-weight:700;">Grand Total</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;border-right:1px solid #334155;">${grandAssigned}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;">${grand.val}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;">${grand.pn}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;">${grand.kyc}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;">${grand.ud}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;">${grand.vz}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;">${grand.acc}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;border-left:1px solid #334155;">${grand.rc}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;border-left:1px solid #334155;">${grandPurchased}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;border-left:1px solid #334155;">${avgDaysWeight > 0 ? Math.round((avgDaysWeightedSum / avgDaysWeight) * 10) / 10 + 'd' : '—'}</td>
+        <td style="padding:10px 12px;text-align:center;font-weight:700;border-left:1px solid #334155;">${grand.val + grand.pn + grand.kyc + grand.ud + grand.vz + grand.acc}</td>
+      </tr>`;
+  }
+
+  // 4. Stage distribution dots — org-wide via RPC for Admin, or a direct
+  // filtered current_stage count for PE (own leads) / Manager (own team)
+  // (0=Valuation,1=Price Neg.,2=Bank KYC,3=Upload Delivery — matches the
+  // reordered pipeline below).
+  document.getElementById('dashStageDotsLabel').textContent = isPE ? 'My Stage Distribution' : isManager ? "My Team's Stage Distribution" : 'Stage Distribution';
+  const stageDefs = [
+    { key: 'valuation', label: 'Valuation', color: '#1d4ed8' },
+    { key: 'price_negotiation', label: 'Price Neg.', color: '#7c3aed' },
+    { key: 'bank_kyc', label: 'Bank KYC', color: '#059669' },
+    { key: 'delivery', label: 'Delivery', color: '#d97706' },
+  ];
+  let stageCounts;
+  if (isPE || isManager) {
+    const stageBase = () => {
+      let q = sb.from('rewire_master_data').select('id', { count: 'exact', head: true })
+        .eq('lead_status', 'Qualified').eq('overall_status', 'Active');
+      return isPE ? q.eq('pe_id', currentProfile.id) : q.eq('manager_id', currentProfile.id);
+    };
+    const [val, pn, kyc, ud] = await Promise.all([
+      stageBase().eq('current_stage', 0), stageBase().eq('current_stage', 1),
+      stageBase().eq('current_stage', 2), stageBase().eq('current_stage', 3),
+    ]);
+    stageCounts = [val.count || 0, pn.count || 0, kyc.count || 0, ud.count || 0];
+  } else {
+    const { data: dist } = await sb.rpc('get_stage_distribution');
+    stageCounts = stageDefs.map(s => dist ? Number(dist[s.key] || 0) : 0);
+  }
+  const maxStage = Math.max(1, ...stageCounts);
+  const stageTotal = stageCounts.reduce((s, c) => s + c, 0) || 1;
+  document.getElementById('dashStageDots').innerHTML = stageDefs.map((s, i) => {
+    const pct = ((stageCounts[i] / stageTotal) * 100).toFixed(0);
+    return `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:9px;">
+      <span style="font-size:11px;color:var(--color-text-secondary);flex:1;">${s.label}</span>
+      <div style="width:90px;height:6px;background:#f1f5f9;border-radius:3px;overflow:hidden;"><div style="height:100%;border-radius:3px;width:${(stageCounts[i]/maxStage*100)}%;background:${s.color};"></div></div>
+      <span style="font-size:10px;color:var(--color-text-tertiary);width:56px;text-align:right;">${stageCounts[i]} (${pct}%)</span>
+    </div>`;
+  }).join('');
+}
+
+// ------------------------------------------------------------
+// TOTAL PURCHASE SUMMARY — Dashboard card grid + detail modal
+// ------------------------------------------------------------
+const VEHICLE_TYPE_META = {
+  'M (Cars)': { color: '#1d4ed8' },
+  'L (2W)': { color: '#059669' },
+  'N (Commercial Vehicles)': { color: '#92400e', short: 'N (Comm.)' },
+  'O (Other)': { color: '#991b1b' },
+};
+let _purchaseSummaryRows = [];
+let _psActiveYear = null, _psActiveMonth = null, _psActiveLabel = '';
+
+async function renderPurchaseSummaryCards(peId, managerId) {
+  const { data, error } = await sb.rpc('get_purchase_summary_by_month', { months_back: 4, pe_id_filter: peId || null, manager_id_filter: managerId || null });
+  if (error) { console.error(error); return; }
+  _purchaseSummaryRows = data || [];
+  // Card heading/total label switch to "My ..."/"My Team's ..." when
+  // scoped, so it doesn't read like the whole company's numbers.
+  const heading = document.getElementById('dashPurchaseHeading');
+  if (heading) heading.textContent = peId ? 'My Purchase Summary' : managerId ? "My Team's Purchase Summary" : 'Total Purchase Summary';
+
+  const now = new Date();
+  const months = [];
+  for (let i = 3; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    months.push({ year: d.getFullYear(), month: d.getMonth() + 1, label: d.toLocaleString('en', { month: 'short', year: '2-digit' }) });
+  }
+
+  let grandTotal = 0;
+  document.getElementById('dashPurchaseGrid').innerHTML = months.map(m => {
+    const rows = _purchaseSummaryRows.filter(r => r.yr === m.year && r.mo === m.month);
+    const monthTotal = rows.reduce((s, r) => s + Number(r.cnt), 0);
+    grandTotal += monthTotal;
+    const types = ['M (Cars)', 'L (2W)', 'N (Commercial Vehicles)', 'O (Other)'];
+    const quads = types.map((t, i) => {
+      const row = rows.find(r => r.vehicle_type === t);
+      const meta = VEHICLE_TYPE_META[t];
+      const brdr = (i % 2 === 0 ? 'border-right:1px solid #e5e7eb;' : '') + (i < 2 ? 'border-bottom:1px solid #e5e7eb;' : '');
+      return `<div style="padding:10px;${brdr}">
+        <div style="font-size:20px;font-weight:700;color:${meta.color};">${row ? row.cnt : 0}</div>
+        <div style="font-size:11px;color:var(--color-text-secondary);">${meta.short || t}</div>
+        <div style="font-size:10px;color:var(--color-text-tertiary);">Avg/kg: ${row && row.avg_per_kg ? row.avg_per_kg : 0}</div>
+      </div>`;
+    }).join('');
+    return `<div style="border:1px solid #cbd5e1;border-radius:10px;overflow:hidden;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.04);" onclick="openPurchaseSummaryDetail(${m.year},${m.month},'${m.label}')">
+      <div style="background:#1d4ed8;color:#fff;padding:8px 12px;display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-weight:700;font-size:13px;">${m.label}</span>
+        <span style="background:rgba(255,255,255,.2);padding:2px 8px;border-radius:10px;font-size:11px;">Total: ${monthTotal}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;">${quads}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('dashPurchaseGrandTotal').textContent = 'Grand Total: ' + grandTotal + ' vehicles';
+}
+
+async function openPurchaseSummaryDetail(year, month, label) {
+  _psActiveYear = year; _psActiveMonth = month; _psActiveLabel = label;
+  const start = new Date(year, month - 1, 1).toISOString();
+  const end = new Date(year, month, 1).toISOString();
+
+  let psQuery = sb.from('rewire_master_data')
+    .select(`customer_name, phone, val_vehicle_type, val_vehicle_number, val_make, val_model_variant,
+      val_kerb_weight_kg, pn_total_offer_price, pn_deal_type, ud_customer_payment, ud_broker_payment, ud_trader_payment,
+      ud_cash_commission, ud_total_offer_price, ud_filled_on,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name)`)
+    .eq('ud_status', 'Complete')
+    .neq('overall_status', 'Closed Lost')
+    .gte('ud_filled_on', start).lt('ud_filled_on', end)
+    .order('ud_filled_on', { ascending: false });
+  // Same scoping as the summary cards themselves (renderPurchaseSummaryCards)
+  // — without this, a PE/Manager clicking their own month card would still
+  // see every OTHER PE's/team's purchases in the drill-down popup.
+  if (currentProfile && currentProfile.role === 'PE') psQuery = psQuery.eq('pe_id', currentProfile.id);
+  if (currentProfile && currentProfile.role === 'Manager') psQuery = psQuery.eq('manager_id', currentProfile.id);
+  const { data, error } = await psQuery;
+  if (error) { notify('Error loading details: ' + error.message, { icon: 'error' }); return; }
+
+  _purchaseSummaryDetailRows = data || [];
+  document.getElementById('psModalTitle').textContent = `${label} — ${_purchaseSummaryDetailRows.length} vehicles`;
+
+  const peNames = [...new Set(_purchaseSummaryDetailRows.map(r => r.pe ? r.pe.name : 'Unassigned'))];
+  document.getElementById('psPeFilter').innerHTML = '<option value="">All PE</option>' + peNames.map(n => `<option value="${n}">${n}</option>`).join('');
+  const codInput = document.getElementById('psCodDeduction'); if (codInput) codInput.value = '';
+  // Column filters are keyed by table id ('psTable', fixed) not by which
+  // month is open — without clearing here, a filter left on from a
+  // previously-viewed month would silently carry over and hide rows in
+  // this one too (Ramvir, Sept 2026 fix, found while fixing the stats-row
+  // column-filter bug above).
+  const psTableEl = document.getElementById('psTable');
+  if (psTableEl && typeof clearColumnFiltersForTable === 'function') clearColumnFiltersForTable(psTableEl);
+
+  renderPurchaseSummaryTable();
+  openModal('purchaseSummaryModal');
+}
+
+// Split out of openPurchaseSummaryDetail() (Ramvir, Sept 2026 fix) — the
+// M/L/N/O count cards used to only ever get computed once, off the FULL
+// unfiltered row set, and never again. Picking a PE from the dropdown re-
+// rendered the table below with that PE's vehicles but left these cards
+// showing the whole month's totals — so "how many M(Cars)/L(2W)/etc. did
+// Khemraj specifically buy" had no answer anywhere in this popup. Now
+// called every time the PE filter changes, off whatever the filtered rows
+// actually are.
+function renderPsStatsRow(rows) {
+  const el = document.getElementById('psStatsRow');
+  if (!el) return;
+  const typeCounts = {};
+  rows.forEach(r => { const t = r.val_vehicle_type || 'O (Other)'; typeCounts[t] = (typeCounts[t] || 0) + 1; });
+  el.innerHTML = Object.entries(VEHICLE_TYPE_META).map(([t, meta]) => `
+    <div style="flex:1;text-align:center;padding:12px;border-right:0.5px solid var(--color-border-tertiary);">
+      <div style="font-size:22px;font-weight:700;color:${meta.color};">${typeCounts[t] || 0}</div>
+      <div style="font-size:11px;color:var(--color-text-secondary);">${meta.short || t}</div>
+    </div>`).join('');
+}
+
+let _purchaseSummaryDetailRows = [];
+// Rows actually rendered into psTableBody on the last call — one <tr> per
+// entry, same order — so psOnColumnFilterChange() (JS-Core.html's generic
+// column-filter hook) can map a visible <tr> back to its source row and
+// recompute the M/L/N/O stats cards off whatever survives BOTH the PE
+// dropdown above AND any per-column funnel filter (Ramvir, Sept 2026 fix —
+// the stats cards previously only ever reacted to the PE dropdown).
+let _psTableRenderedRows = [];
+function renderPurchaseSummaryTable() {
+  const peFilter = document.getElementById('psPeFilter').value;
+  const rows = peFilter ? _purchaseSummaryDetailRows.filter(r => (r.pe ? r.pe.name : 'Unassigned') === peFilter) : _purchaseSummaryDetailRows;
+  _psTableRenderedRows = rows;
+  renderPsStatsRow(rows);
+
+  // CoD Deduction (Ramvir, Sept 2026 fix) — now shares the EXACT same
+  // eligibility rule as the Purchases tab's own CoD Deduction (paEffectiveOffer,
+  // defined below): only Trader COD deals delivered after Aug 15 (current
+  // year) actually get the amount subtracted. Originally this popup applied
+  // the deduction to every row unconditionally, which is what Ramvir
+  // flagged as wrong — the two screens now always agree with each other.
+  const deduction = parseFloat((document.getElementById('psCodDeduction') || {}).value) || 0;
+  const cutoff = new Date(new Date().getFullYear(), 7, 15);
+
+  // "Total Offer Price" column removed (Ramvir, Sept 2026) — it was always
+  // identical to "Final Purchase" (both read ud_total_offer_price), so it
+  // was a redundant duplicate column taking up space for no reason.
+  document.getElementById('psTableBody').innerHTML = rows.length ? rows.map(r => {
+    const finalPurchase = typeof paEffectiveOffer === 'function' ? paEffectiveOffer(r, deduction, cutoff) : (parseFloat(r.ud_total_offer_price) || 0);
+    const avgPerKg = (r.ud_total_offer_price && r.val_kerb_weight_kg) ? (finalPurchase / r.val_kerb_weight_kg).toFixed(2) : '—';
+    return `<tr>
+      <td>${_psActiveLabel}</td>
+      <td>${r.pe ? r.pe.name : '—'}</td>
+      <td style="font-weight:500;">${r.customer_name}</td>
+      <td>${r.phone}</td>
+      <td>${r.val_vehicle_type || '—'}</td>
+      <td>${r.val_vehicle_number || '—'}</td>
+      <td>${r.val_make || '—'}</td>
+      <td>${r.val_model_variant || '—'}</td>
+      <td>${r.val_kerb_weight_kg || '—'}</td>
+      <td>${r.ud_customer_payment ? '₹' + r.ud_customer_payment : '—'}</td>
+      <td>${r.ud_broker_payment ? '₹' + r.ud_broker_payment : '—'}</td>
+      <td>${r.ud_trader_payment ? '₹' + r.ud_trader_payment : '—'}</td>
+      <td>${r.ud_cash_commission ? '₹' + r.ud_cash_commission : '—'}</td>
+      <td>₹${avgPerKg}</td>
+      <td style="font-weight:700;">${r.ud_total_offer_price ? '₹' + Math.round(finalPurchase).toLocaleString('en-IN') : '—'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="15" style="text-align:center;color:var(--color-text-tertiary);padding:20px;">No vehicles for this filter.</td></tr>';
+}
+
+// Fired by JS-Core.html's generic column-filter engine (applyColumnFilters)
+// via psTable's data-col-filter-hook attribute, every time a per-column
+// funnel filter is applied/changed/cleared — see _psTableRenderedRows above
+// for why index-matching the <tr>s back to source rows works here.
+function psOnColumnFilterChange(table) {
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  const trs = Array.from(tbody.children).filter(r => r.tagName === 'TR' && !r.querySelector('td[colspan]'));
+  const visibleRows = trs.map((tr, i) => (tr.dataset.twColFiltered !== '1' && tr.dataset.twFiltered !== '1') ? _psTableRenderedRows[i] : null).filter(Boolean);
+  renderPsStatsRow(visibleRows);
+}
+
+// "Clear Filter" button (Ramvir, Sept 2026) — resets the PE dropdown, the
+// CoD Deduction what-if figure, AND any per-column funnel filter applied on
+// the table, all in one click, then re-renders from scratch.
+function psClearAllFilters() {
+  const peSel = document.getElementById('psPeFilter'); if (peSel) peSel.value = '';
+  const codInput = document.getElementById('psCodDeduction'); if (codInput) codInput.value = '';
+  const table = document.getElementById('psTable');
+  if (table && typeof clearColumnFiltersForTable === 'function') clearColumnFiltersForTable(table);
+  renderPurchaseSummaryTable();
+}
+
+// ------------------------------------------------------------
+// LOCATION WISE SUMMARY — days-since-delivery aging matrix, split by
+// parking location (ud_vehicle_parking). Same data scope as Total
+// Purchase Summary (ud_status = 'Complete'). "Days" = today minus
+// ud_filled_on (when the Upload Delivery form — which records the
+// parking location — was completed). Click a non-zero cell to see the
+// underlying vehicles, same click-through idea as Total Purchase Summary.
+// ------------------------------------------------------------
+const AGING_BUCKETS = [
+  { label: '<7 days', min: 0, max: 6 },
+  { label: '7 to 15 days', min: 7, max: 14 },
+  { label: '15 to 30 days', min: 15, max: 29 },
+  { label: '30 to 60 days', min: 30, max: 59 },
+  { label: '>60 days', min: 60, max: Infinity },
+];
+let _locationSummaryRows = [];
+
+// Same physical location can be typed with different casing/spacing
+// (e.g. "Ajmer" vs "AJMER") — normalizing here so they merge into one
+// column instead of showing up as two separate ones in the table.
+const normLoc = (v) => (v && v.trim()) ? v.trim().toUpperCase().replace(/\s+/g, ' ') : 'No Location';
+// Sub Location kept in its original casing (it's a real place/yard name,
+// not typed freely enough elsewhere to need normalizing) — 'Not Specified'
+// for the (currently: every) vehicle whose Sub Location hasn't been filled
+// in yet via Upload Delivery / Location Tracking's Update flow.
+const normSubLoc = (v) => (v && v.trim()) ? v.trim() : 'Not Specified';
+
+// Location Wise Summary reworked (Ramvir, Sept 2026) from a flat
+// bucket-rows/location-columns matrix into Location rows that expand to
+// reveal a Sub Location breakdown underneath — same expand/collapse
+// pattern as Purchase Analytics' PE -> Category -> Deal Type hierarchy
+// (togglePaDealType etc., this same file). Kept as 2 functions: this one
+// fetches once, renderLocationSummaryTable() does the actual (re-)render
+// so toggling a row's expand state doesn't need a fresh Supabase round
+// trip every click.
+let expandedLocationSummaryRows = new Set();
+
+function toggleLocationSummaryRow(loc) {
+  if (expandedLocationSummaryRows.has(loc)) expandedLocationSummaryRows.delete(loc);
+  else expandedLocationSummaryRows.add(loc);
+  renderLocationSummaryTable();
+}
+
+async function renderLocationWiseSummary() {
+  const container = document.getElementById('dashLocationSummaryTable');
+  if (!container) return;
+  // Every delivered vehicle ever, no date bound — will silently drop the
+  // oldest rows past Supabase's 1000-row cap once delivered-vehicle count
+  // grows past that (same class of bug fixed everywhere else this session).
+  // overall_status = 'Purchased' (not just ud_status = 'Complete') — same
+  // reasoning as get_purchase_summary_by_month() (Sept 2026): a delivered
+  // vehicle still awaiting Head Approval, or one Closed Lost after
+  // delivery, isn't a completed purchase yet.
+  const data = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select('id, lead_no, customer_name, phone, val_vehicle_type, val_vehicle_number, val_make, val_model_variant, ud_vehicle_parking, ud_vehicle_sub_parking, ud_filled_on')
+    .eq('ud_status', 'Complete')
+    .eq('overall_status', 'Purchased')
+    .not('ud_filled_on', 'is', null)
+    // Scrapped / "Scrapped - Provisionally" stay out. Jaipur Plant is back IN (Ramvir, Oct 2026) so the
+    // summary shows how many vehicles sit at Jaipur Plant and its Yard-2 / Yard-3 sub-locations.
+    .not('ud_vehicle_parking', 'in', '(Scrapped,Scrapped - Provisionally)')
+    .range(from, to))
+    .catch(err => { console.error(err); return []; });
+  _locationSummaryRows = data || [];
+  renderLocationSummaryTable();
+}
+
+function renderLocationSummaryTable() {
+  const container = document.getElementById('dashLocationSummaryTable');
+  if (!container) return;
+  if (!_locationSummaryRows.length) { container.innerHTML = '<div style="text-align:center;color:var(--color-text-tertiary);padding:16px;">No delivered vehicles with a recorded parking location yet.</div>'; return; }
+
+  const now = new Date();
+  const bucketOf = (dateStr) => {
+    const days = Math.floor((now - new Date(dateStr)) / 86400000);
+    const b = AGING_BUCKETS.find(bb => days >= bb.min && days <= bb.max);
+    return b ? b.label : null;
+  };
+  const rowTotal = (counts) => AGING_BUCKETS.reduce((s, b) => s + (counts[b.label] || 0), 0);
+
+  // byLoc[loc] = { total: {bucketLabel: count}, subs: { subLoc: {bucketLabel: count} } }
+  const byLoc = {};
+  _locationSummaryRows.forEach(r => {
+    const bucket = bucketOf(r.ud_filled_on);
+    if (!bucket) return;
+    const loc = normLoc(r.ud_vehicle_parking);
+    const sub = normSubLoc(r.ud_vehicle_sub_parking);
+    byLoc[loc] = byLoc[loc] || { total: {}, subs: {} };
+    byLoc[loc].total[bucket] = (byLoc[loc].total[bucket] || 0) + 1;
+    byLoc[loc].subs[sub] = byLoc[loc].subs[sub] || {};
+    byLoc[loc].subs[sub][bucket] = (byLoc[loc].subs[sub][bucket] || 0) + 1;
+  });
+  const locations = Object.keys(byLoc).sort();
+
+  // Bucket cell's onclick stops propagation so clicking a number opens the
+  // detail popup WITHOUT also toggling the row's expand state (the row's
+  // own onclick is on the whole <tr>, same as Purchase Analytics' rows).
+  // Gridlines added (Ramvir, Sept 2026) — border on every cell, matching
+  // the app's other data tables, instead of just a border-top on rows.
+  const gridBorder = 'border:1px solid var(--color-border-tertiary);';
+  const bucketCells = (counts, loc, sub) => AGING_BUCKETS.map(b => {
+    const c = counts[b.label] || 0;
+    const locEsc = loc.replace(/'/g, "\\'");
+    const subArg = sub ? `,'${sub.replace(/'/g, "\\'")}'` : '';
+    return `<td style="text-align:center;padding:6px 10px;${gridBorder}${c ? 'cursor:pointer;color:#1d4ed8;font-weight:600;' : 'color:#cbd5e1;'}" ${c ? `onclick="event.stopPropagation();openLocationSummaryDetail('${locEsc}','${b.label}'${subArg})"` : ''}>${c || 0}</td>`;
+  }).join('');
+
+  let grandTotal = 0;
+  const grandBucketTotals = {};
+  const rowsHtml = locations.map(loc => {
+    const entry = byLoc[loc];
+    const total = rowTotal(entry.total);
+    grandTotal += total;
+    AGING_BUCKETS.forEach(b => { grandBucketTotals[b.label] = (grandBucketTotals[b.label] || 0) + (entry.total[b.label] || 0); });
+    const expanded = expandedLocationSummaryRows.has(loc);
+    const locEsc = loc.replace(/'/g, "\\'");
+    // "Not Specified" sorted to the bottom of each Location's own
+    // sub-rows — real yard names first, the not-yet-filled-in bucket last.
+    const subKeys = Object.keys(entry.subs).sort((a, b) => (a === 'Not Specified') - (b === 'Not Specified') || a.localeCompare(b));
+    const subRows = expanded ? subKeys.map(sub => {
+      const subCounts = entry.subs[sub];
+      return `<tr style="background:var(--color-background-secondary,#f8fafc);">
+        <td style="padding:6px 10px 6px 30px;color:var(--color-text-secondary);position:sticky;left:0;background:var(--color-background-secondary,#f8fafc);z-index:1;font-size:11.5px;${gridBorder}">${sub}</td>
+        ${bucketCells(subCounts, loc, sub)}
+        <td style="text-align:center;padding:6px 10px;font-weight:600;${gridBorder}">${rowTotal(subCounts)}</td>
+      </tr>`;
+    }).join('') : '';
+    return `<tr style="cursor:pointer;" onclick="toggleLocationSummaryRow('${locEsc}')">
+      <td style="padding:6px 10px;font-weight:600;position:sticky;left:0;background:#fff;z-index:1;${gridBorder}"><i class="ti ${expanded ? 'ti-chevron-down' : 'ti-chevron-right'}" style="font-size:11px;" aria-hidden="true"></i> ${loc}</td>
+      ${bucketCells(entry.total, loc)}
+      <td style="text-align:center;padding:6px 10px;font-weight:700;${gridBorder}">${total}</td>
+    </tr>${subRows}`;
+  }).join('');
+
+  const totalRow = `<tr style="background:#1d4ed8;color:#fff;font-weight:700;"><td style="padding:8px 10px;position:sticky;left:0;background:#1d4ed8;z-index:1;${gridBorder}">Total</td>${AGING_BUCKETS.map(b => `<td style="text-align:center;padding:8px 10px;${gridBorder}">${grandBucketTotals[b.label] || 0}</td>`).join('')}<td style="text-align:center;padding:8px 10px;${gridBorder}">${grandTotal}</td></tr>`;
+
+  container.innerHTML = `<table id="locationSummaryTable" style="width:100%;border-collapse:collapse;font-size:12px;">
+    <thead><tr style="background:#1d4ed8;color:#fff;">
+      <th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.04em;position:sticky;left:0;background:#1d4ed8;z-index:2;${gridBorder}">Location</th>
+      ${AGING_BUCKETS.map(b => `<th style="padding:8px 10px;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.04em;${gridBorder}">${b.label}</th>`).join('')}
+      <th style="padding:8px 10px;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.04em;${gridBorder}">Total</th>
+    </tr></thead>
+    <tbody>${rowsHtml}${totalRow}</tbody>
+  </table>`;
+}
+
+// Mirrors copyPurchaseSummaryTable() below — selects the rendered table
+// node and copies it via the browser's own copy command, so it pastes
+// into Excel/Sheets as a real table (not just plain text).
+function copyLocationSummaryTable() {
+  const table = document.getElementById('locationSummaryTable');
+  if (!table) { notify('Nothing to copy yet.', { icon: 'info' }); return; }
+  const range = document.createRange();
+  range.selectNode(table);
+  window.getSelection().removeAllRanges();
+  window.getSelection().addRange(range);
+  try {
+    document.execCommand('copy');
+    notify('Table copied to clipboard.');
+  } catch (e) {
+    notify('Could not copy — please select and copy manually.', { icon: 'error' });
+  }
+  window.getSelection().removeAllRanges();
+}
+
+// Generic copy-a-table-by-id helper — same select-node + execCommand
+// pattern as copyPurchaseSummaryTable()/copyLocationSummaryTable() above,
+// factored out so the two detail-popup Copy buttons (Location Summary
+// bucket detail, Month detail) don't each need their own near-identical
+// function.
+function copyTableById(tableId) {
+  const table = document.getElementById(tableId);
+  if (!table) { notify('Nothing to copy yet.', { icon: 'info' }); return; }
+  const range = document.createRange();
+  range.selectNode(table);
+  window.getSelection().removeAllRanges();
+  window.getSelection().addRange(range);
+  try {
+    document.execCommand('copy');
+    notify('Table copied to clipboard.');
+  } catch (e) {
+    notify('Could not copy — please select and copy manually.', { icon: 'error' });
+  }
+  window.getSelection().removeAllRanges();
+}
+function copyLocationSummaryDetailTable() { copyTableById('lsTable'); }
+function copyMonthModalTable() { copyTableById('monthModalTable'); }
+
+function openLocationSummaryDetail(loc, bucketLabel, subLoc) {
+  const now = new Date();
+  const bucket = AGING_BUCKETS.find(b => b.label === bucketLabel);
+  if (!bucket) return;
+  const rows = _locationSummaryRows.filter(r => {
+    const rloc = normLoc(r.ud_vehicle_parking);
+    if (rloc !== loc) return false;
+    // subLoc is only passed when the click came from an expanded
+    // Sub Location row — plain Location-row clicks (subLoc undefined)
+    // keep showing every vehicle under that Location, same as before.
+    if (subLoc && normSubLoc(r.ud_vehicle_sub_parking) !== subLoc) return false;
+    const days = Math.floor((now - new Date(r.ud_filled_on)) / 86400000);
+    return days >= bucket.min && days <= bucket.max;
+  });
+  document.getElementById('lsModalTitle').textContent = `${loc}${subLoc ? ' → ' + subLoc : ''} — ${bucketLabel} (${rows.length} vehicles)`;
+  document.getElementById('lsTableBody').innerHTML = rows.length ? rows.map(r => {
+    const days = Math.floor((now - new Date(r.ud_filled_on)) / 86400000);
+    return `<tr>
+      <td><span class="lid">${r.lead_no}</span></td>
+      <td style="font-weight:500;">${r.customer_name}</td>
+      <td>${r.phone}</td>
+      <td>${r.val_vehicle_type || '—'}</td>
+      <td>${r.val_vehicle_number || '—'}</td>
+      <td>${r.val_make || ''} ${r.val_model_variant || ''}</td>
+      <td>${days} days</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--color-text-tertiary);padding:20px;">No vehicles.</td></tr>';
+  openModal('locationSummaryModal');
+}
+
+function copyPurchaseSummaryTable() {
+  const table = document.getElementById('psTable');
+  const range = document.createRange();
+  range.selectNode(table);
+  window.getSelection().removeAllRanges();
+  window.getSelection().addRange(range);
+  try {
+    document.execCommand('copy');
+    notify('Table copied to clipboard.');
+  } catch (e) {
+    notify('Could not copy — please select and copy manually.', { icon: 'error' });
+  }
+  window.getSelection().removeAllRanges();
+}
+
+async function showMonthDetails(year, month, label) {
+  const start = new Date(year, month - 1, 1).toISOString();
+  const end = new Date(year, month, 1).toISOString();
+  const { data: leads, error } = await sb.from('rewire_master_data')
+    .select('id, lead_no, customer_name, lead_status, pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name)')
+    .gte('created_at', start).lt('created_at', end)
+    .order('created_at', { ascending: false });
+  if (error) { notify('Error loading month details: ' + error.message, { icon: 'error' }); return; }
+
+  document.getElementById('monthModalTitle').textContent = label + ' — ' + leads.length + ' leads';
+  document.getElementById('monthModalBody').innerHTML = leads.length ? leads.map(l => `<tr>
+    <td><span class="lid" style="cursor:pointer;" onclick="viewLeadDetails('${l.id}')" title="Click for full details">${l.lead_no}</span></td>
+    <td>${l.customer_name}</td>
+    <td>${l.pe ? l.pe.name : '—'}</td>
+    <td><span class="badge badge-na">${l.lead_status}</span></td>
+  </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--color-text-tertiary);padding:16px;">No leads this month</td></tr>';
+  openModal('monthModal');
+}
+
+
+// ------------------------------------------------------------
+// PURCHASE ANALYTICS (Ramvir, Sept 2026) — GVUPL-style category tabs +
+// filter row + KPI cards + monthly chart + PE-grouped table, all on the
+// Dashboard's Purchases tab (#paCard, Sections.html). One fetch of every
+// Purchased vehicle (paRows) via loadPurchaseAnalytics(); every filter
+// change after that just re-filters paRows client-side and re-renders —
+// no re-fetching, so it stays instant even with a few thousand rows.
+//
+// Field mapping (each one confirmed against actual data/RPC logic, not
+// guessed):
+//   Category tabs (All/L/M/N) -> val_vehicle_type, which already stores
+//     exactly 'L (2W)' / 'M (Cars)' / 'N (Commercial Vehicles)' /
+//     'O (Other Vehicles)' — no new field needed.
+//   Purchase Month -> ud_filled_on (Delivery/Unloading date), same field
+//     get_purchase_summary_by_month() already keys off.
+//   Deal Category (Trader COD / Customer COD / No COD) and Deal Type
+//     (Broker / Direct) -> BOTH come from the single field
+//     rewire_master_data.pn_deal_type, whose real stored values look like
+//     "Customer Keeping the COD / Broker Deal" — confirmed by querying
+//     distinct values for Purchased rows (Ramvir corrected an earlier
+//     mistake here where pn_payment_type, i.e. "Post Delivery / Advance
+//     Payment / Omini Pay / Instant Payments" — a different field shown
+//     under its own "Payment Type" column elsewhere in this app — had
+//     been wired to "Deal Type" instead). paParseDealType() below splits
+//     the raw string into the two dropdown dimensions; the table's 3rd
+//     grouping level shows the raw pn_deal_type string as-is, matching
+//     GVUPL's own table exactly.
+//   Lead Status -> fixed to "Purchased" (this whole card only ever loads
+//     overall_status='Purchased' rows — shown as a disabled field for
+//     visual parity with the reference, not a real filter).
+//   CoD Deduction Post 15-Aug (₹) -> per Ramvir's confirmation, a flat
+//     amount subtracted from Net Value for every vehicle whose
+//     ud_filled_on falls after Aug 15 (current year) — NOT stored
+//     anywhere, purely a live what-if figure the viewer types in.
+// ------------------------------------------------------------
+let paRows = [];
+let paCategory = ''; // '' = All, else 'L'/'M'/'N'/'O' (vehicle type, tab-driven only)
+let paChartInstance = null;
+let paExpandedPe = new Set();
+let paRerenderTimer = null, paTableRerenderTimer = null;
+
+// Splits the raw pn_deal_type string (e.g. "Customer Keeping the COD /
+// Broker Deal") into the two independent filter dimensions GVUPL exposes
+// as separate dropdowns. Tolerant of the minor wording inconsistencies
+// actually present in the data (e.g. "Customer Keeping COD" vs "Customer
+// Keeping the COD").
+function paParseDealType(pn) {
+  const s = (pn || '').toLowerCase();
+  let codCategory = 'No COD';
+  if (s.includes('customer')) codCategory = 'Customer COD';
+  else if (s.includes('trader')) codCategory = 'Trader COD';
+  let dealType = 'Unspecified';
+  if (s.includes('broker')) dealType = 'Broker';
+  else if (s.includes('direct')) dealType = 'Direct';
+  return { codCategory, dealType };
+}
+
+// The CoD Deduction number field and the PE search box both fired a full
+// re-render (incl. destroying/recreating the Chart.js instance) on every
+// single keystroke — typing "35000" meant 5 chart rebuilds back to back,
+// which is what made this feel like it was hanging (Ramvir, Sept 2026).
+// Debounced the same way every other live-search field in this app already
+// is (see searchDebounceTimer elsewhere).
+function debouncePaRerender() {
+  clearTimeout(paRerenderTimer);
+  paRerenderTimer = setTimeout(renderPurchaseAnalytics, 300);
+}
+function debouncePaTableRerender() {
+  clearTimeout(paTableRerenderTimer);
+  paTableRerenderTimer = setTimeout(renderPurchaseAnalyticsTable, 300);
+}
+
+const PA_CATEGORY_LABELS = { L: 'L (2W)', M: 'M (Cars)', N: 'N (Commercial Vehicles)', O: 'O (Other Vehicles)' };
+
+// ₹517.7L / ₹1.2Cr style compact formatting — GVUPL's own Net Value card
+// uses this, and nothing in this codebase already provides it.
+function paFormatRupeesCompact(n) {
+  const v = Math.abs(n);
+  const sign = n < 0 ? '-' : '';
+  if (v >= 1e7) return `${sign}₹${(v / 1e7).toFixed(1)}Cr`;
+  if (v >= 1e5) return `${sign}₹${(v / 1e5).toFixed(1)}L`;
+  return `${sign}₹${Math.round(v).toLocaleString('en-IN')}`;
+}
+
+async function loadPurchaseAnalytics() {
+  // val_model_variant (Vehicle Model column) and the Manager join added
+  // Sept 2026 — table now groups Manager > PE > Category > Deal Type >
+  // Lead instead of just PE > Category > Deal Type > Lead.
+  paRows = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_number, val_vehicle_type, val_model_variant, val_kerb_weight_kg, ud_total_offer_price, ud_filled_on, pn_deal_type,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name), manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name), rewire_partners(partner_name)`)
+    .eq('overall_status', 'Purchased').range(from, to))
+    .catch(err => { console.error(err); return []; });
+
+  paCategory = ''; // reset to "All" on every fresh load (role switch, tab re-open)
+  renderPaCategoryTabs();
+
+  // Month filter options — every distinct YYYY-MM present in the data,
+  // newest first.
+  const months = [...new Set(paRows.filter(r => r.ud_filled_on).map(r => r.ud_filled_on.slice(0, 7)))].sort().reverse();
+  const monthSel = document.getElementById('paMonthFilter');
+  if (monthSel) {
+    monthSel.innerHTML = '<option value="">All Months</option>' +
+      months.map(m => `<option value="${m}">${new Date(m + '-01').toLocaleString('en', { month: 'short', year: 'numeric' })}</option>`).join('');
+  }
+
+  // "Deal Category" dropdown = who keeps the CoD (Trader COD / Customer
+  // COD / No COD) and "Deal Type" dropdown = Broker / Direct — both parsed
+  // out of pn_deal_type, per Ramvir's correction (Sept 2026).
+  const codCatCounts = {}, dealTypeCounts = {};
+  paRows.forEach(r => {
+    const { codCategory, dealType } = paParseDealType(r.pn_deal_type);
+    codCatCounts[codCategory] = (codCatCounts[codCategory] || 0) + 1;
+    dealTypeCounts[dealType] = (dealTypeCounts[dealType] || 0) + 1;
+  });
+  const catSel = document.getElementById('paCategoryFilter');
+  if (catSel) {
+    catSel.innerHTML = '<option value="">All Categories</option>' +
+      ['Trader COD', 'Customer COD', 'No COD'].filter(k => codCatCounts[k]).map(k => `<option value="${k}">${k}</option>`).join('');
+    catSel.value = '';
+  }
+  const dealTypeSel = document.getElementById('paDealTypeFilter');
+  if (dealTypeSel) {
+    dealTypeSel.innerHTML = '<option value="">All Types</option>' +
+      ['Broker', 'Direct'].filter(k => dealTypeCounts[k]).map(k => `<option value="${k}">${k}</option>`).join('');
+    dealTypeSel.value = '';
+  }
+
+  const codInput = document.getElementById('paCodDeduction'); if (codInput) codInput.value = 0;
+  const searchInput = document.getElementById('paTableSearch'); if (searchInput) searchInput.value = '';
+  paExpandedPe = new Set();
+  if (typeof paExpandedManager !== 'undefined') paExpandedManager = new Set();
+  if (typeof paExpandedCat !== 'undefined') paExpandedCat = new Set();
+  if (typeof paExpandedDealType !== 'undefined') paExpandedDealType = new Set();
+
+  renderPurchaseAnalytics();
+}
+
+function renderPaCategoryTabs() {
+  const el = document.getElementById('paCategoryTabs');
+  if (!el) return;
+  const counts = { L: 0, M: 0, N: 0, O: 0 };
+  paRows.forEach(r => { const c = (r.val_vehicle_type || '')[0]; if (counts[c] !== undefined) counts[c]++; });
+  const badge = (n) => `<span style="background:var(--color-background-secondary,#f1f5f9);color:var(--color-text-tertiary);border-radius:10px;padding:1px 7px;font-size:10.5px;margin-left:5px;">${n}</span>`;
+  const tabHtml = (key, label, count) => `<div class="tab ${paCategory === key ? 'active' : ''}" onclick="setPaCategory('${key}')">${label}${badge(count)}</div>`;
+  el.innerHTML = tabHtml('', 'All', paRows.length) +
+    Object.keys(PA_CATEGORY_LABELS).filter(k => counts[k] > 0).map(k => tabHtml(k, PA_CATEGORY_LABELS[k], counts[k])).join('');
+}
+
+function setPaCategory(key) {
+  paCategory = key;
+  renderPaCategoryTabs();
+  renderPurchaseAnalytics();
+}
+
+function paFilteredRows() {
+  const month = (document.getElementById('paMonthFilter') || {}).value || '';
+  const dealCategory = (document.getElementById('paCategoryFilter') || {}).value || '';
+  const dealType = (document.getElementById('paDealTypeFilter') || {}).value || '';
+  const cat = paCategory;
+  return paRows.filter(r => {
+    if (cat && (r.val_vehicle_type || '')[0] !== cat) return false;
+    if (month && (!r.ud_filled_on || r.ud_filled_on.slice(0, 7) !== month)) return false;
+    if (dealCategory || dealType) {
+      const parsed = paParseDealType(r.pn_deal_type);
+      if (dealCategory && parsed.codCategory !== dealCategory) return false;
+      if (dealType && parsed.dealType !== dealType) return false;
+    }
+    return true;
+  });
+}
+
+function renderPurchaseAnalytics() {
+
+  const rows = paFilteredRows();
+  const deduction = parseFloat((document.getElementById('paCodDeduction') || {}).value) || 0;
+  const cutoff = new Date(new Date().getFullYear(), 7, 15); // Aug = month index 7, per Ramvir's confirmed per-vehicle deduction rule
+
+  let totalWeight = 0, netValue = 0;
+  rows.forEach(r => {
+    totalWeight += parseFloat(r.val_kerb_weight_kg) || 0;
+    let val = parseFloat(r.ud_total_offer_price) || 0;
+    // Only Trader COD deals actually carry this deduction (Ramvir, Sept
+    // 2026) — Customer COD / No COD vehicles must show ₹0 here regardless
+    // of which Deal Category tab/filter is currently active (including
+    // "All"), since a filtered view mixing categories together was
+    // silently deducting this amount from Customer COD / No COD rows too.
+    if (deduction > 0 && r.ud_filled_on && new Date(r.ud_filled_on) > cutoff
+      && paParseDealType(r.pn_deal_type).codCategory === 'Trader COD') val -= deduction;
+    netValue += val;
+  });
+  const perKg = totalWeight > 0 ? netValue / totalWeight : 0;
+
+  const setText = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  setText('paShowingText', `Showing ${rows.length.toLocaleString('en-IN')} vehicle${rows.length === 1 ? '' : 's'}`);
+  setText('paKpiVehicles', rows.length.toLocaleString('en-IN'));
+  setText('paKpiWeight', (totalWeight / 1000).toFixed(1) + ' MT');
+  setText('paKpiWeightKg', Math.round(totalWeight).toLocaleString('en-IN') + ' kg');
+  setText('paKpiNetValue', paFormatRupeesCompact(netValue));
+  setText('paKpiPerKg', '₹' + perKg.toFixed(1));
+
+  renderPaMonthlyChart(rows);
+  renderPurchaseAnalyticsTable();
+}
+
+function renderPaMonthlyChart(rows) {
+  const canvas = document.getElementById('paMonthlyChart');
+  if (!canvas) return;
+  const byMonth = {};
+  rows.forEach(r => {
+    if (!r.ud_filled_on) return;
+    const m = r.ud_filled_on.slice(0, 7);
+    const cat = (r.val_vehicle_type || '')[0] || 'O';
+    if (!byMonth[m]) byMonth[m] = { L: 0, M: 0, N: 0, O: 0, weight: 0, value: 0 };
+    byMonth[m][cat] = (byMonth[m][cat] || 0) + 1;
+    byMonth[m].weight += parseFloat(r.val_kerb_weight_kg) || 0;
+    byMonth[m].value += parseFloat(r.ud_total_offer_price) || 0;
+  });
+  const months = Object.keys(byMonth).sort();
+
+  if (paChartInstance) { paChartInstance.destroy(); paChartInstance = null; }
+  if (typeof Chart === 'undefined' || !months.length) return;
+
+  const labels = months.map(m => new Date(m + '-01').toLocaleString('en', { month: 'short', year: '2-digit' }));
+  const perKgSeries = months.map(m => byMonth[m].weight > 0 ? +(byMonth[m].value / byMonth[m].weight).toFixed(1) : 0);
+
+  paChartInstance = new Chart(canvas, {
+    data: {
+      labels,
+      datasets: [
+        { type: 'bar', label: 'Cat L', data: months.map(m => byMonth[m].L), backgroundColor: '#3b82f6', yAxisID: 'y' },
+        { type: 'bar', label: 'Cat M', data: months.map(m => byMonth[m].M), backgroundColor: '#ec4899', yAxisID: 'y' },
+        { type: 'bar', label: 'Cat N', data: months.map(m => byMonth[m].N), backgroundColor: '#10b981', yAxisID: 'y' },
+        { type: 'line', label: 'Net ₹/kg', data: perKgSeries, borderColor: '#f59e0b', backgroundColor: '#f59e0b', yAxisID: 'y1', tension: 0.3, pointRadius: 3 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      // animation off + no resize-observer feedback loop (fixed-height
+      // wrapper in Sections.html handles that) — re-rendering on every
+      // filter change should feel instant, not re-animate from zero each
+      // time (Ramvir's "hang" report, Sept 2026).
+      animation: false,
+      resizeDelay: 100,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: false } },
+        y1: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, ticks: { callback: (v) => '₹' + v } },
+      },
+      plugins: { legend: { position: 'top', labels: { boxWidth: 12, font: { size: 10 } } } },
+    },
+  });
+}
+
+// 4-level table (Ramvir, Sept 2026, matching his GVUPL screenshots): PE ->
+// Category (val_vehicle_type) -> Deal Type (raw pn_deal_type string, e.g.
+// "Customer Keeping the COD / Broker Deal" — corrected from an earlier
+// mistake that used pn_payment_type here) -> individual lead.
+// paExpandedPe/paExpandedCat/paExpandedDealType are Sets of keys
+// ("<peName>" / "<peName>||<catKey>" / "<peName>||<catKey>||<dealType>")
+// tracking which rows are currently expanded, so re-rendering after any
+// filter change preserves what the viewer had open.
+let paExpandedCat = new Set();
+let paExpandedDealType = new Set();
+let paExpandedManager = new Set();
+
+const PA_CAT_DOT_COLOR = { L: '#3b82f6', M: '#ec4899', N: '#10b981', O: '#94a3b8' };
+
+function togglePaManager(managerKey) {
+  if (paExpandedManager.has(managerKey)) paExpandedManager.delete(managerKey); else paExpandedManager.add(managerKey);
+  renderPurchaseAnalyticsTable();
+}
+function togglePaPe(peKey) {
+  if (paExpandedPe.has(peKey)) paExpandedPe.delete(peKey); else paExpandedPe.add(peKey);
+  renderPurchaseAnalyticsTable();
+}
+function togglePaCat(catId) {
+  if (paExpandedCat.has(catId)) paExpandedCat.delete(catId); else paExpandedCat.add(catId);
+  renderPurchaseAnalyticsTable();
+}
+function togglePaDealType(dealTypeId) {
+  if (paExpandedDealType.has(dealTypeId)) paExpandedDealType.delete(dealTypeId); else paExpandedDealType.add(dealTypeId);
+  renderPurchaseAnalyticsTable();
+}
+
+// Shared with renderPurchaseAnalytics()'s KPI-card math — same rule,
+// pulled out into one place (Ramvir, Sept 2026 fix) since the Manager/PE/
+// Category/Lead breakdown table below used to just read raw
+// ud_total_offer_price everywhere, completely ignoring the "CoD Deduction
+// Post 15-Aug" field. So the top KPI cards (Net Value, Avg ₹/kg) already
+// reflected the deduction, but every row of this table still showed the
+// pre-deduction figures — the two numbers on screen didn't agree with each
+// other. Rule (unchanged, just centralized): only Trader COD vehicles
+// delivered after Aug 15 (current year) get the flat amount subtracted.
+function paEffectiveOffer(r, deduction, cutoff) {
+  let val = parseFloat(r.ud_total_offer_price) || 0;
+  if (deduction > 0 && r.ud_filled_on && new Date(r.ud_filled_on) > cutoff
+    && paParseDealType(r.pn_deal_type).codCategory === 'Trader COD') val -= deduction;
+  return val;
+}
+
+function paAggregate(list, deduction, cutoff) {
+  const count = list.length;
+  const wt = list.reduce((s, r) => s + (parseFloat(r.val_kerb_weight_kg) || 0), 0);
+  const offer = list.reduce((s, r) => s + paEffectiveOffer(r, deduction, cutoff), 0);
+  return { count, wt, offer, perKg: wt > 0 ? offer / wt : 0 };
+}
+
+// Grouping order (Ramvir, Sept 2026): Manager > PE > Category (L/M/N) >
+// Deal Type > Lead — Manager added as the new top level (previously PE
+// was the top level with no Manager grouping at all). Search still
+// matches on PE name only (unchanged), but now also expands that PE's
+// parent Manager row automatically so a search result isn't hidden
+// inside a collapsed Manager group.
+function renderPurchaseAnalyticsTable() {
+  const tbody = document.getElementById('paTableBody');
+  if (!tbody) return;
+  const rows = paFilteredRows();
+  const search = ((document.getElementById('paTableSearch') || {}).value || '').toLowerCase();
+  // Same deduction + cutoff read as renderPurchaseAnalytics()'s KPI cards —
+  // see paEffectiveOffer()/paAggregate() above.
+  const deduction = parseFloat((document.getElementById('paCodDeduction') || {}).value) || 0;
+  const cutoff = new Date(new Date().getFullYear(), 7, 15);
+
+  const byManager = {};
+  rows.forEach(r => {
+    const managerName = r.manager ? r.manager.name : 'Unassigned';
+    (byManager[managerName] = byManager[managerName] || []).push(r);
+  });
+  // Filter by PE-name search, but keep a Manager group in the list as
+  // long as ANY of its PEs match — the PE-level filtering itself still
+  // happens where byPe is built below.
+  const managerNames = Object.keys(byManager).filter(mgrName => {
+    if (!search) return true;
+    return byManager[mgrName].some(r => (r.pe ? r.pe.name : 'Unassigned').toLowerCase().includes(search));
+  }).sort();
+
+  if (!managerNames.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--color-text-tertiary);padding:16px;">No vehicles match.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = managerNames.map(managerName => {
+    const managerList = byManager[managerName];
+    const managerAgg = paAggregate(managerList, deduction, cutoff);
+    const managerKey = managerName.replace(/'/g, "\\'");
+    // Auto-expand a Manager whose PE search matched, same reasoning as
+    // the comment above — otherwise a search result would be invisible.
+    const managerExpanded = paExpandedManager.has(managerName) || (!!search && managerList.some(r => (r.pe ? r.pe.name : 'Unassigned').toLowerCase().includes(search)));
+
+    let peRowsHtml = '';
+    if (managerExpanded) {
+      const byPe = {};
+      managerList.forEach(r => {
+        const peName = r.pe ? r.pe.name : 'Unassigned';
+        (byPe[peName] = byPe[peName] || []).push(r);
+      });
+      const peNames = Object.keys(byPe).filter(n => !search || n.toLowerCase().includes(search)).sort();
+
+      peRowsHtml = peNames.map(peName => {
+        const list = byPe[peName];
+        const { count, wt, offer, perKg } = paAggregate(list, deduction, cutoff);
+        const peId = managerName + '||' + peName;
+        const peIdEsc = peId.replace(/'/g, "\\'");
+        const peExpanded = paExpandedPe.has(peId);
+
+        let catRowsHtml = '';
+        if (peExpanded) {
+          const byCat = {};
+          list.forEach(r => { const c = (r.val_vehicle_type || '')[0] || 'O'; (byCat[c] = byCat[c] || []).push(r); });
+          catRowsHtml = Object.keys(byCat).sort().map(catKey => {
+            const catList = byCat[catKey];
+            const catAgg = paAggregate(catList, deduction, cutoff);
+            const catId = peId + '||' + catKey;
+            const catExpanded = paExpandedCat.has(catId);
+            const catIdEsc = catId.replace(/'/g, "\\'");
+            const dot = `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${PA_CAT_DOT_COLOR[catKey] || '#94a3b8'};margin-right:6px;"></span>`;
+
+            let dealTypeRowsHtml = '';
+            if (catExpanded) {
+              const byDealType = {};
+              catList.forEach(r => { const dt = (r.pn_deal_type && r.pn_deal_type.trim()) || 'Unspecified'; (byDealType[dt] = byDealType[dt] || []).push(r); });
+              dealTypeRowsHtml = Object.keys(byDealType).sort().map(dealType => {
+                const dtList = byDealType[dealType];
+                const dtAgg = paAggregate(dtList, deduction, cutoff);
+                const dtId = catId + '||' + dealType;
+                const dtExpanded = paExpandedDealType.has(dtId);
+                const dtIdEsc = dtId.replace(/'/g, "\\'");
+
+                const leadRows = dtExpanded ? dtList.map(r => {
+                  const rowOffer = paEffectiveOffer(r, deduction, cutoff);
+                  const rowPerKg = (parseFloat(r.val_kerb_weight_kg) > 0) ? (rowOffer / r.val_kerb_weight_kg).toFixed(1) : '—';
+                  const month = r.ud_filled_on ? new Date(r.ud_filled_on).toLocaleString('en', { month: 'short', year: 'numeric' }) : '—';
+                  const broker = r.rewire_partners ? r.rewire_partners.partner_name : 'Direct';
+                  return `<tr style="background:var(--color-background-secondary,#f8fafc);">
+                    <td style="padding:6px 10px 6px 88px;font-size:11px;color:#2563eb;font-weight:600;">${r.lead_no || '—'}</td>
+                    <td style="padding:6px 10px;font-size:11px;">${r.customer_name || '—'}</td>
+                    <td style="padding:6px 10px;font-size:11px;">${r.val_vehicle_number || '—'}</td>
+                    <td style="padding:6px 10px;font-size:11px;">${r.val_model_variant || '—'}</td>
+                    <td style="padding:6px 10px;font-size:11px;">${broker}</td>
+                    <td style="padding:6px 10px;text-align:center;font-size:11px;">1</td>
+                    <td style="padding:6px 10px;text-align:right;font-size:11px;">${Math.round(r.val_kerb_weight_kg || 0).toLocaleString('en-IN')}</td>
+                    <td style="padding:6px 10px;text-align:right;font-size:11px;">₹${Math.round(rowOffer || 0).toLocaleString('en-IN')}</td>
+                    <td style="padding:6px 10px;text-align:right;font-size:11px;color:#059669;">${rowPerKg}</td>
+                    <td style="padding:6px 10px;font-size:11px;">${month}</td>
+                  </tr>`;
+                }).join('') : '';
+
+                return `<tr style="cursor:pointer;background:var(--color-background-secondary,#f8fafc);border-top:0.5px solid var(--color-border-tertiary);" onclick="togglePaDealType('${dtIdEsc}')">
+                  <td style="padding:7px 10px 7px 68px;font-weight:600;font-size:11.5px;"><i class="ti ${dtExpanded ? 'ti-chevron-down' : 'ti-chevron-right'}" style="font-size:10px;" aria-hidden="true"></i> ${dealType}</td>
+                  <td colspan="3"></td>
+                  <td style="padding:7px 10px;"></td>
+                  <td style="padding:7px 10px;text-align:center;font-size:11.5px;">${dtAgg.count}</td>
+                  <td style="padding:7px 10px;text-align:right;font-size:11.5px;">${Math.round(dtAgg.wt).toLocaleString('en-IN')}</td>
+                  <td style="padding:7px 10px;text-align:right;font-size:11.5px;">₹${Math.round(dtAgg.offer).toLocaleString('en-IN')}</td>
+                  <td style="padding:7px 10px;text-align:right;font-size:11.5px;color:#059669;">${dtAgg.perKg.toFixed(1)}</td>
+                  <td></td>
+                </tr>${leadRows}`;
+              }).join('');
+            }
+
+            return `<tr style="cursor:pointer;background:var(--color-background-secondary,#f8fafc);border-top:0.5px solid var(--color-border-tertiary);" onclick="togglePaCat('${catIdEsc}')">
+              <td style="padding:7px 10px 7px 48px;font-weight:600;font-size:11.5px;"><i class="ti ${catExpanded ? 'ti-chevron-down' : 'ti-chevron-right'}" style="font-size:10px;" aria-hidden="true"></i> ${dot}${PA_CATEGORY_LABELS[catKey] || catKey}</td>
+              <td colspan="3"></td>
+              <td style="padding:7px 10px;"></td>
+              <td style="padding:7px 10px;text-align:center;font-size:11.5px;">${catAgg.count}</td>
+              <td style="padding:7px 10px;text-align:right;font-size:11.5px;">${Math.round(catAgg.wt).toLocaleString('en-IN')}</td>
+              <td style="padding:7px 10px;text-align:right;font-size:11.5px;">₹${Math.round(catAgg.offer).toLocaleString('en-IN')}</td>
+              <td style="padding:7px 10px;text-align:right;font-size:11.5px;color:#059669;">${catAgg.perKg.toFixed(1)}</td>
+              <td></td>
+            </tr>${dealTypeRowsHtml}`;
+          }).join('');
+        }
+
+        return `<tr style="cursor:pointer;background:var(--color-background-secondary,#f8fafc);border-top:0.5px solid var(--color-border-tertiary);" onclick="togglePaPe('${peIdEsc}')">
+          <td style="padding:8px 10px 8px 28px;font-weight:600;"><i class="ti ${peExpanded ? 'ti-chevron-down' : 'ti-chevron-right'}" style="font-size:11px;" aria-hidden="true"></i> ${peName}</td>
+          <td colspan="3"></td>
+          <td style="padding:8px 10px;"></td>
+          <td style="padding:8px 10px;text-align:center;">${count}</td>
+          <td style="padding:8px 10px;text-align:right;">${Math.round(wt).toLocaleString('en-IN')}</td>
+          <td style="padding:8px 10px;text-align:right;">₹${Math.round(offer).toLocaleString('en-IN')}</td>
+          <td style="padding:8px 10px;text-align:right;color:#059669;font-weight:600;">${perKg.toFixed(1)}</td>
+          <td style="padding:8px 10px;"></td>
+        </tr>${catRowsHtml}`;
+      }).join('');
+    }
+
+    return `<tr style="cursor:pointer;border-top:0.5px solid var(--color-border-tertiary);" onclick="togglePaManager('${managerKey}')">
+      <td style="padding:8px 10px;font-weight:700;"><i class="ti ${managerExpanded ? 'ti-chevron-down' : 'ti-chevron-right'}" style="font-size:11px;" aria-hidden="true"></i> ${managerName}</td>
+      <td colspan="3"></td>
+      <td style="padding:8px 10px;"></td>
+      <td style="padding:8px 10px;text-align:center;">${managerAgg.count}</td>
+      <td style="padding:8px 10px;text-align:right;">${Math.round(managerAgg.wt).toLocaleString('en-IN')}</td>
+      <td style="padding:8px 10px;text-align:right;">₹${Math.round(managerAgg.offer).toLocaleString('en-IN')}</td>
+      <td style="padding:8px 10px;text-align:right;color:#059669;font-weight:600;">${managerAgg.perKg.toFixed(1)}</td>
+      <td style="padding:8px 10px;"></td>
+    </tr>${peRowsHtml}`;
+  }).join('');
+}
+
+// Dashboard "Material" tab (Ramvir, Sept 2026) — one card per Material
+// Category showing Available vs Sold counts, sourced the same way the Sale
+// sidebar section computes eligibility (fetchMaterialEligibleLeadsWithMat(),
+// JS-Tracking.html) crossed with rewire_material_sales' per-category status
+// rows (a missing row = still Available, same convention used everywhere
+// else this table is read).
+async function renderDashboardMaterialTab() {
+  const container = document.getElementById('dashMaterialCards');
+  if (!container) return;
+  container.innerHTML = 'Loading…';
+  if (typeof fetchMaterialEligibleLeadsWithMat !== 'function' || typeof MATERIAL_CATEGORIES === 'undefined') {
+    container.innerHTML = '<div style="color:var(--color-text-tertiary);">Material module not loaded.</div>';
+    return;
+  }
+  const leads = await fetchMaterialEligibleLeadsWithMat();
+  // fetchAllRows: a plain select is capped at 1000 rows by PostgREST and this table has ~2000, which undercounted Sold.
+  const allSales = await fetchAllRows((from, to) => sb.from('rewire_material_sales').select('lead_id, category_key, status').range(from, to)).catch(() => []);
+  const soldSet = new Set((allSales || []).filter(s => s.status === 'Sold').map(s => s.lead_id + '||' + s.category_key));
+  const emptySet = new Set((allSales || []).filter(s => s.status === 'Empty').map(s => s.lead_id + '||' + s.category_key));
+
+  container.innerHTML = MATERIAL_CATEGORIES.map(([key, label]) => {
+    const filledLeads = leads.filter(l => typeof isMaterialCategoryFilled === 'function' && isMaterialCategoryFilled(l.mat, key));
+    const sold = filledLeads.filter(l => soldSet.has(l.id + '||' + key)).length;
+    const emptyCnt = filledLeads.filter(l => emptySet.has(l.id + '||' + key)).length;
+    const available = filledLeads.length - sold - emptyCnt;
+    // Ramvir, Sept 2026 — these cards used a 0.5px near-invisible border with
+    // no shadow, so on a white page they read as plain floating text, not
+    // cards ("accha nahi lag raha"). Now: a real 1px border + soft shadow +
+    // a colored top accent strip (indigo, matching the app's brand color) so
+    // each category is a clearly-bounded, distinct block. "Sold" is now red
+    // to match the same Available=green/Sold=red convention already used on
+    // the Sale tab's own Status column, instead of blue (which reads as a
+    // link/neutral color here, not a status).
+    return `<div style="background:#fff;border:1px solid var(--color-border-secondary,#cbd5e1);border-top:3px solid #1d4ed8;border-radius:10px;padding:14px 16px;box-shadow:0 1px 3px rgba(15,23,42,0.06);">
+      <div style="font-size:12.5px;font-weight:700;margin-bottom:12px;color:var(--color-text-primary,#0f172a);">${label}</div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+        <span style="font-size:11px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:.03em;">Available</span>
+        <span style="font-size:18px;font-weight:700;color:#059669;">${available}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;">
+        <span style="font-size:11px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:.03em;">Sold</span>
+        <span style="font-size:18px;font-weight:700;color:#dc2626;">${sold}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// "Detailed Stage Breakdown by PE" drill-down (Ramvir, Sept 2026) — every
+// non-zero count in that table is clickable (see cellAttrs()/cell() above)
+// and opens this popup with the actual leads behind it, plus a "Copy"
+// button so the list can be pasted into WhatsApp/Excel/etc. Pulled via
+// get_pe_stage_breakdown_detail(), which mirrors the exact bucketing logic
+// of get_pe_stage_breakdown() itself so this list can never disagree with
+// the number that was clicked.
+const PE_BUCKET_LABELS = {
+  total: 'Total (All Pending Stages)', val: 'Valuation', pn: 'Price Negotiation', kyc: 'Bank KYC',
+  ud: 'Upload Delivery', vz: 'Verification & Zoho', ma: 'Manager Approval', acc: 'Accessories Check',
+  ha: 'Head Approval', rc: 'RC Tracking (Pending)',
+};
+async function showPeStageDetailPopup(peName, bucketKey, managerFilterStr) {
+  const managerFilter = managerFilterStr || null;
+  Swal.fire({ title: 'Loading…', didOpen: () => Swal.showLoading(), allowOutsideClick: false });
+  const { data, error } = await sb.rpc('get_pe_stage_breakdown_detail', {
+    pe_name_filter: peName, bucket_filter: bucketKey, manager_id_filter: managerFilter,
+  });
+  if (error) { Swal.fire('Error', error.message, 'error'); return; }
+  const rows = data || [];
+  const bucketLabel = PE_BUCKET_LABELS[bucketKey] || bucketKey;
+  const tsvLines = [['Lead No', 'Customer', 'Vehicle No.', 'Phone', 'Stage', 'Payment Type'].join('\t')]
+    .concat(rows.map(r => [r.lead_no, r.customer_name || '', r.val_vehicle_number || '', r.phone || '', r.current_stage, r.pn_payment_type || ''].join('\t')));
+  window._peStageDetailTsv = tsvLines.join('\n');
+  const tableHtml = rows.length
+    ? `<div style="max-height:360px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;text-align:left;">
+          <thead style="position:sticky;top:0;background:#f8fafc;">
+            <tr>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Lead No</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Customer</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Vehicle No.</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Phone</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Payment Type</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(r => `<tr>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;font-weight:600;">${r.lead_no}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.customer_name || '—'}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.val_vehicle_number || '—'}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.phone || '—'}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.pn_payment_type || '—'}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`
+    : '<div style="color:var(--color-text-tertiary);padding:16px;text-align:center;">No leads found.</div>';
+  Swal.fire({
+    title: `${peName} — ${bucketLabel}`,
+    html: `<div style="text-align:left;">
+      <div style="font-size:12px;color:var(--color-text-tertiary);margin-bottom:8px;">${rows.length} lead(s)</div>
+      ${tableHtml}
+    </div>`,
+    width: 640,
+    showCancelButton: true,
+    confirmButtonText: '<i class="ti ti-copy" aria-hidden="true"></i> Copy List',
+    cancelButtonText: 'Close',
+    confirmButtonColor: '#1d4ed8',
+  }).then((result) => {
+    if (result.isConfirmed && window._peStageDetailTsv) {
+      navigator.clipboard.writeText(window._peStageDetailTsv)
+        .then(() => notify('Copied ' + rows.length + ' lead(s) to clipboard.'))
+        .catch(() => notify('Could not copy — clipboard access blocked.', { icon: 'error' }));
+    }
+  });
+}
+
+// "Purchased Vehicle" drill-down (Ramvir, Sept 2026 request) — clicking the
+// count in the Detailed Stage Breakdown table's Purchased Vehicle column
+// lists exactly which vehicles that PE has purchased, scoped to the same
+// Month filter (ud_filled_on) and Manager filter that produced the count,
+// via get_pe_purchased_detail() — mirrors get_pe_lead_counts()'s own
+// "purchased" predicate so this list can never disagree with the number.
+async function showPeVehiclePopup(peName, managerFilterStr, monthFilterStr) {
+  const managerFilter = managerFilterStr || null;
+  const monthFilter = monthFilterStr || null;
+  Swal.fire({ title: 'Loading…', didOpen: () => Swal.showLoading(), allowOutsideClick: false });
+  const { data, error } = await sb.rpc('get_pe_purchased_detail', {
+    pe_name_filter: peName, manager_id_filter: managerFilter, month_filter: monthFilter,
+  });
+  if (error) { Swal.fire('Error', error.message, 'error'); return; }
+  const rows = data || [];
+  const tsvLines = [['Lead No', 'Customer', 'Vehicle No.', 'Make/Model', 'Phone', 'Purchase Date', 'Offer Price'].join('\t')]
+    .concat(rows.map(r => [r.lead_no, r.customer_name || '', r.val_vehicle_number || '', [r.val_make, r.val_model_variant].filter(Boolean).join(' '), r.phone || '', r.ud_filled_on || '', r.pn_total_offer_price || ''].join('\t')));
+  window._peVehicleTsv = tsvLines.join('\n');
+  const tableHtml = rows.length
+    ? `<div style="max-height:360px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;text-align:left;">
+          <thead style="position:sticky;top:0;background:#f8fafc;">
+            <tr>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Lead No</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Customer</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Vehicle No.</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Make/Model</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Purchase Date</th>
+              <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Offer Price</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(r => `<tr>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;font-weight:600;">${r.lead_no}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.customer_name || '—'}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.val_vehicle_number || '—'}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${[r.val_make, r.val_model_variant].filter(Boolean).join(' ') || '—'}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.ud_filled_on ? new Date(r.ud_filled_on).toLocaleDateString('en-IN') : '—'}</td>
+              <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.pn_total_offer_price ? Number(r.pn_total_offer_price).toLocaleString('en-IN') : '—'}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`
+    : '<div style="color:var(--color-text-tertiary);padding:16px;text-align:center;">No purchased vehicles found.</div>';
+  Swal.fire({
+    title: `${peName} — Purchased Vehicles`,
+    html: `<div style="text-align:left;">
+      <div style="font-size:12px;color:var(--color-text-tertiary);margin-bottom:8px;">${rows.length} vehicle(s)</div>
+      ${tableHtml}
+    </div>`,
+    width: 720,
+    showCancelButton: true,
+    confirmButtonText: '<i class="ti ti-copy" aria-hidden="true"></i> Copy List',
+    cancelButtonText: 'Close',
+    confirmButtonColor: '#1d4ed8',
+  }).then((result) => {
+    if (result.isConfirmed && window._peVehicleTsv) {
+      navigator.clipboard.writeText(window._peVehicleTsv)
+        .then(() => notify('Copied ' + rows.length + ' vehicle(s) to clipboard.'))
+        .catch(() => notify('Could not copy — clipboard access blocked.', { icon: 'error' }));
+    }
+  });
+}
+
+</script>

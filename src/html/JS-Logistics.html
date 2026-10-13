@@ -1,0 +1,1108 @@
+<script>
+// ============================================================
+// LOGISTICS MODULE (Ramvir, Oct 2026) — split out of JS-Operations.html,
+// same pattern as JS-Incentive.html / JS-Conveyance.html / JS-CodTrading.html.
+// Contains: (1) Logistics tab + Send to Plant, (2) Transporter Payments / Manifest Bill,
+// (3) Received at Plant mode tabs + manifest receiving. Accessories Check and the
+// RST Pending list stay in JS-Operations.html (shared globals, runtime calls only).
+// ============================================================
+
+// ------------------------------------------------------------
+// LOGISTICS — every delivered vehicle lands here first (ud_status =
+// Complete, logistics_status still empty). Back Office multi-selects
+// vehicles and Sends them to Plant with a Transporter attached; once
+// sent, logistics_status flips to 'Sent to Plant' and the vehicle moves
+// out of this list and into Received at Plant (see that section's query).
+// ------------------------------------------------------------
+let logisticsSelectedIds = new Set();
+
+async function renderLogisticsSection() {
+  initTableFilterBar('logistics', renderLogisticsSection);
+  logisticsSelectedIds = new Set();
+  updateLogisticsSendButtonState();
+  const chkAll = document.getElementById('chkLogisticsAll');
+  if (chkAll) chkAll.checked = false;
+
+  // EVERY delivered vehicle shows here now (Ramvir, Oct 2026) — Sent or
+  // Pending both, with a Status column, instead of dropping off the list
+  // the moment it's dispatched. Reason: vehicles without an updated
+  // delivery photo were quietly piling up in "Received at Plant" with no
+  // single place to see the whole Logistics picture at once. Checkboxes
+  // for already-dispatched rows (logistics_status not null) are disabled
+  // in the render below — a vehicle can only be sent once.
+  // .neq('overall_status','Closed Lost') — a lead found to be a duplicate
+  // (or otherwise closed) after Upload Delivery was already done still has
+  // ud_status='Complete', so without this exclusion it sits here forever
+  // even though the lead itself is dead.
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, phone, val_vehicle_type, val_vehicle_number, val_make,
+      val_model_variant, ud_vehicle_parking, ud_vehicle_sub_parking, ud_filled_on, ud_status, ud_delivery_photo_url, logistics_status, transportation_type, pn_transportation_type, ud_vehicle_amount, ud_cod_amount, ud_vehicle_weight_kg, pn_vehicle_amount, pn_cod_amount, pn_vehicle_weight_kg, rewire_partners(partner_name),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name)`)
+    // (Ramvir, Oct 2026 — correction) — pre-delivery leads show here too: a
+    // vehicle can be physically moved before its Upload Delivery paperwork
+    // is done, so the gate is now Valuation complete (not Delivery
+    // complete). Rows whose delivery isn't done carry a "Delivery pending"
+    // tag in the Status column.
+    .eq('val_status', 'Complete')
+    .neq('overall_status', 'Closed Lost')
+    // Same fix as Location Tracking (renderLocationTrackingSection) —
+    // Scrapped/Reserved/"Scrapped - Provisionally" vehicles are already a
+    // terminal Vehicle Disposal outcome, not something still waiting to be
+    // dispatched to plant. Without this, they inflated this tab's count
+    // (and its Location filter, since that column is really just `city`)
+    // by 443 vehicles that will never actually get a "Send to Plant" click.
+    // Also excluding "Jaipur Plant" itself — ~71 leads from the old bulk
+    // parking-location import already have ud_vehicle_parking='Jaipur
+    // Plant' despite logistics_status still being null (never actually
+    // sent via this tab's own flow); they're already AT the plant, so
+    // asking to "Send to Plant" them here is meaningless — same reasoning
+    // Dashboard's Location Wise Summary already treats a "Jaipur Plant"
+    // vehicle as arrived, not in-transit.
+    // NULL parking must be kept explicitly: a plain NOT IN (...) is NULL (not
+    // true) for rows with no ud_vehicle_parking, silently dropping every
+    // pre-delivery lead (e.g. RJ27CA1140) — Ramvir, Oct 2026.
+    .or('ud_vehicle_parking.is.null,ud_vehicle_parking.not.in.("Scrapped","Scrapped - Provisionally","Reserved","Jaipur Plant")')
+    .order('ud_filled_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const data = filterRowsByTableFilter(rawData || [], 'logistics',
+    l => l.pe ? l.pe.id : null,
+    l => l.manager ? l.manager.id : null,
+    l => l.ud_filled_on ? l.ud_filled_on.slice(0, 10) : null);
+
+  const pendingCountLogistics = (data || []).filter(l => !l.logistics_status).length;
+  document.getElementById('countLogistics').textContent = (data || []).length + ' vehicles · ' + pendingCountLogistics + ' pending dispatch';
+  document.getElementById('badgeLogistics').textContent = pendingCountLogistics;
+  logisticsPageCache = data || [];
+  document.getElementById('tbodyLogistics').innerHTML = (data && data.length) ? data.map(l => {
+    // Status badge — '—'/unsent rows get a live checkbox; 'In Transit'
+    // (dispatched via Logistic Carrier, manifest not yet Paid) and 'Sent to
+    // Plant' (either self-carried, or a Paid manifest) are both locked —
+    // a vehicle can only be sent once (see submitLogisticsSend()).
+    const already = !!l.logistics_status;
+    const statusBadge = l.logistics_status === 'Sent to Plant'
+      ? '<span class="badge badge-q">Sent to Plant</span>'
+      : l.logistics_status === 'In Transit'
+      ? '<span class="badge badge-na">In Transit</span>'
+      : '<span class="badge badge-na" style="opacity:.6;">Pending</span>' + (l.ud_status !== 'Complete' ? ' <span class="badge" style="background:#fef3c7;color:#92400e;">Delivery pending</span>' : '');
+    return `<tr>
+    <td><input type="checkbox" class="chkLogisticsRow" value="${l.id}" ${already ? 'disabled title="Already dispatched"' : ''} onchange="toggleLogisticsRow('${l.id}',this.checked)" /></td>
+    <td data-col="lead_no"><span class="lid">${l.lead_no}</span></td>
+    <td data-col="customer" style="font-weight:500;">${l.customer_name}</td>
+    <td data-col="phone">${l.phone}</td>
+    <td data-col="location">${l.ud_vehicle_parking || '—'}</td>
+    <td data-col="sub_location">${l.ud_vehicle_sub_parking || '—'}</td>
+    <td data-col="vehicle_type">${l.val_vehicle_type || '—'}</td>
+    <td data-col="vehicle_no">${l.val_vehicle_number || '—'}</td>
+    <td data-col="make">${l.val_make || '—'}</td>
+    <td data-col="model">${l.val_model_variant || '—'}</td>
+    <td data-col="partner">${l.rewire_partners ? l.rewire_partners.partner_name : '—'}</td>
+    <td data-col="pe">${l.pe ? l.pe.name : '—'}</td>
+    <td data-col="manager">${l.manager ? l.manager.name : '—'}</td>
+    <td data-col="delivered_on">${l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '—'}</td>
+    <td data-col="status">${statusBadge}</td>
+  </tr>`;
+  }).join('') : '<tr><td colspan="15" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No delivered vehicles yet.</td></tr>';
+  initColumnPicker('logistics', LOGISTICS_COLUMNS, 'logisticsColumnPicker', 'tableLogistics');
+}
+
+let logisticsPageCache = [];
+const LOGISTICS_COLUMNS = [
+  { key: 'lead_no', label: 'Lead No.', get: l => l.lead_no || '' },
+  { key: 'customer', label: 'Customer', get: l => l.customer_name || '' },
+  { key: 'phone', label: 'Phone', get: l => l.phone || '' },
+  { key: 'location', label: 'Location', get: l => l.ud_vehicle_parking || '' },
+  { key: 'sub_location', label: 'Sub Location', get: l => l.ud_vehicle_sub_parking || '' },
+  { key: 'vehicle_type', label: 'Vehicle Type', get: l => l.val_vehicle_type || '' },
+  { key: 'vehicle_no', label: 'Vehicle No.', get: l => l.val_vehicle_number || '' },
+  { key: 'make', label: 'Make', get: l => l.val_make || '' },
+  { key: 'model', label: 'Model', get: l => l.val_model_variant || '' },
+  { key: 'partner', label: 'Partner', get: l => l.rewire_partners ? l.rewire_partners.partner_name : '' },
+  { key: 'pe', label: 'PE', get: l => l.pe ? l.pe.name : '' },
+  { key: 'manager', label: 'Manager', get: l => l.manager ? l.manager.name : '' },
+  { key: 'delivered_on', label: 'Delivered On', get: l => l.ud_filled_on ? new Date(l.ud_filled_on).toLocaleDateString() : '' },
+  { key: 'status', label: 'Status', get: l => (l.logistics_status || 'Pending') + (!l.logistics_status && l.ud_status !== 'Complete' ? ' (Delivery pending)' : '') },
+];
+function exportLogisticsTabExcel() {
+  if (!logisticsPageCache.length) { notify('No vehicles to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('logistics', logisticsPageCache, LOGISTICS_COLUMNS, 'rewire-dms-logistics.xlsx', 'Logistics');
+}
+function toggleLogisticsRow(id, checked) {
+  if (checked) logisticsSelectedIds.add(id); else logisticsSelectedIds.delete(id);
+  updateLogisticsSendButtonState();
+}
+
+function toggleLogisticsSelectAll(checkboxEl) {
+  document.querySelectorAll('.chkLogisticsRow').forEach(el => {
+    if (el.disabled) return; // already-dispatched rows aren't selectable
+    const _tr = el.closest('tr');
+    if (_tr && (_tr.dataset.twColFiltered === '1' || _tr.dataset.twFiltered === '1')) { el.checked = false; logisticsSelectedIds.delete(el.value); return; } // hidden by a filter — Excel-style: only visible rows
+    el.checked = checkboxEl.checked;
+    if (checkboxEl.checked) logisticsSelectedIds.add(el.value); else logisticsSelectedIds.delete(el.value);
+  });
+  updateLogisticsSendButtonState();
+}
+
+function updateLogisticsSendButtonState() {
+  const btn = document.getElementById('btnLogisticsSend');
+  const countEl = document.getElementById('logisticsSelectedCount');
+  if (countEl) countEl.textContent = logisticsSelectedIds.size;
+  if (btn) btn.disabled = logisticsSelectedIds.size === 0;
+}
+
+function openLogisticsSendModal() {
+  if (!logisticsSelectedIds.size) { notify('Select at least one vehicle first.', { icon: 'error' }); return; }
+  document.getElementById('logisticsSendModalSub').textContent = logisticsSelectedIds.size + ' vehicle(s) selected';
+  document.getElementById('logisticsVehicleSendTo').value = '';
+  ['logisticsTransporter', 'logisticsCraneVendor', 'logisticsDriverName', 'logisticsDriverPhone', 'logisticsVehicleNo', 'logisticsOtherDetails', 'logisticsRemarks'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.getElementById('logisticsDispatchDate').value = new Date().toISOString().slice(0, 10);
+  // Pre-pick the mode from Transportation Type (PN/Delivery) when all selected vehicles agree
+  const sel = logisticsPageCache.filter(l => logisticsSelectedIds.has(l.id));
+  const fromLocs = [...new Set(sel.map(l => l.ud_vehicle_parking).filter(Boolean))];
+  document.getElementById('logisticsFromLocation').value = fromLocs.length === 1 ? fromLocs[0] : '';
+  document.getElementById('logisticsToLocation').value = ''; // user picks explicitly — decides Plant vs local move
+  const types = [...new Set(sel.map(l => l.transportation_type || l.pn_transportation_type).filter(Boolean))];
+  const map = { 'Crane': 'Crane', 'Driver': 'Driver', 'Towing': 'Towing', 'Self Customer': 'Self Drop', 'PE Self': 'Self Drop' };
+  const pre = types.length === 1 ? (map[types[0]] || '') : '';
+  document.getElementById('logisticsVehicleSendTo').value = pre;
+  handleLogisticsVehicleSendTo(pre);
+  openModal('logisticsSendModal');
+}
+
+function parseLogisticsTo(label) {
+  const i = (label || '').indexOf(' — ');
+  if (i === -1) return { location: label, sub: null };
+  return { location: label.slice(0, i), sub: label.slice(i + 3) };
+}
+// Crane mode: show the COD calculation (amounts + per-KG rates) of every
+// selected vehicle so the crane decision is made with the numbers in view.
+function renderLogisticsCraneRates() {
+  const rows = logisticsPageCache.filter(l => logisticsSelectedIds.has(l.id));
+  const n = v => (v === null || v === undefined || v === '') ? null : Number(v);
+  const fmt = v => v === null ? '—' : (Math.round(v * 100) / 100).toString();
+  document.getElementById('logisticsCraneRatesBody').innerHTML = rows.map(l => {
+    const veh = n(l.ud_vehicle_amount) ?? n(l.pn_vehicle_amount);
+    const cod = n(l.ud_cod_amount) ?? n(l.pn_cod_amount);
+    const w = n(l.ud_vehicle_weight_kg) ?? n(l.pn_vehicle_weight_kg);
+    return `<tr><td>${l.val_vehicle_number || l.lead_no}</td><td>${fmt(veh)}</td><td>${fmt(cod)}</td><td>${fmt(w)}</td>
+      <td>${w && veh !== null ? fmt(veh / w) : '—'}</td><td>${w && cod !== null ? fmt(cod / w) : '—'}</td></tr>`;
+  }).join('');
+}
+async function submitLogisticsSend() {
+  const mode = document.getElementById('logisticsVehicleSendTo').value.trim();
+  if (!mode) { notify('Please select Transport Mode.', { icon: 'error', title: 'Missing field' }); return; }
+  const val = id => (document.getElementById(id).value || '').trim();
+  const missing = m => notify(m, { icon: 'error', title: 'Missing field' });
+  let transporterName = null, craneVendor = null, driverName = null, driverPhone = null;
+  if (mode === 'Logistic Carrier') {
+    transporterName = val('logisticsTransporter');
+    if (!transporterName) return missing('Please select a Transporter.');
+    if (!isValidMasterValue('transporter', transporterName)) return notify('"' + transporterName + '" is not a registered Transporter. Use "+ Register new" first.', { icon: 'error', title: 'Invalid Transporter' });
+    transporterName = normalizeMasterValue('transporter', transporterName);
+  } else if (mode === 'Crane') {
+    craneVendor = val('logisticsCraneVendor');
+    if (!craneVendor) return missing('Please select the Crane Company.');
+    if (!isValidMasterValue('crane_vendor', craneVendor)) return notify('"' + craneVendor + '" is not a registered Crane vendor.', { icon: 'error', title: 'Invalid Crane Company' });
+    craneVendor = normalizeMasterValue('crane_vendor', craneVendor);
+  } else if (mode === 'Driver') {
+    driverName = val('logisticsDriverName');
+    if (!driverName) return missing('Please enter the Driver Name.');
+    driverPhone = val('logisticsDriverPhone').replace(/\D/g, '').slice(-10);
+    if (driverPhone.length !== 10) return missing('Please enter the Driver\'s 10-digit mobile number (WhatsApp).');
+  }
+  const checkLoc = (id, label) => {
+    let v = val(id);
+    if (!v) { missing('Please select ' + label + '.'); return null; }
+    if (!isValidMasterValue('location', v)) { notify('"' + v + '" is not in the Location master list.', { icon: 'error', title: 'Invalid Location' }); return null; }
+    return normalizeMasterValue('location', v);
+  };
+  const fromLocation = checkLoc('logisticsFromLocation', 'From Location'); if (!fromLocation) return;
+  // To Location is a "Location — Sub-Location" label (see getMasterListValues('logistics_to'))
+  const toRaw = val('logisticsToLocation');
+  if (!toRaw) return missing('Please select To Location.');
+  if (!isValidMasterValue('logistics_to', toRaw)) return notify('"' + toRaw + '" is not a valid To Location for this From Location. Pick from the list.', { icon: 'error', title: 'Invalid To Location' });
+  const toParsed = parseLogisticsTo(normalizeMasterValue('logistics_to', toRaw));
+  const toLocation = toParsed.location, toSub = toParsed.sub;
+
+  const ids = Array.from(logisticsSelectedIds);
+  const selectedVehicles = logisticsPageCache.filter(l => logisticsSelectedIds.has(l.id));
+  const hasVno = ['Logistic Carrier', 'Towing'].includes(mode);
+  const { data: rpcData, error } = await sb.rpc('create_logistics_manifest', {
+    p_lead_ids: ids,
+    p_mode: mode,
+    p_transporter_name: transporterName,
+    p_vehicle_truck_no: hasVno ? (val('logisticsVehicleNo') || null) : null,
+    p_dispatch_date: val('logisticsDispatchDate') || null,
+    p_remarks: val('logisticsRemarks') || null,
+    p_sent_by: currentProfile.id,
+    p_from_location: fromLocation,
+    p_to_location: toLocation,
+    p_crane_vendor: craneVendor,
+    p_driver_name: driverName,
+    p_other_details: hasVno ? (val('logisticsOtherDetails') || null) : null,
+    p_to_sub_location: toSub,
+  });
+  if (error) { notify('Error creating manifest: ' + error.message, { icon: 'error' }); return; }
+  const manifestNo = rpcData && rpcData[0] ? rpcData[0].manifest_no : null;
+  closeModal('logisticsSendModal');
+
+  // ---- Send slip: generated at SUBMIT time, for every mode (Ramvir, Oct 2026) ----
+  // Manifest row (for to_sub_location etc.) + driver mobile, then PDF -> email
+  // (+ WhatsApp hook for Driver mode, see Mail.gs sendManifestDriverWhatsApp_).
+  let mRow = null;
+  if (manifestNo) {
+    const { data: mr } = await sb.from('rewire_logistics_manifests').select('*').eq('manifest_no', manifestNo).maybeSingle();
+    mRow = mr;
+    if (mRow && driverPhone) { await sb.from('rewire_logistics_manifests').update({ driver_phone: driverPhone }).eq('id', mRow.id); mRow.driver_phone = driverPhone; }
+  }
+  const m = mRow || { manifest_no: manifestNo, transport_mode: mode, transporter_name: transporterName, crane_vendor_name: craneVendor, driver_name: driverName, driver_phone: driverPhone,
+    vehicle_truck_no: val('logisticsVehicleNo') || null, dispatch_date: val('logisticsDispatchDate') || null, from_location: fromLocation, to_location: toLocation, to_sub_location: toSub, remarks: val('logisticsRemarks') || null };
+  // The Logistics list query doesn't carry the Delivery-form accessory columns,
+  // so re-read the selected vehicles with them (MANIFEST_VEH_SELECT) — without
+  // this the slip printed "None" for every vehicle at send time.
+  let slipVehicles = selectedVehicles;
+  try {
+    const { data: fullVs } = await sb.from('rewire_master_data').select(MANIFEST_VEH_SELECT).in('id', ids);
+    if (fullVs && fullVs.length) {
+      const byId = {}; fullVs.forEach(v => { byId[v.id] = v; });
+      slipVehicles = selectedVehicles.map(v => ({ ...v, ...(byId[v.id] || {}) }));
+    }
+  } catch (e) { console.error('Slip accessory reload failed', e); }
+  const slipHtml = buildManifestSlipHtml('send', m, slipVehicles);
+  if (manifestNo) {
+    google.script.run
+      .withSuccessHandler(async (res) => {
+        if (mRow) await sb.from('rewire_logistics_manifests').update({ request_email_sent_on: new Date().toISOString() }).eq('id', mRow.id);
+        const wa = res && res.whatsapp;
+        if (driverPhone && wa && wa.ok === false) notify('Slip emailed. Driver WhatsApp not sent: ' + (wa.reason || 'not configured'), { icon: 'info' });
+        else notify('Slip emailed to Ramvir' + (driverPhone ? ' and sent to the driver on WhatsApp.' : '.'));
+      })
+      .withFailureHandler(err => notify('Manifest created, but slip email failed: ' + (err && err.message ? err.message : err), { icon: 'error' }))
+      .sendManifestRequestEmail({
+        manifestNo, mode, html: slipHtml, subjectExtra: manifestCarrierLabel(m), driverName, driverPhone,
+        from: fromLocation, to: manifestRouteTo(m), vehicles: selectedVehicles.map(v => v.val_vehicle_number || v.lead_no).join(', '),
+      });
+  }
+  await renderLogisticsSection();
+  const r = await Swal.fire({ icon: 'success', title: 'Manifest ' + (manifestNo || '') + ' created',
+    text: ids.length + ' vehicle(s) ' + (mode === 'Self Drop' ? 'received.' : 'in transit.') + ' Send slip is being emailed.',
+    showCancelButton: true, confirmButtonText: 'Print Send Slip', cancelButtonText: 'Close' });
+  if (r.isConfirmed) openManifestPrintWindow(slipHtml, manifestNo);
+}
+
+// Accessories column on the Send Slip/popup (Ramvir, Oct 2026): if the Delivery form is filled
+// (ud_status set) list the accessories the PE marked as present; otherwise "N/A".
+function manifestDeliveryAccessories(v) {
+  if (!v || !v.ud_status) return 'N/A';
+  const items = [];
+  RECEIPT_REPORT_ITEMS.forEach(([label, udKey, , , type]) => {
+    const x = v[udKey];
+    if (type === 'yesno') { if (String(x || '').toLowerCase() === 'yes') items.push(label); }
+    else if (Number(x) > 0) items.push(label + ' (' + Number(x) + ')');
+  });
+  return items.length ? items.join(', ') : 'None';
+}
+function manifestRouteTo(m) { return (m.to_location || '—') + (m.to_sub_location ? ' — ' + m.to_sub_location : ''); }
+function manifestCarrierLabel(m) {
+  const mode = m.transport_mode || 'Logistic Carrier';
+  if (mode === 'Crane') return m.crane_vendor_name || '—';
+  if (mode === 'Driver') return (m.driver_name || '—') + (m.driver_phone ? ' (' + m.driver_phone + ')' : '');
+  if (mode === 'Self Drop') return 'Self (Customer drop)';
+  return m.transporter_name || '—';
+}
+
+// One slip builder for BOTH PDFs of a manifest (Ramvir, Oct 2026):
+//   'send'    -> generated when the Transportation Request is raised
+//   'receipt' -> generated after Vehicle Receiving (accessories present/shortage)
+function buildManifestSlipHtml(kind, m, vehicles) {
+  const isReceipt = kind === 'receipt';
+  const rowsHtml = (vehicles || []).map((v, i) => {
+    const common = `<td>${i + 1}</td><td>${v.lead_no || ''}</td><td>${v.val_vehicle_number || '—'}</td><td>${[v.val_make, v.val_model_variant].filter(Boolean).join(' ') || '—'}</td>`;
+    if (!isReceipt) return `<tr>${common}<td>${manifestDeliveryAccessories(v)}</td></tr>`;
+    const s = vehicleAccessorySummary(v);
+    return `<tr>${common}<td>${s.present.join(', ') || '—'}</td><td>${s.shortage.length ? '<b>' + s.shortage.join(', ') + '</b>' : 'No shortage'}</td></tr>`;
+  }).join('');
+  const head = isReceipt
+    ? '<tr><th>Sr.</th><th>Lead No.</th><th>Vehicle No.</th><th>Make/Model</th><th>Accessories Present</th><th>Shortage</th></tr>'
+    : '<tr><th>Sr.</th><th>Lead No.</th><th>Vehicle No.</th><th>Make/Model</th><th>Accessories (Delivery Form)</th></tr>';
+  const mode = m.transport_mode || 'Logistic Carrier';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${m.manifest_no} — ${isReceipt ? 'Receiving' : 'Send'} Slip</title><style>
+    body { font-family: Arial, Helvetica, sans-serif; padding: 24px; color:#111; }
+    h2, h3 { margin: 4px 0; text-align:center; }
+    .addr { text-align:center; font-size:11px; margin-bottom:4px; }
+    .meta { display:flex; justify-content:space-between; margin: 10px 0; font-size:13px; flex-wrap:wrap; gap:4px 16px; }
+    table { width:100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #333; padding: 6px 8px; font-size:12px; text-align:left; vertical-align:top; }
+  </style></head><body>
+    <h2>Ganganagar Vaahan Udyog Pvt. Ltd.</h2>
+    <div class="addr">Khasra No 252, Tehsil Mozamabad, Village Nasnoda, Dudu, Nasnoda-303007<br/>Email id : accounts.rewire@gnmotors.net</div>
+    <h3>${isReceipt ? 'Vehicle Receiving Slip' : 'Transportation Request — Send Slip'}</h3>
+    <div class="meta"><div>Manifest No. : <b>${m.manifest_no}</b></div><div>Dispatch Date : ${m.dispatch_date || '—'}</div></div>
+    <div class="meta"><div>Transport Mode : ${mode}</div><div>${mode === 'Crane' ? 'Crane Company' : (mode === 'Driver' ? 'Driver' : 'Transporter')} : ${manifestCarrierLabel(m)}</div></div>
+    <div class="meta"><div>Vehicle/Truck No. : ${m.vehicle_truck_no || '—'}</div><div>Total Vehicles : ${(vehicles || []).length}</div></div>
+    <div class="meta"><div>From : ${m.from_location || '—'}</div><div>${isReceipt ? 'Received At : ' + (m.unload_location || manifestRouteTo(m)) : 'To : ' + manifestRouteTo(m)}</div></div>
+    ${m.remarks && !isReceipt ? `<div class="meta"><div>Remarks : ${m.remarks}</div></div>` : ''}
+    <table><thead>${head}</thead><tbody>${rowsHtml}</tbody></table>
+  </body></html>`;
+}
+function openManifestPrintWindow(html, title) {
+  const win = window.open('', '_blank', 'width=800,height=850');
+  if (!win) { notify('Popup blocked — please allow popups for this site to print.', { icon: 'error' }); return; }
+  win.document.open(); win.document.write(html); win.document.close();
+  setTimeout(() => { win.focus(); win.print(); }, 300);
+}
+function printManifestSendSlip(manifestId) {
+  const m = logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  openManifestPrintWindow(buildManifestSlipHtml('send', m, m._vehicles), m.manifest_no);
+}
+function printManifestReceiptReport(manifestId) {
+  const m = logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  openManifestPrintWindow(buildManifestSlipHtml('receipt', m, m._vehicles), m.manifest_no);
+}
+// The two PDF buttons every manifest row carries (Send slip / Receiving slip)
+function manifestPdfButtons(m) {
+  const rec = manifestReceiptReady(m);
+  return `<button class="ab ab-form" onclick="printManifestSendSlip('${m.id}')" title="Send slip (generated at request time)"><i class="ti ti-file-text" style="font-size:11px;" aria-hidden="true"></i> Send Slip</button>
+    <button class="ab ab-form" ${rec ? '' : 'disabled style="opacity:.5;cursor:not-allowed;"'} onclick="printManifestReceiptReport('${m.id}')" title="${rec ? 'Receiving slip — accessories present / shortage' : 'Available once every vehicle is received and its accessories check is done'}"><i class="ti ti-file-check" style="font-size:11px;" aria-hidden="true"></i> Receiving Slip</button>`;
+}
+// Re-render whichever manifest screen is currently open (after bill / amount / payment / yard-receiving saves)
+async function refreshManifestViews() {
+  const vis = id => { const el = document.getElementById(id); return el && el.style.display !== 'none'; };
+  if (vis('section-logistics-payments')) await renderLogisticsPaymentsSection();
+  if (vis('section-receivedplant')) { await loadPlantManifests(); renderPlantModeRows(); }
+}
+function manifestFileLink(url, label) {
+  return url && isRealFileUrl(url) ? `<a href="javascript:void(0)" onclick="viewAccessoryPhoto('${url}','${label}')" style="color:#1d4ed8;font-size:11px;text-decoration:underline;">View</a>` : '—';
+}
+// ------------------------------------------------------------
+// LOGISTICS PAYMENTS — one row per MANIFEST ("Ek Manifest = Ek Bill").
+// Tabs (Ramvir, Oct 2026): Logistic Carrier · Crane (QR) · Driver / Towing · Archive.
+//   LC / Crane : Upload Bill (Vehicle Receiving) -> Send to Payment / Pay via QR -> UTR -> Archive
+//   Driver/Towing : Head's Approved Amount (Vehicle Receiving) -> select rows ->
+//                   Send to Payment (ONE sheet row per driver, total amount) -> UTR -> Archive
+// ------------------------------------------------------------
+let logisticsManifestsCache = [];
+let logisticsPayMode = 'Logistic Carrier';   // 'Logistic Carrier' | 'Crane' | 'DT' | 'Archive'
+const DT_MODES = ['Driver', 'Towing'];
+const dtSelectedIds = new Set();
+const LOGISTICS_PAY_THEAD = {
+  'Logistic Carrier': ['Manifest No.', 'Transporter', 'Vehicle/Truck No.', 'Dispatch Date', 'From', 'To', 'Vehicles', 'Receiving', 'Yard Receiving', 'Bill Amount (₹)', 'Bill No.', 'Bill', 'Debit Total (₹)', 'Final Amount (₹)', 'Payment Status', 'Action'],
+  'Crane': ['Manifest No.', 'Crane Company', 'Vehicle/Truck No.', 'Dispatch Date', 'From', 'To', 'Vehicles', 'Receiving', 'Yard Receiving', 'Bill Amount (₹)', 'Bill No.', 'Bill', 'Debit Total (₹)', 'Final Amount (₹)', 'Payment Status', 'Action'],
+  'DT': ['', 'Manifest No.', 'Mode', 'Driver / Towing', 'Mobile', 'Dispatch Date', 'From', 'To', 'Vehicles', 'Receiving', 'Yard Receiving', 'Approved Amount (₹)', 'Payment Status', 'Action'],
+  'Archive': ['Manifest No.', 'Mode', 'Carrier / Driver', 'Dispatch Date', 'From', 'To', 'Vehicles', 'Bill No.', 'Bill', 'Amount Paid (₹)', 'UTR No.', 'Paid On', 'PDFs'],
+};
+function showLogisticsPayTab(mode) {
+  logisticsPayMode = mode;
+  dtSelectedIds.clear();
+  [['lc', 'Logistic Carrier'], ['crane', 'Crane'], ['driver', 'DT'], ['archive', 'Archive']].forEach(([k, m]) => {
+    const el = document.getElementById('paynav-' + k); if (el) el.classList.toggle('active', m === mode);
+  });
+  renderLogisticsPaymentsSection();
+}
+async function renderLogisticsPaymentsSection() {
+  try { await renderLogisticsPaymentsSectionImpl(); }
+  catch (e) {
+    console.error('Logistics Payments render failed', e);
+    const tb = document.getElementById('tbodyLogisticsPayments');
+    if (tb) tb.innerHTML = '<tr><td colspan="16" style="padding:24px;color:#b91c1c;">Could not load Logistics Payments: ' + (e && e.message ? e.message : e) + '</td></tr>';
+  }
+}
+async function renderLogisticsPaymentsSectionImpl() {
+  initTableFilterBar('logisticspayments', renderLogisticsPaymentsSection);
+  // Every manifest ever created — accumulates indefinitely, paginated defensively.
+  const manifests = await fetchAllRows((from, to) => sb.from('rewire_logistics_manifests')
+    .select('*').order('created_at', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+
+  // Member vehicles of every manifest, fetched as one paginated table +
+  // client-side grouping (NOT .in('logistics_manifest_id', ids)) — avoids "URL too long".
+  const memberLeads = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_number, val_make, val_model_variant, ud_status, ud_delivery_photo_url, logistics_manifest_id, logistics_received_on,
+      val_spare_wheel, ud_spare_wheel, val_stereo, ud_stereo, val_speakers, ud_speakers, val_tool_kit, ud_tool_kit, val_battery, ud_battery, val_alloy_wheel, ud_alloy_wheel,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name), manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name)`)
+    .not('logistics_manifest_id', 'is', null).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const leadsByManifest = {};
+  (memberLeads || []).forEach(l => { (leadsByManifest[l.logistics_manifest_id] = leadsByManifest[l.logistics_manifest_id] || []).push(l); });
+
+  const receipts = await fetchAllRows((from, to) => sb.from('rewire_vehicle_receipt').select('lead_id, plant_debit_amount, plant_other_debit_amount, plant_spare_wheel, plant_stereo, plant_speakers, plant_tool_kit, plant_battery, plant_alloy_wheel').range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const receiptByLead = {};
+  (receipts || []).forEach(r => { receiptByLead[r.lead_id] = r; });
+  Object.keys(leadsByManifest).forEach(k => leadsByManifest[k].forEach(v => { v._receipt = receiptByLead[v.id] || null; }));
+
+  // Cache keeps EVERY mode so row actions / PDFs can look any manifest up.
+  logisticsManifestsCache = (manifests || []).map(m => ({ ...m, _vehicles: leadsByManifest[m.id] || [] }));
+  const modeOf = m => m.transport_mode || 'Logistic Carrier';
+  let scope;
+  if (logisticsPayMode === 'Archive') scope = logisticsManifestsCache.filter(m => m.payment_status === 'Paid');
+  else if (logisticsPayMode === 'DT') scope = logisticsManifestsCache.filter(m => DT_MODES.includes(modeOf(m)) && m.payment_status !== 'Paid');
+  else scope = logisticsManifestsCache.filter(m => modeOf(m) === logisticsPayMode && m.payment_status !== 'Paid');
+  const data = filterRowsByTableFilter(scope, 'logisticspayments',
+    l => (l._vehicles[0] && l._vehicles[0].pe) ? l._vehicles[0].pe.id : null,
+    l => (l._vehicles[0] && l._vehicles[0].manager) ? l._vehicles[0].manager.id : null,
+    l => l.dispatch_date);
+
+  document.getElementById('countLogisticsPayments').textContent = data.length + ' manifest(s)' + (logisticsPayMode === 'Archive' ? ' · paid' : '');
+  const th = LOGISTICS_PAY_THEAD[logisticsPayMode];
+  document.getElementById('theadLogisticsPayments').innerHTML = '<tr>' + th.map(h => h === '' ? '<th><input type="checkbox" onchange="toggleDtSelectAll(this)" title="Select all"></th>' : '<th>' + h + '</th>').join('') + '</tr>';
+  const sendBtn = document.getElementById('btnDtSendPayment');
+  if (sendBtn) sendBtn.style.display = logisticsPayMode === 'DT' ? '' : 'none';
+  const cols = th.length;
+  const empty = `<tr><td colspan="${cols}" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">Nothing here.</td></tr>`;
+  const tb = document.getElementById('tbodyLogisticsPayments');
+  if (logisticsPayMode === 'DT') { tb.innerHTML = data.length ? data.map(dtRowHtml).join('') : empty; updateDtSendButton(); return; }
+  if (logisticsPayMode === 'Archive') { tb.innerHTML = data.length ? data.map(archiveRowHtml).join('') : empty; return; }
+  const isCrane = logisticsPayMode === 'Crane';
+  tb.innerHTML = data.length ? data.map(m => {
+    const billed = m.bill_total_amount != null;
+    const debitTotal = billed ? (Number(m.bill_deduction_amount) || 0) + (Number(m.bill_other_deduction) || 0) + (Number(m.bill_tds_amount) || 0) : manifestPlantDebit(m);
+    const finalAmount = billed ? Number(m.bill_total_amount) : null;
+    const vehicleList = m._vehicles.map(v => v.lead_no).join(', ');
+    const billReady = m.payment_status === 'Bill Uploaded';
+    const needBill = 'title="Upload the bill first (Vehicle Receiving → Upload Bill)" disabled style="opacity:.5;cursor:not-allowed;"';
+    const st = plantManifestState(m);
+    return `<tr>
+    <td><span class="lid" style="cursor:pointer;" onclick="showManifestDetailsPopup('${m.id}')" title="View details">${m.manifest_no}</span></td>
+    <td style="font-weight:500;">${(isCrane ? m.crane_vendor_name : m.transporter_name) || '—'}</td>
+    <td>${m.vehicle_truck_no || '—'}</td>
+    <td>${m.dispatch_date || '—'}</td>
+    <td>${m.from_location || '—'}</td><td>${manifestRouteTo(m)}</td>
+    <td title="${vehicleList}">${m._vehicles.length} vehicle(s)</td>
+    <td>${m.receiving_generated_on ? '<span class="badge badge-q">Generated</span>' : st.rec + ' / ' + st.n + ' received'}</td>
+    <td>${manifestFileLink(m.yard_receiving_url, 'Yard Receiving')}</td>
+    <td title="${billed ? 'Basic ' + m.bill_basic_amount + ' + GST ' + m.bill_gst_amount : ''}">${m.bill_basic_amount ? '₹' + m.bill_basic_amount : (m.bill_amount ? '₹' + m.bill_amount : '—')}</td>
+    <td>${m.bill_no || '—'}</td>
+    <td>${manifestFileLink(m.bill_url, 'Transporter Bill')}</td>
+    <td>${debitTotal ? '₹' + debitTotal : '—'}</td>
+    <td style="font-weight:500;">${finalAmount !== null ? '₹' + finalAmount : '—'}</td>
+    <td><span class="badge ${m.payment_status === 'Paid' ? 'badge-q' : 'badge-na'}">${m.payment_status || 'Pending'}${m.utr_no ? ' · ' + m.utr_no : ''}</span></td>
+    <td style="display:flex;gap:4px;flex-wrap:wrap;">
+      ${manifestPdfButtons(m)}
+      ${(!m.payment_status || m.payment_status === 'Pending' || m.payment_status === 'Bill Uploaded')
+        ? (m.receiving_generated_on
+          ? `<button class="ab ab-form" style="background:#059669;color:#fff;" onclick="openMarkManifestPaidModal('${m.id}')"><i class="ti ti-receipt" style="font-size:11px;" aria-hidden="true"></i> ${billed ? 'Edit Bill' : 'Upload Bill'}</button>`
+          : `<button class="ab ab-form" disabled style="opacity:.5;cursor:not-allowed;" title="Available once Receiving is generated in Vehicle Receiving"><i class="ti ti-receipt" style="font-size:11px;" aria-hidden="true"></i> Upload Bill</button>`) : ''}
+      ${isCrane && (m.payment_status === 'Pending' || !m.payment_status || billReady) ? `<button class="ab ab-form" ${billReady ? 'style="background:#1d4ed8;color:#fff;"' : needBill} onclick="payManifestViaQr('${m.id}')"><i class="ti ti-qrcode" style="font-size:11px;" aria-hidden="true"></i> Pay via QR</button>` : ''}
+      ${!isCrane && (m.payment_status === 'Pending' || !m.payment_status || billReady) ? `<button class="ab ab-form" ${billReady ? 'style="background:#1d4ed8;color:#fff;"' : needBill} onclick="sendManifestToPayment('${m.id}')"><i class="ti ti-send" style="font-size:11px;" aria-hidden="true"></i> Send to Payment</button>` : ''}
+      ${!isCrane && m.payment_status === 'Sent to Payment' ? `<button class="ab ab-form" style="background:#059669;color:#fff;" onclick="enterManifestUtr('${m.id}')"><i class="ti ti-check" style="font-size:11px;" aria-hidden="true"></i> Enter UTR</button>` : ''}
+    </td>
+  </tr>`;
+  }).join('') : empty;
+}
+
+// ---- Driver / Towing tab ----
+function dtRowHtml(m) {
+  const st = plantManifestState(m);
+  const hasAmt = m.driver_amount != null;
+  const sent = m.payment_status === 'Sent to Payment';
+  const selectable = hasAmt && !sent;
+  return `<tr>
+    <td><input type="checkbox" class="chkDtRow" value="${m.id}" ${selectable ? '' : 'disabled'} ${dtSelectedIds.has(m.id) ? 'checked' : ''} onchange="toggleDtRow('${m.id}', this.checked)" title="${selectable ? '' : (sent ? 'Already sent to payment' : 'Head must set the Approved Amount first')}"></td>
+    <td><span class="lid" style="cursor:pointer;" onclick="showManifestDetailsPopup('${m.id}')">${m.manifest_no}</span></td>
+    <td>${m.transport_mode}</td>
+    <td style="font-weight:500;">${m.driver_name || m.transporter_name || '—'}</td>
+    <td>${m.driver_phone || '—'}</td>
+    <td>${m.dispatch_date || '—'}</td><td>${m.from_location || '—'}</td><td>${manifestRouteTo(m)}</td>
+    <td>${st.n} vehicle(s)</td>
+    <td>${m.receiving_generated_on ? '<span class="badge badge-q">Generated</span>' : st.rec + ' / ' + st.n + ' received'}</td>
+    <td>${manifestFileLink(m.yard_receiving_url, 'Yard Receiving')}</td>
+    <td style="font-weight:500;">${hasAmt ? '₹' + m.driver_amount : '—'}</td>
+    <td><span class="badge ${hasAmt ? 'badge-q' : 'badge-na'}">${m.payment_status || 'Pending'}${m.payment_batch_id ? ' · ' + m.payment_batch_id : ''}</span></td>
+    <td style="display:flex;gap:4px;flex-wrap:wrap;">${manifestPdfButtons(m)}
+      ${sent ? `<button class="ab ab-form" style="background:#059669;color:#fff;" onclick="enterDriverBatchUtr('${m.payment_batch_id}')"><i class="ti ti-check" style="font-size:11px;" aria-hidden="true"></i> Enter UTR</button>` : ''}
+    </td></tr>`;
+}
+function toggleDtRow(id, checked) { if (checked) dtSelectedIds.add(id); else dtSelectedIds.delete(id); updateDtSendButton(); }
+function toggleDtSelectAll(master) {
+  document.querySelectorAll('.chkDtRow').forEach(el => {
+    if (el.disabled) return;
+    const tr = el.closest('tr');
+    if (tr && (tr.dataset.twColFiltered === '1' || tr.dataset.twFiltered === '1')) { el.checked = false; dtSelectedIds.delete(el.value); return; }
+    el.checked = master.checked;
+    if (master.checked) dtSelectedIds.add(el.value); else dtSelectedIds.delete(el.value);
+  });
+  updateDtSendButton();
+}
+function updateDtSendButton() {
+  const btn = document.getElementById('btnDtSendPayment'); const c = document.getElementById('dtSelectedCount');
+  if (c) c.textContent = dtSelectedIds.size;
+  if (btn) btn.disabled = dtSelectedIds.size === 0;
+}
+// One sheet row PER DRIVER with the total of all their selected manifests (Ramvir, Oct 2026).
+function buildDriverBatchCsv(rows) {
+  const q = v => '"' + String(v === null || v === undefined ? '' : v).replace(/"/g, '""') + '"';
+  const header = ['Driver / Towing Name', 'Mobile', 'Mode', 'No. of Manifests', 'Manifest Nos.', 'No. of Vehicles', 'Total Amount (INR)'];
+  const lines = rows.map(r => [r.name, r.phone, r.modes.join('/'), r.manifests.length, r.manifests.join(' | '), r.vehicles, r.total].map(q).join(','));
+  return [header.map(q).join(','), ...lines].join('\r\n');
+}
+async function sendDriverBatchToPayment() {
+  const sel = logisticsManifestsCache.filter(m => dtSelectedIds.has(m.id));
+  if (!sel.length) return;
+  if (sel.some(m => m.driver_amount == null || m.payment_status === 'Sent to Payment' || m.payment_status === 'Paid')) { notify('Only rows with an Approved Amount (and not already sent) can be sent.', { icon: 'error' }); return; }
+  const groups = {};
+  sel.forEach(m => {
+    const name = (m.driver_name || m.transporter_name || '—').trim(); const phone = (m.driver_phone || '').trim();
+    const key = name.toLowerCase() + '|' + phone;
+    const g = groups[key] = groups[key] || { name, phone, modes: [], manifests: [], vehicles: 0, total: 0 };
+    if (!g.modes.includes(m.transport_mode)) g.modes.push(m.transport_mode);
+    g.manifests.push(m.manifest_no); g.vehicles += m._vehicles.length; g.total += Number(m.driver_amount) || 0;
+  });
+  const rows = Object.values(groups);
+  const grand = rows.reduce((s, r) => s + r.total, 0);
+  const ok = await confirmDialog('Send ' + sel.length + ' manifest(s) for ' + rows.length + ' driver(s) — total ₹' + grand + ' — to the cashier? (one row per driver)');
+  if (!ok) return;
+  const batchId = 'DRV-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '-' + String(Date.now()).slice(-4);
+  const csvContent = buildDriverBatchCsv(rows);
+  await new Promise(resolve => {
+    google.script.run
+      .withSuccessHandler(async () => {
+        const { error } = await sb.from('rewire_logistics_manifests').update({ payment_status: 'Sent to Payment', payment_batch_id: batchId, sent_to_payment_on: new Date().toISOString(), sent_to_payment_by: currentProfile.id }).in('id', sel.map(m => m.id));
+        if (error) notify('Email sent, but status update failed: ' + error.message, { icon: 'error' });
+        else notify('Sent to cashier (' + batchId + '). Waiting for UTR.');
+        dtSelectedIds.clear(); await renderLogisticsPaymentsSection(); resolve();
+      })
+      .withFailureHandler(err => { notify('Failed to send email: ' + err.message, { icon: 'error' }); resolve(); })
+      .sendManifestPaymentEmail({ csvContent, manifestNo: 'DRIVER/TOWING BATCH ' + batchId, transporter: rows.length + ' driver(s)', amount: grand, billNo: '—', senderName: currentProfile ? currentProfile.name : '' });
+  });
+}
+async function enterDriverBatchUtr(batchId) {
+  if (!batchId) return;
+  const r = await Swal.fire({ title: 'Enter UTR / RTGS No.', text: 'Batch ' + batchId + ' — applies to every manifest in this batch', input: 'text', inputPlaceholder: 'UTR number', showCancelButton: true, confirmButtonText: 'Mark Paid',
+    inputValidator: v => (!v || !v.trim()) ? 'UTR is required' : null });
+  if (!r.isConfirmed) return;
+  const { error } = await sb.from('rewire_logistics_manifests').update({ utr_no: r.value.trim(), payment_status: 'Paid', paid_by: currentProfile.id, paid_on: new Date().toISOString() }).eq('payment_batch_id', batchId);
+  if (error) { notify('Error: ' + error.message, { icon: 'error' }); return; }
+  notify('Batch ' + batchId + ' marked Paid — moved to Archive.');
+  await renderLogisticsPaymentsSection();
+}
+
+// ---- Archive tab ----
+function archiveRowHtml(m) {
+  const amt = m.bill_total_amount != null ? m.bill_total_amount : m.driver_amount;
+  return `<tr>
+    <td><span class="lid" style="cursor:pointer;" onclick="showManifestDetailsPopup('${m.id}')">${m.manifest_no}</span></td>
+    <td>${m.transport_mode || 'Logistic Carrier'}</td>
+    <td style="font-weight:500;">${manifestCarrierLabel(m)}</td>
+    <td>${m.dispatch_date || '—'}</td><td>${m.from_location || '—'}</td><td>${manifestRouteTo(m)}</td>
+    <td>${m._vehicles.length} vehicle(s)</td>
+    <td>${m.bill_no || '—'}</td><td>${manifestFileLink(m.bill_url, 'Transporter Bill')}</td>
+    <td style="font-weight:500;">${amt != null ? '₹' + amt : '—'}</td>
+    <td>${m.utr_no || '—'}</td><td>${m.paid_on ? new Date(m.paid_on).toLocaleDateString() : '—'}</td>
+    <td style="display:flex;gap:4px;flex-wrap:wrap;">${manifestPdfButtons(m)}</td></tr>`;
+}
+
+// Head's "Approved Amount" for a Driver / Towing manifest (Ramvir, Oct 2026).
+async function setDriverAmount(manifestId) {
+  const m = (logisticsManifestsCache.find(x => x.id === manifestId)) || (plantManifestsCache.find(x => x.id === manifestId));
+  if (!m) return;
+  if (!(currentProfile && ['Head', 'Admin'].includes(currentProfile.role))) { notify('Only Head can set the Approved Amount.', { icon: 'error' }); return; }
+  if (['Sent to Payment', 'Paid'].includes(m.payment_status)) { notify('Already sent to payment — amount locked.', { icon: 'info' }); return; }
+  const r = await Swal.fire({ title: 'Approved Amount', text: m.manifest_no + ' · ' + (m.driver_name || m.transporter_name || ''), input: 'number', inputValue: m.driver_amount != null ? m.driver_amount : '',
+    inputAttributes: { min: 0, step: 1 }, showCancelButton: true, confirmButtonText: 'Save',
+    inputValidator: v => (v === '' || Number(v) < 0) ? 'Enter a valid amount' : null });
+  if (!r.isConfirmed) return;
+  const { error } = await sb.from('rewire_logistics_manifests').update({ driver_amount: Number(r.value), driver_amount_set_by: currentProfile.id, driver_amount_set_on: new Date().toISOString(), payment_status: 'Amount Set' }).eq('id', manifestId);
+  if (error) { notify('Error: ' + error.message, { icon: 'error' }); return; }
+  notify('Approved Amount saved.');
+  await refreshManifestViews();
+}
+
+// Yard Receiving = optional upload (signed slip / photo from the yard) — Ramvir, Oct 2026
+async function uploadYardReceiving(manifestId) {
+  const m = plantManifestsCache.find(x => x.id === manifestId) || logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  const r = await Swal.fire({ title: 'Yard Receiving', text: m.manifest_no + ' - upload the yard receiving slip / photo (optional)', input: 'file', inputAttributes: { accept: '.png,.jpg,.jpeg,.pdf' },
+    showCancelButton: true, confirmButtonText: 'Upload', inputValidator: f => f ? null : 'Choose a file' });
+  if (!r.isConfirmed || !r.value) return;
+  const url = await uploadFile(r.value, m.manifest_no, 'Yard_Receiving');
+  if (!url) { notify('Upload failed — try again.', { icon: 'error' }); return; }
+  const { error } = await sb.from('rewire_logistics_manifests').update({ yard_receiving_url: url, yard_receiving_on: new Date().toISOString(), yard_receiving_by: currentProfile.id }).eq('id', manifestId);
+  if (error) { notify('Error: ' + error.message, { icon: 'error' }); return; }
+  notify('Yard receiving uploaded.');
+  await refreshManifestViews();
+}
+
+// Crane payment: QR uploaded at Crane Vendor registration; pay from here, then record the UTR/reference.
+async function payManifestViaQr(manifestId) {
+  const m = logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  if (m.payment_status !== 'Bill Uploaded') { notify('Upload the bill first (Vehicle Receiving → Upload Bill).', { icon: 'error' }); return; }
+  const v = (allCraneVendors || []).find(x => x.vendor_name === m.crane_vendor_name);
+  if (!v || !isRealFileUrl(v.upi_qr_code_url)) { notify('"' + (m.crane_vendor_name || '') + '" ka QR code upload nahi hai. Manage Crane Vendors me QR add karein.', { icon: 'error', title: 'QR missing' }); return; }
+  const r = await Swal.fire({
+    title: 'Pay ₹' + (m.bill_total_amount != null ? m.bill_total_amount : '') + ' — ' + m.crane_vendor_name,
+    text: m.manifest_no + ' · QR scan karke payment karein, phir UTR / reference daalein',
+    imageUrl: driveThumbUrl(v.upi_qr_code_url, 600), imageAlt: 'UPI QR', imageWidth: 280,
+    input: 'text', inputPlaceholder: 'UTR / Reference No.', showCancelButton: true, confirmButtonText: 'Payment Done',
+    inputValidator: x => (!x || !x.trim()) ? 'UTR / reference is required' : null });
+  if (!r.isConfirmed) return;
+  const { error } = await sb.from('rewire_logistics_manifests').update({ utr_no: r.value.trim(), payment_status: 'Paid', paid_by: currentProfile.id, paid_on: new Date().toISOString() }).eq('id', manifestId);
+  if (error) { notify('Error: ' + error.message, { icon: 'error' }); return; }
+  notify(m.manifest_no + ' marked Paid — moved to Archive.');
+  await refreshManifestViews();
+}
+
+// ---- Receipt Report (Ramvir, Oct 2026) ----
+// Same manifest PDF, generated once EVERY vehicle on the manifest has been
+// received at the plant and its accessories check is done — shows, per
+// vehicle, which accessories were present and which were short, in place of
+// the dispatch-time Delivery Status column.
+function manifestReceiptReady(m) {
+  return m._vehicles.length > 0 && m._vehicles.every(v => v.logistics_received_on && v._receipt && v._receipt.plant_spare_wheel);
+}
+// [label, expected-from-Delivery col, expected-from-Valuation col, plant answer col, type]
+const RECEIPT_REPORT_ITEMS = [
+  ['Spare Wheel', 'ud_spare_wheel', 'val_spare_wheel', 'plant_spare_wheel', 'yesno'],
+  ['Stereo', 'ud_stereo', 'val_stereo', 'plant_stereo', 'yesno'],
+  ['Speakers', 'ud_speakers', 'val_speakers', 'plant_speakers', 'count'],
+  ['Tool Kit', 'ud_tool_kit', 'val_tool_kit', 'plant_tool_kit', 'yesno'],
+  ['Battery', 'ud_battery', 'val_battery', 'plant_battery', 'yesno'],
+  ['Alloy Wheel', 'ud_alloy_wheel', 'val_alloy_wheel', 'plant_alloy_wheel', 'count'],
+];
+function vehicleAccessorySummary(v) {
+  const r = v._receipt || {};
+  const present = [], shortage = [];
+  RECEIPT_REPORT_ITEMS.forEach(([label, udKey, valKey, plantKey, type]) => {
+    const exp = (v[udKey] !== null && v[udKey] !== undefined && v[udKey] !== '') ? v[udKey] : v[valKey];
+    const got = r[plantKey];
+    if (type === 'yesno') {
+      const expYes = String(exp || '').toLowerCase() === 'yes';
+      if (got === 'Yes') present.push(label);
+      if (expYes && got !== 'Yes') shortage.push(label);
+    } else {
+      const expN = Number(exp) || 0, gotN = Number(got) || 0;
+      if (gotN > 0) present.push(label + ' (' + gotN + ')');
+      if (gotN < expN) shortage.push(label + ' (expected ' + expN + ', found ' + gotN + ')');
+    }
+  });
+  return { present, shortage };
+}
+// Manifest No. click -> details popup (Ramvir, Oct 2026)
+function showManifestDetailsPopup(manifestId) {
+  const m = logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  const kv = (k, v) => `<tr><td style="padding:5px 10px;color:#64748b;width:38%;">${k}</td><td style="padding:5px 10px;font-weight:500;">${v || '—'}</td></tr>`;
+  const money = v => v ? '₹' + Number(v).toLocaleString('en-IN') : '';
+  // Admin can change vehicles only BEFORE receiving: Remove only for a vehicle not yet received; Add only while
+  // the manifest still has an unreceived vehicle (or is empty) and is not a Self Drop (those are received instantly).
+  const canEdit = (currentProfile && currentProfile.role === 'Admin' && m.payment_status !== 'Paid');
+  const allReceived = m._vehicles.length > 0 && m._vehicles.every(v => v.logistics_received_on);
+  const canAdd = !allReceived && (m.transport_mode || '') !== 'Self Drop';
+  const html = `<div style="text-align:left;font-size:12px;">
+    <table style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+      ${kv('Mode', m.transport_mode || 'Logistic Carrier')}${kv('Carrier / Driver', manifestCarrierLabel(m))}${kv('Vehicle/Truck No.', m.vehicle_truck_no)}${kv('Dispatch Date', m.dispatch_date)}
+      ${kv('From', m.from_location)}${kv('To', manifestRouteTo(m))}${kv('Unload Location', m.unload_location)}${kv('Remarks', m.remarks)}
+      ${kv('Yard Receiving', m.yard_receiving_url ? `<a href="javascript:void(0)" onclick="viewAccessoryPhoto('${m.yard_receiving_url}','Yard Receiving')" style="color:#1d4ed8;text-decoration:underline;">View</a>` : '')}
+      ${m.driver_amount != null ? kv('Approved Amount', money(m.driver_amount)) : ''}
+      ${kv('Bill Amount', money(m.bill_amount))}${kv('Bill No.', m.bill_no)}
+      ${kv('Bill', m.bill_url ? `<a href="javascript:void(0)" onclick="viewAccessoryPhoto('${m.bill_url}','Transporter Bill')" style="color:#1d4ed8;text-decoration:underline;">View</a>` : '')}
+      ${kv('Payment Status', m.payment_status)}
+    </table>
+    <div style="max-height:260px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px;">
+      <table style="width:100%;border-collapse:collapse;text-align:left;">
+        <thead style="position:sticky;top:0;background:#f8fafc;"><tr>
+          <th style="padding:6px 10px;border-bottom:1px solid #e2e8f0;">Lead No.</th><th style="padding:6px 10px;border-bottom:1px solid #e2e8f0;">Vehicle No.</th>
+          <th style="padding:6px 10px;border-bottom:1px solid #e2e8f0;">Make/Model</th><th style="padding:6px 10px;border-bottom:1px solid #e2e8f0;">Accessories (Delivery Form)</th>${canEdit ? '<th style="padding:6px 10px;border-bottom:1px solid #e2e8f0;"></th>' : ''}
+        </tr></thead>
+        <tbody>${m._vehicles.map(v => `<tr><td style="padding:5px 10px;border-bottom:0.5px solid #f1f5f9;">${v.lead_no}</td><td style="padding:5px 10px;border-bottom:0.5px solid #f1f5f9;">${v.val_vehicle_number || '—'}</td><td style="padding:5px 10px;border-bottom:0.5px solid #f1f5f9;">${[v.val_make, v.val_model_variant].filter(Boolean).join(' ') || '—'}</td><td style="padding:5px 10px;border-bottom:0.5px solid #f1f5f9;">${manifestDeliveryAccessories(v)}</td>${canEdit ? `<td style="padding:5px 10px;border-bottom:0.5px solid #f1f5f9;">${v.logistics_received_on ? '<span style="color:#16a34a;font-size:11px;">Received</span>' : `<a href="javascript:void(0)" onclick="adminRemoveManifestVehicle('${m.id}','${v.id}','${(v.val_vehicle_number || v.lead_no || '').replace(/'/g, '')}')" style="color:#dc2626;font-weight:600;">Remove</a>`}</td>` : ''}</tr>`).join('')}</tbody>
+      </table></div>${canEdit && canAdd ? `<div style="margin-top:10px;"><button type="button" class="btn btn-outline" onclick="adminAddManifestVehicle('${m.id}')">+ Add vehicle to this manifest</button> <span style="font-size:11px;color:#64748b;">(Admin only)</span></div>` : ''}</div>`;
+  Swal.fire({ title: m.manifest_no, html, width: 700, confirmButtonText: 'Close', confirmButtonColor: '#1d4ed8' });
+}
+
+// ------------------------------------------------------------
+// Find which manifest a vehicle is in + Admin add / remove vehicle (Ramvir, Oct 2026)
+// ------------------------------------------------------------
+const MANIFEST_VEH_SELECT = `id, lead_no, customer_name, val_vehicle_number, val_make, val_model_variant, ud_status, logistics_manifest_id, logistics_status, logistics_received_on,
+  val_spare_wheel, ud_spare_wheel, val_stereo, ud_stereo, val_speakers, ud_speakers, val_tool_kit, ud_tool_kit, val_battery, ud_battery, val_alloy_wheel, ud_alloy_wheel`;
+async function loadManifestForPopup(manifestId) {
+  const { data: m, error } = await sb.from('rewire_logistics_manifests').select('*').eq('id', manifestId).maybeSingle();
+  if (error || !m) { notify('Could not load manifest' + (error ? ': ' + error.message : '.'), { icon: 'error' }); return null; }
+  const { data: vs } = await sb.from('rewire_master_data').select(MANIFEST_VEH_SELECT).eq('logistics_manifest_id', manifestId);
+  const full = { ...m, _vehicles: vs || [] };
+  const i = logisticsManifestsCache.findIndex(x => x.id === manifestId);
+  if (i >= 0) logisticsManifestsCache[i] = { ...logisticsManifestsCache[i], ...full }; else logisticsManifestsCache.push(full);
+  return full;
+}
+async function openManifestPopupById(manifestId) {
+  Swal.close();
+  if (await loadManifestForPopup(manifestId)) showManifestDetailsPopup(manifestId);
+}
+async function findVehicleManifest() {
+  const r = await Swal.fire({ title: 'Find vehicle in manifest', input: 'text', inputPlaceholder: 'Vehicle no. or Lead no.', showCancelButton: true, confirmButtonText: 'Search',
+    inputValidator: v => (!v || v.trim().length < 3) ? 'Enter at least 3 characters' : null });
+  if (!r.isConfirmed) return;
+  const term = r.value.trim().replace(/[%,()]/g, '');
+  const { data: leads, error } = await sb.from('rewire_master_data').select('id, lead_no, customer_name, val_vehicle_number, logistics_manifest_id, logistics_status')
+    .or(`val_vehicle_number.ilike.%${term}%,lead_no.ilike.%${term}%`).limit(20);
+  if (error) { notify('Search failed: ' + error.message, { icon: 'error' }); return; }
+  if (!leads || !leads.length) { Swal.fire({ icon: 'info', title: 'No vehicle found', text: term }); return; }
+  const ids = [...new Set(leads.map(l => l.logistics_manifest_id).filter(Boolean))];
+  const { data: ms } = ids.length ? await sb.from('rewire_logistics_manifests').select('id, manifest_no, transport_mode, payment_status, dispatch_date, to_location').in('id', ids) : { data: [] };
+  const mById = {}; (ms || []).forEach(m => { mById[m.id] = m; });
+  const rows = leads.map(l => {
+    const m = l.logistics_manifest_id ? mById[l.logistics_manifest_id] : null;
+    return `<tr><td style="padding:5px 8px;border-bottom:0.5px solid #f1f5f9;">${l.val_vehicle_number || '—'}<div style="font-size:10px;color:#64748b;">${l.lead_no} · ${l.customer_name || ''}</div></td>
+      <td style="padding:5px 8px;border-bottom:0.5px solid #f1f5f9;">${m ? `<a href="javascript:void(0)" onclick="openManifestPopupById('${m.id}')" style="color:#1d4ed8;font-weight:700;text-decoration:underline;">${m.manifest_no}</a><div style="font-size:10px;color:#64748b;">${m.transport_mode || 'Logistic Carrier'} · ${m.dispatch_date || ''} · ${m.payment_status || ''}</div>` : '<span style="color:#94a3b8;">Not in any manifest</span>'}</td></tr>`;
+  }).join('');
+  Swal.fire({ title: 'Manifest lookup', width: 620, confirmButtonText: 'Close', confirmButtonColor: '#1d4ed8',
+    html: `<div style="text-align:left;font-size:12px;max-height:60vh;overflow:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr><th style="text-align:left;padding:6px 8px;">Vehicle</th><th style="text-align:left;padding:6px 8px;">Manifest</th></tr></thead><tbody>${rows}</tbody></table></div>` });
+}
+async function adminRemoveManifestVehicle(manifestId, leadId, label) {
+  if (!currentProfile || currentProfile.role !== 'Admin') return;
+  const ok = await Swal.fire({ icon: 'warning', title: 'Remove ' + label + '?', text: 'The vehicle goes back to the Logistics tab (pending dispatch) and its logistics details are cleared.', showCancelButton: true, confirmButtonText: 'Remove', confirmButtonColor: '#dc2626' });
+  if (!ok.isConfirmed) return;
+  const { error } = await sb.rpc('admin_manifest_remove_vehicle', { p_manifest: manifestId, p_lead: leadId });
+  if (error) { notify('Could not remove: ' + error.message, { icon: 'error' }); return; }
+  notify(label + ' removed from the manifest.');
+  await refreshManifestViews();
+  await openManifestPopupById(manifestId);
+}
+async function adminAddManifestVehicle(manifestId) {
+  if (!currentProfile || currentProfile.role !== 'Admin') return;
+  const r = await Swal.fire({ title: 'Add vehicle to manifest', input: 'text', inputPlaceholder: 'Exact vehicle no. or Lead no.', showCancelButton: true, confirmButtonText: 'Add',
+    inputValidator: v => (!v || !v.trim()) ? 'Enter a vehicle / lead number' : null });
+  if (!r.isConfirmed) return;
+  const term = r.value.trim().replace(/[%,()]/g, '');
+  const { data: leads, error } = await sb.from('rewire_master_data').select('id, lead_no, val_vehicle_number, logistics_manifest_id, overall_status')
+    .or(`val_vehicle_number.ilike.${term},lead_no.ilike.${term}`).neq('overall_status', 'Closed Lost').limit(5);
+  if (error) { notify('Search failed: ' + error.message, { icon: 'error' }); return; }
+  if (!leads || leads.length !== 1) { notify(leads && leads.length > 1 ? 'More than one match - enter the exact vehicle number.' : 'No vehicle found for ' + term, { icon: 'error' }); return; }
+  const l = leads[0];
+  if (l.logistics_manifest_id) { notify(l.val_vehicle_number + ' is already in a manifest. Remove it from there first.', { icon: 'error' }); return; }
+  const { error: e2 } = await sb.rpc('admin_manifest_add_vehicle', { p_manifest: manifestId, p_lead: l.id });
+  if (e2) { notify('Could not add: ' + e2.message, { icon: 'error' }); return; }
+  notify((l.val_vehicle_number || l.lead_no) + ' added to the manifest.');
+  await refreshManifestViews();
+  await openManifestPopupById(manifestId);
+}
+
+let activeMarkPaidManifestId = null;
+// Manifest Bill (Ramvir, Oct 2026): Bill No, Basic, GST 18% (fixed), TDS,
+// Deduction (prefilled from the plant debits, editable), Other Deduction,
+// Total. Saving moves the manifest to Accounts ("Bill Uploaded") — Accounts
+// then does Send to Payment (cashier email) and finally enters the UTR.
+function calcManifestBillTotal() {
+  const n = id => Number(document.getElementById(id).value) || 0;
+  const basic = n('markPaidBillAmount');
+  const gst = Math.round(basic * 0.18 * 100) / 100;
+  document.getElementById('markPaidGst').value = basic ? gst : '';
+  const total = basic + gst - n('markPaidTds') - n('markPaidDeduction') - n('markPaidOtherDeduction');
+  document.getElementById('markPaidTotal').value = basic ? Math.round(total * 100) / 100 : '';
+}
+function manifestPlantDebit(m) {
+  return (m._vehicles || []).reduce((s, v) => s + (v._receipt ? (Number(v._receipt.plant_debit_amount) || 0) + (Number(v._receipt.plant_other_debit_amount) || 0) : 0), 0);
+}
+async function openMarkManifestPaidModal(manifestId) {
+  const m = logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) { notify('Manifest not found — refresh and try again.', { icon: 'error' }); return; }
+  activeMarkPaidManifestId = manifestId;
+  document.getElementById('markPaidModalSub').textContent = m.manifest_no + ' · ' + (m.transporter_name || m.crane_vendor_name || '') + ' · ' + m._vehicles.length + ' vehicle(s)';
+  const set = (id, v) => { document.getElementById(id).value = (v === null || v === undefined) ? '' : v; };
+  set('markPaidBillNo', m.bill_no);
+  set('markPaidBillAmount', m.bill_basic_amount != null ? m.bill_basic_amount : m.bill_amount);
+  set('markPaidTds', m.bill_tds_amount);
+  set('markPaidDeduction', m.bill_deduction_amount != null ? m.bill_deduction_amount : (manifestPlantDebit(m) || ''));
+  set('markPaidOtherDeduction', m.bill_other_deduction);
+  set('markPaidOtherDeductionReason', m.bill_other_deduction_reason);
+  document.getElementById('markPaidBillFile').value = '';
+  calcManifestBillTotal();
+  openModal('markManifestPaidModal');
+}
+
+async function submitMarkManifestPaid() {
+  if (!activeMarkPaidManifestId) return;
+  const m = logisticsManifestsCache.find(x => x.id === activeMarkPaidManifestId);
+  if (!m) return;
+  const n = id => Number(document.getElementById(id).value) || 0;
+  const billNo = document.getElementById('markPaidBillNo').value.trim();
+  const basic = n('markPaidBillAmount');
+  if (!billNo) { notify('Enter the Bill No.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!basic) { notify('Enter the Bill Basic Amount.', { icon: 'error', title: 'Missing field' }); return; }
+  const gst = Math.round(basic * 0.18 * 100) / 100;
+  const total = Math.round((basic + gst - n('markPaidTds') - n('markPaidDeduction') - n('markPaidOtherDeduction')) * 100) / 100;
+  if (total <= 0) { notify('Total payable must be greater than 0.', { icon: 'error', title: 'Check amounts' }); return; }
+
+  const billFile = document.getElementById('markPaidBillFile');
+  let billUrl = m.bill_url || null;
+  if (billFile && billFile.files && billFile.files.length) {
+    const uploaded = await uploadFile(billFile.files[0], m.manifest_no, 'Transporter_Bill');
+    if (!uploaded) { notify('Bill upload failed — try again.', { icon: 'error' }); return; }
+    billUrl = uploaded;
+  }
+  const { error } = await sb.from('rewire_logistics_manifests').update({
+    bill_no: billNo, bill_url: billUrl, bill_amount: basic, bill_basic_amount: basic, bill_gst_amount: gst,
+    bill_tds_amount: n('markPaidTds'), bill_deduction_amount: n('markPaidDeduction'),
+    bill_other_deduction: n('markPaidOtherDeduction'), bill_other_deduction_reason: document.getElementById('markPaidOtherDeductionReason').value.trim() || null,
+    bill_total_amount: total, bill_uploaded_on: new Date().toISOString(), bill_uploaded_by: currentProfile.id,
+    payment_status: 'Bill Uploaded',
+  }).eq('id', activeMarkPaidManifestId);
+  if (error) { notify('Error saving bill: ' + error.message, { icon: 'error' }); return; }
+  notify('Bill saved for ' + m.manifest_no + ' — now with Accounts for payment.');
+  closeModal('markManifestPaidModal');
+  activeMarkPaidManifestId = null;
+  await refreshManifestViews();
+}
+
+// Accounts -> Send to Payment: emails the cashier a bank-format (NEFT/RTGS CSV,
+// same layout as "Send for Payment") file for this manifest, then waits for UTR.
+function buildManifestNeftCsv(m, t) {
+  const header = ['Transaction  Type', 'Beneficiary Code', 'Beneficiary \nAccount Number', 'Instrument\n Amount',
+    'Beneficiary\n Name', 'Drawee\n Location', 'Print \nLocation', 'Bene \nAddress 1', 'Bene \nAddress 2',
+    'Bene \nAddress 3', 'Bene \nAddress 4', 'Bene \nAddress 5', 'Instruction\n Reference Number',
+    'Customer \nReference Number', 'Payment \ndetails 1', 'Payment \ndetails 2', 'Payment \ndetails 3',
+    'Payment \ndetails 4', 'Payment \ndetails 5', 'Payment \ndetails 6', 'Payment \ndetails 7',
+    'Cheque \nNumber', 'Cheque \nDate', 'MICR NO', 'IFSC COD', 'BENE BANK', 'Bene Bank Bracnh', 'Bene Emai Id'];
+  const q = (v, text) => { const s = (v === null || v === undefined) ? '' : String(v).replace(/"/g, '""'); return (text && s) ? '="' + s + '"' : '"' + s + '"'; };
+  const d = new Date(); const today = String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear();
+  const row = ['N', '01', t.account_number || '', m.bill_total_amount || 0, (t.account_holder_name || t.transporter_name || m.transporter_name || '').slice(0, 29),
+    '', '', '', '', '', '', '', m.manifest_no, m.bill_no || '', m.manifest_no, m.transporter_name || '', m.bill_no || '', '', '', '', '', '', today, '',
+    t.ifsc_code || '', t.bank_name || '', (t.branch_name || '').replace(/,/g, ''), t.email || ''];
+  return [header.map(h => q(h)).join(','), row.map((v, i) => q(v, i === 2)).join(',')].join('\r\n');
+}
+async function sendManifestToPayment(manifestId) {
+  const m = logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  const t = (allTransporters || []).find(x => x.transporter_name === m.transporter_name) || {};
+  if (!t.account_number || !t.ifsc_code) { notify('Transporter "' + (m.transporter_name || '') + '" has no bank account / IFSC on file. Add it in Manage Transporters first.', { icon: 'error', title: 'Bank details missing' }); return; }
+  const ok = await confirmDialog('Send ' + m.manifest_no + ' (₹' + m.bill_total_amount + ') to the cashier for payment?');
+  if (!ok) return;
+  const csvContent = buildManifestNeftCsv(m, t);
+  await new Promise(resolve => {
+    google.script.run
+      .withSuccessHandler(async () => {
+        const { error } = await sb.from('rewire_logistics_manifests').update({ payment_status: 'Sent to Payment', sent_to_payment_on: new Date().toISOString(), sent_to_payment_by: currentProfile.id }).eq('id', manifestId);
+        if (error) notify('Email sent, but status update failed: ' + error.message, { icon: 'error' });
+        else notify('Sent to cashier. Waiting for UTR.');
+        await refreshManifestViews(); resolve();
+      })
+      .withFailureHandler(err => { notify('Failed to send email: ' + err.message, { icon: 'error' }); resolve(); })
+      .sendManifestPaymentEmail({ csvContent, manifestNo: m.manifest_no, transporter: m.transporter_name, amount: m.bill_total_amount, billNo: m.bill_no, senderName: currentProfile ? currentProfile.name : '' });
+  });
+}
+async function enterManifestUtr(manifestId) {
+  const m = logisticsManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  const r = await Swal.fire({ title: 'Enter UTR / RTGS No.', text: m.manifest_no, input: 'text', inputPlaceholder: 'UTR number', showCancelButton: true, confirmButtonText: 'Mark Paid',
+    inputValidator: v => (!v || !v.trim()) ? 'UTR is required' : null });
+  if (!r.isConfirmed) return;
+  const { error } = await sb.from('rewire_logistics_manifests').update({ utr_no: r.value.trim(), payment_status: 'Paid', paid_by: currentProfile.id, paid_on: new Date().toISOString() }).eq('id', manifestId);
+  if (error) { notify('Error: ' + error.message, { icon: 'error' }); return; }
+  notify(m.manifest_no + ' marked Paid.');
+  await refreshManifestViews();
+}
+
+let plantManifestsCache = [];   // manifests with _vehicles (+ _receipt), rebuilt every render
+let plantOpenManifestId = null;
+let plantModeTab = 'lc';
+let plantModeFiltered = [];
+// Vehicle Receiving sub-tabs (Ramvir, Oct 2026): Driver / Towing / Self Drop are ONE combined tab.
+const PLANT_MODES_BY_TAB = { lc: ['Logistic Carrier'], crane: ['Crane'], dts: ['Driver', 'Towing', 'Self Drop'] };
+
+// Vehicle Receiving page loader — light (manifests only). The heavy RST/accessories
+// list now lives on its own RST Pending page (renderReceivedPlantSection).
+window.DMS_BUILD_LOGISTICS = '2026-10-06-vr3';
+async function renderVehicleReceivingSection() {
+  const slow = setTimeout(() => {
+    const tb = document.getElementById('tbodyPlantIncoming');
+    if (tb && /Loading/.test(tb.textContent)) tb.innerHTML = '<tr><td colspan="16" style="padding:24px;color:#b91c1c;">Taking too long to load. Check internet / Supabase, then press Refresh. (build ' + window.DMS_BUILD_LOGISTICS + ')</td></tr>';
+  }, 20000);
+  try { await loadPlantManifests(); renderPlantModeRows(); }
+  catch (e) {
+    console.error('Vehicle Receiving render failed', e);
+    const tb = document.getElementById('tbodyPlantIncoming');
+    if (tb) tb.innerHTML = '<tr><td colspan="16" style="padding:24px;color:#b91c1c;">Could not load Vehicle Receiving: ' + (e && e.message ? e.message : e) + '</td></tr>';
+  }
+  finally { clearTimeout(slow); }
+}
+function showPlantTab(tab) {
+  if (!PLANT_MODES_BY_TAB[tab]) tab = 'lc';
+  plantModeTab = tab;
+  ['lc', 'crane', 'dts'].forEach(t => {
+    const el = document.getElementById('plantnav-' + t); if (el) el.classList.toggle('active', t === tab);
+  });
+  renderPlantModeRows();
+}
+
+// Loads every manifest + its vehicles + receipts (paginated, grouped client-side
+// — same "URL too long" avoidance as elsewhere in this file).
+async function loadPlantManifests() {
+  const manifests = await fetchAllRows((from, to) => sb.from('rewire_logistics_manifests').select('*').order('created_at', { ascending: false }).range(from, to)).catch(() => []);
+  const leads = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_number, val_make, val_model_variant, ud_status, ud_delivery_photo_url, logistics_manifest_id, logistics_received_on, logistics_unload_location, logistics_status, overall_status,
+      val_spare_wheel, ud_spare_wheel, val_stereo, ud_stereo, val_speakers, ud_speakers, val_tool_kit, ud_tool_kit, val_battery, ud_battery, val_alloy_wheel, ud_alloy_wheel`)
+    .not('logistics_manifest_id', 'is', null).range(from, to)).catch(() => []);
+  const receipts = await fetchAllRows((from, to) => sb.from('rewire_vehicle_receipt').select('lead_id, plant_debit_amount, plant_debit_reason, plant_other_debit_amount, plant_other_debit_reason, plant_spare_wheel, plant_stereo, plant_speakers, plant_tool_kit, plant_battery, plant_alloy_wheel').range(from, to)).catch(() => []);
+  const rBy = {}; (receipts || []).forEach(r => { rBy[r.lead_id] = r; });
+  const byM = {};
+  (leads || []).forEach(l => { l._receipt = rBy[l.id] || null; (byM[l.logistics_manifest_id] = byM[l.logistics_manifest_id] || []).push(l); });
+  plantManifestsCache = (manifests || []).map(m => ({ ...m, _vehicles: byM[m.id] || [] }));
+  // keep Logistics Payments' helpers (PDF / bill / QR) in sync
+  logisticsManifestsCache = plantManifestsCache;
+}
+
+function plantManifestState(m) {
+  const n = m._vehicles.length;
+  const rec = m._vehicles.filter(v => v.logistics_received_on).length;
+  return { n, rec, done: !!m.receiving_generated_on, pending: n > 0 && !m.receiving_generated_on };
+}
+function plantModeLabel(m) { return m.transport_mode || 'Logistic Carrier'; }
+function plantCarrierName(m) { return m.transporter_name || m.crane_vendor_name || m.driver_name || '—'; }
+// "Open" = still needs something here: receiving not generated yet, or (LC/Crane) not paid yet,
+// or (Driver/Towing) Head hasn't set the Approved Amount yet.
+function plantManifestOpen(m) {
+  const mode = plantModeLabel(m);
+  if (plantManifestState(m).pending) return true;
+  if (['Logistic Carrier', 'Crane'].includes(mode)) return m.payment_status !== 'Paid';
+  if (DT_MODES.includes(mode)) return m.driver_amount == null;
+  return false;
+}
+
+function plantBtn(label, icon, onclick, opts) {
+  opts = opts || {};
+  const style = opts.disabled ? 'opacity:.5;cursor:not-allowed;' : (opts.color ? 'background:' + opts.color + ';color:#fff;' : '');
+  return `<button class="ab ab-form" style="${style}" ${opts.disabled ? 'disabled' : ''} title="${opts.title || ''}" ${opts.disabled ? '' : `onclick="${onclick}"`}><i class="ti ti-${icon}" style="font-size:11px;" aria-hidden="true"></i> ${label}</button>`;
+}
+
+function renderPlantModeRows() {
+  const modes = PLANT_MODES_BY_TAB[plantModeTab];
+  const q = ((document.getElementById('searchPlantMode') || {}).value || '').toLowerCase().trim();
+  const st = (document.getElementById('plantModeStatus') || {}).value || 'pending';
+  const from = (document.getElementById('plantIncFrom') || {}).value, to = (document.getElementById('plantIncTo') || {}).value;
+  const allOfMode = plantManifestsCache.filter(m => modes.includes(plantModeLabel(m)));
+  plantModeFiltered = allOfMode.filter(m => {
+    const s = plantManifestState(m);
+    if (st === 'pending' && !plantManifestOpen(m)) return false;
+    if (st === 'done' && !s.done) return false;
+    if (q && !((m.manifest_no || '').toLowerCase().includes(q) || m._vehicles.some(v => (v.lead_no || '').toLowerCase().includes(q) || (v.val_vehicle_number || '').toLowerCase().includes(q)))) return false;
+    const d = (m.dispatch_date || '').slice(0, 10);
+    if (from && (!d || d < from)) return false;
+    if (to && (!d || d > to)) return false;
+    return true;
+  });
+  // tab badges = open manifests per tab
+  Object.entries(PLANT_MODES_BY_TAB).forEach(([tab, mds]) => {
+    const id = { lc: 'badgePlantLc', crane: 'badgePlantCrane', dts: 'badgePlantDts' }[tab];
+    const el = document.getElementById(id);
+    if (el) el.textContent = plantManifestsCache.filter(m => mds.includes(plantModeLabel(m)) && plantManifestState(m).pending).length;
+  });
+
+  // Header + row buttons per tab: Manifest No., then Vehicle Receiving / Upload Bill (or Approved Amount) / Yard Receiving (+ Payment on Crane)
+  const isDts = plantModeTab === 'dts', isCrane = plantModeTab === 'crane';
+  const btnHeads = isDts ? ['Vehicle Receiving', 'Approved Amount', 'Yard Receiving'] : ['Vehicle Receiving', 'Upload Bill', 'Yard Receiving'].concat(isCrane ? ['Payment'] : []);
+  const heads = ['Manifest No.'].concat(btnHeads, ['PDFs', isDts ? 'Mode' : 'Mode', isDts ? 'Driver / Towing / Self' : (isCrane ? 'Crane Company' : 'Transporter'), 'Vehicle No.', 'Dispatch Date', 'From', 'To', 'Vehicles', 'Received', 'Status']);
+  const _th = document.getElementById('theadPlantIncoming'); if (_th) _th.innerHTML = '<tr>' + heads.map(h => '<th>' + h + '</th>').join('') + '</tr>';
+
+  const isHead = currentProfile && ['Head', 'Admin'].includes(currentProfile.role);
+  document.getElementById('countPlantIncoming').textContent = plantModeFiltered.length + ' manifest(s)';
+  document.getElementById('tbodyPlantIncoming').innerHTML = plantModeFiltered.length ? plantModeFiltered.map(m => {
+    const s = plantManifestState(m);
+    const mode = plantModeLabel(m);
+    const badge = s.done ? '<span class="badge badge-q">Receiving Generated</span>' : (s.rec === s.n && s.n ? '<span class="badge badge-na">Ready to Generate</span>' : '<span class="badge badge-na">Pending</span>');
+    const pay = m.payment_status && m.payment_status !== 'Pending' ? ` <span class="badge badge-na">${m.payment_status}</span>` : '';
+    const vr = plantBtn('Vehicle Receiving (' + s.rec + '/' + s.n + ')', 'package-import', `openPlantManifestModal('${m.id}')`, { color: '#059669' });
+    const yard = plantBtn(m.yard_receiving_url ? 'Yard Receiving ✓' : 'Yard Receiving', 'upload', `uploadYardReceiving('${m.id}')`, {});
+    let mid;
+    if (isDts) {
+      const amtOk = DT_MODES.includes(mode);
+      const canSet = amtOk && isHead && !['Sent to Payment', 'Paid'].includes(m.payment_status);
+      mid = plantBtn(m.driver_amount != null ? 'Approved ₹' + m.driver_amount : 'Approved Amount', 'currency-rupee', `setDriverAmount('${m.id}')`,
+        { disabled: !canSet, title: !amtOk ? 'Not applicable for Self Drop' : (!isHead ? 'Head sets the Approved Amount' : '') }) ;
+    } else {
+      const billed = m.payment_status === 'Bill Uploaded' || m.payment_status === 'Sent to Payment' || m.payment_status === 'Paid';
+      const canBill = m.payment_status !== 'Sent to Payment' && m.payment_status !== 'Paid';
+      mid = plantBtn(billed ? 'Edit Bill' : 'Upload Bill', 'receipt', `openMarkManifestPaidModal('${m.id}')`, { disabled: !canBill, title: canBill ? '' : 'Bill locked once sent to payment' });
+    }
+    const crane = isCrane ? '<td>' + plantBtn('Payment', 'qrcode', `payManifestViaQr('${m.id}')`, { disabled: m.payment_status !== 'Bill Uploaded', title: m.payment_status === 'Bill Uploaded' ? '' : 'Upload the bill first', color: '#1d4ed8' }) + '</td>' : '';
+    return `<tr>
+      <td><span class="lid" style="cursor:pointer;" onclick="showManifestDetailsPopup('${m.id}')" title="Manifest details">${m.manifest_no}</span></td>
+      <td>${vr}</td><td>${mid}</td><td>${yard}</td>${crane}
+      <td style="display:flex;gap:4px;flex-wrap:wrap;">${manifestPdfButtons(m)}</td>
+      <td>${mode}</td><td style="font-weight:500;">${plantCarrierName(m)}</td><td>${m.vehicle_truck_no || '—'}</td>
+      <td>${m.dispatch_date || '—'}</td><td>${m.from_location || '—'}</td><td>${manifestRouteTo(m)}</td>
+      <td>${s.n}</td><td>${s.rec} / ${s.n}</td><td>${badge}${pay}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="${heads.length}" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No manifests.</td></tr>`;
+}
+function clearPlantIncomingFilters() {
+  document.getElementById('searchPlantMode').value = '';
+  document.getElementById('plantIncFrom').value = '';
+  document.getElementById('plantIncTo').value = '';
+  document.getElementById('plantModeStatus').value = 'pending';
+  renderPlantModeRows();
+}
+const PLANT_INCOMING_COLUMNS = [
+  { key: 'manifest_no', label: 'Manifest No.', get: m => m.manifest_no || '' },
+  { key: 'mode', label: 'Mode', get: m => plantModeLabel(m) },
+  { key: 'carrier', label: 'Carrier / Crane / Driver', get: m => plantCarrierName(m) },
+  { key: 'vehicle_no', label: 'Transport Vehicle No.', get: m => m.vehicle_truck_no || '' },
+  { key: 'dispatch_date', label: 'Dispatch Date', get: m => m.dispatch_date || '' },
+  { key: 'from', label: 'From', get: m => m.from_location || '' },
+  { key: 'to', label: 'To', get: m => manifestRouteTo(m) },
+  { key: 'vehicles', label: 'Vehicles', get: m => m._vehicles.map(v => v.val_vehicle_number || v.lead_no).join(', ') },
+  { key: 'received', label: 'Received', get: m => { const s = plantManifestState(m); return s.rec + '/' + s.n; } },
+  { key: 'payment_status', label: 'Payment Status', get: m => m.payment_status || '' },
+];
+function exportPlantIncomingExcel() {
+  if (!plantModeFiltered.length) { notify('No manifests to export.', { icon: 'info' }); return; }
+  exportTableColumnsToExcel('plantincoming', plantModeFiltered, PLANT_INCOMING_COLUMNS, 'rewire-dms-vehicle-receiving-' + plantModeTab + '.xlsx', 'Manifests');
+}
+function openPlantManifestModal(manifestId) {
+  const m = plantManifestsCache.find(x => x.id === manifestId);
+  if (!m) return;
+  plantOpenManifestId = manifestId;
+  document.getElementById('plantManifestTitle').textContent = m.manifest_no;
+  document.getElementById('plantManifestSub').textContent = plantModeLabel(m) + ' · ' + plantCarrierName(m);
+  const meta = [['Date', m.dispatch_date], ['From', m.from_location], ['To', m.to_location], ['Transport Vehicle No.', m.vehicle_truck_no], ['Other Details', m.other_transporter_details]];
+  document.getElementById('plantManifestMeta').innerHTML = meta.map(([k, v]) => `<span><b>${k}:</b> ${v || '—'}</span>`).join('');
+  const toLoc = m.to_location || 'Jaipur Plant';
+  let allReady = m._vehicles.length > 0;
+  document.getElementById('plantManifestBody').innerHTML = m._vehicles.map(v => {
+    const r = v._receipt || {};
+    const recvd = !!v.logistics_received_on;
+    const checked = !!r.plant_spare_wheel;
+    if (!(recvd && checked)) allReady = false;
+    const vNoEsc = (v.val_vehicle_number || '').replace(/'/g, "\\'");
+    const act = !recvd
+      ? `<button class="ab ab-form" style="background:#059669;color:#fff;" onclick="receiveManifestVehicle('${v.id}','${v.lead_no}','${vNoEsc}','${m.id}','${toLoc.replace(/'/g, "\\'")}')"><i class="ti ti-package-import" style="font-size:11px;" aria-hidden="true"></i> Receive</button>`
+      : `<button class="ab ab-form" onclick="editManifestVehicleCheck('${v.id}','${v.lead_no}','${vNoEsc}','${m.id}')"><i class="ti ti-list-check" style="font-size:11px;" aria-hidden="true"></i> ${checked ? 'Edit Check' : 'Accessories Check'}</button>`;
+    return `<tr><td><span class="lid">${v.lead_no}</span></td><td>${v.val_vehicle_number || '—'}</td>
+      <td>${[v.val_make, v.val_model_variant].filter(Boolean).join(' ') || '—'}</td>
+      <td>${recvd ? '<span class="badge badge-q">Received' + (v.logistics_unload_location ? ' · ' + v.logistics_unload_location : '') + '</span>' : '<span class="badge badge-na">Pending</span>'}</td>
+      <td>${r.plant_debit_amount ? '₹' + r.plant_debit_amount : '—'}</td><td>${r.plant_other_debit_amount ? '₹' + r.plant_other_debit_amount : '—'}</td><td>${act}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" style="text-align:center;padding:16px;">No vehicles.</td></tr>';
+  const gen = document.getElementById('plantManifestGenBtn');
+  gen.disabled = !allReady;
+  gen.style.opacity = allReady ? '' : '.5';
+  gen.title = allReady ? '' : 'Enabled once every vehicle is received and its accessories check is done';
+  gen.innerHTML = '<i class="ti ti-printer" style="font-size:13px;" aria-hidden="true"></i> ' + (m.receiving_generated_on ? 'Print Receiving' : 'Generate Receiving');
+  openModal('plantManifestModal');
+}
+function receiveManifestVehicle(leadId, leadNo, vNo, manifestId, toLoc) {
+  closeModal('plantManifestModal');
+  openPlantAccessoriesCheck(leadId, leadNo, vNo, true); // Received Location deliberately NOT prefilled — user must pick it
+}
+function editManifestVehicleCheck(leadId, leadNo, vNo, manifestId) {
+  closeModal('plantManifestModal');
+  openPlantAccessoriesCheck(leadId, leadNo, vNo);
+}
+async function generatePlantReceiving() {
+  const m = plantManifestsCache.find(x => x.id === plantOpenManifestId);
+  if (!m) return;
+  if (!m.receiving_generated_on) {
+    const { error } = await sb.from('rewire_logistics_manifests').update({ receiving_generated_on: new Date().toISOString(), receiving_generated_by: currentProfile.id }).eq('id', m.id);
+    if (error) { notify('Error: ' + error.message, { icon: 'error' }); return; }
+    m.receiving_generated_on = new Date().toISOString();
+    renderPlantModeRows();
+  }
+  printManifestReceiptReport(m.id);
+}
+// Receive = Accessories Check (what actually arrived) + Received Location,
+// in one step (Ramvir, Oct 2026). See openPlantAccessoriesCheck(..., true)
+// / confirmPlantAccessoriesCheck().
+function receivePlantVehicle(leadId, leadNo, vehicleNo) {
+  openPlantAccessoriesCheck(leadId, leadNo, vehicleNo, true);
+}
+</script>

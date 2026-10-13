@@ -1,0 +1,874 @@
+<script>
+// ============================================================
+// CALLING MODULE (Ramvir, Oct 2026) — separate module (own file, like
+// Incentive / Conveyance). Leads are entered here (one by one or Excel),
+// a CRE calls them, logs a disposition for every call, and when the lead is
+// interested the CRE assigns it to a PE — which creates the normal DMS lead
+// (Need Analysis) for that PE (RPC assign_calling_lead_to_pe).
+// Tables: rewire_calling_leads, rewire_calling_logs. Access: role CRE, or
+// any user with calling_access ON (Settings > Users).
+// Screens: Today's Calls, Total Leads, Other Leads, Performance (+ Leaderboard).
+// ============================================================
+const CALL_VEHICLE_TYPES = ['M (Cars)', 'L (2W)', 'N (Comm.)', 'O (Other)'];
+const CALL_SOURCES = ['Exotel', 'Facebook', 'Heion Meta', 'Heion Rural', 'Heion Website', 'Just Dial', 'Meta Rural', 'OLX', 'TML', 'Whatsapp', 'Partner', 'NCD', 'UCD', 'Telein', 'Reference', 'Walkin', 'Workshop', 'Other'];
+const CALL_LEAD_TYPES = ['Vehicle Scrap', 'Parts', 'New Vehicle', 'Misc'];
+const CALL_DEAL_TYPES = ['Direct', 'Broker'];
+// Status the CRE tags a connected call with (same list the team uses in the calling Google Sheet)
+const CALL_CRM_PICK = ['High Demand', 'Interested', 'Open', 'Vehicle HPN', 'Vehicle Backlog', 'Closed'];
+const CALL_CRM_COLORS = { 'Interested': '#2563eb', 'High Demand': '#dc2626', 'Open': '#64748b', 'Vehicle HPN': '#d97706', 'Vehicle Backlog': '#7c3aed', 'Purchased': '#059669', 'Closed': '#475569' };
+const CALL_STATUSES = ['Fresh', 'Try Again', 'Follow Up', 'Assigned', 'Closed'];
+const CALL_REASONS = ['RNR', 'Busy', 'Unreachable', 'Invalid Number', 'Other'];
+const CC_PAGE = 10;
+const CC_PREFIX = { today: 'ct', leads: 'cl', other: 'co' };
+
+let callingLeadsCache = [];
+let callingOtherCache = [];
+let callingCreList = [];
+let callingPeList = [];
+let callingExpanded = new Set();
+let callingHistCache = {};
+let callingSelectedIds = new Set();
+let callingShowDone = false;
+let callingOtherShowDone = false;
+let callingDispState = { contact: 'Contacted', crm: '', action: '', reason: '' };
+let callingActiveLeadId = null;
+let callingPerfTab = 'performance';
+let callingBulkRows = null;
+let callingPartners = null;
+const callingPage = { today: 1, leads: 1, other: 1 };
+const callingFilt = {
+  today: { cs: new Set(), crm: new Set(), src: new Set(), city: '', age: 365 },
+  leads: { cs: new Set(), crm: new Set(), src: new Set(), city: '', age: 365 },
+};
+let callingFiltCtx = 'today';
+let callingFiltTmp = null;
+
+function cEsc(s) {
+  return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+function cVal(id) { const el = document.getElementById(id); return el ? (el.value || '') : ''; }
+function callingIsCre() { return currentProfile && (currentProfile.role === 'CRE' || currentProfile.calling_access); }
+function callingIsAdminish() { return currentProfile && ['Admin', 'Head', 'Back Office Head'].includes(currentProfile.role); }
+function callingDayStart(d) { const x = d ? new Date(d + 'T00:00:00') : new Date(); x.setHours(0, 0, 0, 0); return x; }
+function callingFmtDT(v) {
+  if (!v) return '—';
+  const d = new Date(v);
+  return isNaN(d) ? '—' : d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }) + ' ' + d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+}
+function callingFmtTime(v) { const d = new Date(v); return isNaN(d) ? '—' : d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }); }
+function callingStatusBadge(s) {
+  const colors = { 'Fresh': '#2563eb', 'Try Again': '#d97706', 'Follow Up': '#7c3aed', 'Assigned': '#059669', 'Closed': '#64748b' };
+  const c = colors[s] || '#64748b';
+  return '<span class="cc-chip" style="color:' + c + ';background:' + c + '1a;border-color:' + c + '55;">' + cEsc(s || '—') + '</span>';
+}
+function callingCrmBadge(st) {
+  if (!st) return '';
+  const c = CALL_CRM_COLORS[st] || '#64748b';
+  return '<span class="cc-chip" style="color:' + c + ';background:' + c + '1a;border-color:' + c + '55;">' + cEsc(st) + '</span>';
+}
+function callingInitials(n) { return String(n || '?').trim().split(/\s+/).slice(0, 2).map(w => w[0]).join('').toUpperCase(); }
+
+// ---------------- data loaders ----------------
+async function callingLoadPeople() {
+  const { data } = await sb.from('rewire_user_profiles').select('id, name, role, manager_id, active, calling_access').eq('active', true);
+  const all = data || [];
+  callingCreList = all.filter(u => u.role === 'CRE' || u.calling_access).sort((a, b) => a.name.localeCompare(b.name));
+  callingPeList = all.filter(u => u.role === 'PE' || u.role === 'Manager').sort((a, b) => a.name.localeCompare(b.name));
+}
+async function callingLoadLeads() {
+  callingLeadsCache = await fetchAllRows((from, to) => sb.from('rewire_calling_leads')
+    .select(`*, cre:rewire_user_profiles!rewire_calling_leads_cre_id_fkey(name), pe:rewire_user_profiles!rewire_calling_leads_assigned_pe_id_fkey(name)`)
+    .order('created_at', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); notify('Could not load calling leads: ' + (err.message || err), { icon: 'error' }); return []; });
+  // Live DMS status of leads already handed to a PE (security-definer RPC — a CRE can't read rewire_master_data directly)
+  const { data: st } = await sb.rpc('calling_dms_status');
+  const map = {}; (st || []).forEach(r => { map[r.calling_id] = r; });
+  callingLeadsCache.forEach(l => { l.lead = map[l.id] || null; });
+  // Only Vehicle Scrap leads are called. Parts / New Vehicle / Misc go to the separate "Other Leads" tab (remarks only).
+  callingOtherCache = callingLeadsCache.filter(l => l.lead_type && l.lead_type !== 'Vehicle Scrap');
+  callingLeadsCache = callingLeadsCache.filter(l => !l.lead_type || l.lead_type === 'Vehicle Scrap');
+  callingHistCache = {};
+}
+function callingDmsStatus(d) {
+  if (!d) return '';
+  if (d.overall_status === 'Closed Lost') return 'Closed Lost';
+  if (d.ud_status === 'Complete' && d.ha_status === 'Approved') return 'Purchased';
+  return d.lead_status || 'Need Analysis';
+}
+function callingDmsBadge(d) {
+  const s = callingDmsStatus(d); if (!s) return '';
+  const c = { 'Purchased': '#059669', 'Closed Lost': '#dc2626', 'Qualified': '#2563eb' }[s] || '#d97706';
+  return '<span class="cc-chip" style="color:' + c + ';background:' + c + '1a;border-color:' + c + '55;">' + cEsc(s) + '</span>';
+}
+function callingFillSelect(id, items, firstLabel, valueKey, labelKey) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const cur = el.value;
+  el.innerHTML = '<option value="">' + firstLabel + '</option>' + items.map(it => '<option value="' + cEsc(it[valueKey]) + '">' + cEsc(it[labelKey]) + '</option>').join('');
+  if (cur) el.value = cur;
+}
+
+// WhatsApp: sends the approved template (server side, WhatsApp.gs > sendCallingWhatsApp) instead of opening wa.me
+let callingWaLeadId = null;
+function callingSendWa(id) {
+  const l = callingLeadsCache.find(x => x.id === id) || callingOtherCache.find(x => x.id === id);
+  if (!l) return;
+  callingWaLeadId = id;
+  document.getElementById('cwTo').textContent = l.customer_name + ' · ' + l.phone;
+  document.getElementById('cwText').value = '';
+  const sb0 = document.getElementById('cwSendBtn'); sb0.disabled = false; sb0.innerHTML = '<i class="ti ti-send" style="font-size:14px;" aria-hidden="true"></i> Send';
+  openModal('callingWaModal');
+}
+function callingWaSubmit() {
+  const l = callingLeadsCache.find(x => x.id === callingWaLeadId) || callingOtherCache.find(x => x.id === callingWaLeadId);
+  const text = cVal('cwText').replace(/\s+/g, ' ').trim();
+  if (!l) return;
+  if (!text) { notify('Type the message first.', { icon: 'error' }); return; }
+  if (typeof google === 'undefined' || !google.script || !google.script.run) { notify('WhatsApp can only be sent from the deployed app.', { icon: 'error' }); return; }
+  const btn = document.getElementById('cwSendBtn');
+  if (btn.disabled) return; // already sending — ignore repeat clicks
+  const label = btn.innerHTML;
+  btn.disabled = true; btn.innerHTML = 'Sending…';
+  google.script.run
+    .withSuccessHandler(() => { btn.disabled = false; btn.innerHTML = label; closeModal('callingWaModal'); notify('WhatsApp message sent to ' + l.phone + '.'); })
+    .withFailureHandler(err => { btn.disabled = false; btn.innerHTML = label; notify('WhatsApp failed: ' + (err && err.message ? err.message : err), { icon: 'error' }); })
+    .sendCallingWhatsApp(l.phone, text);
+}
+
+// ---------------- shared list helpers (search / filters / pager / cards) ----------------
+function callingSearchMatch(l, p) {
+  const q = cVal(p + 'Search').trim().toLowerCase();
+  if (!q) return true;
+  const by = cVal(p + 'SearchIn') || 'name';
+  if (by === 'phone') return (l.phone || '').includes(q) || (l.alt_phone || '').includes(q);
+  if (by === 'vehicle') return [l.make, l.model, l.vehicle_type, l.vehicle_number].join(' ').toLowerCase().includes(q);
+  if (by === 'callno') return (l.call_no || '').toLowerCase().includes(q);
+  return (l.customer_name || '').toLowerCase().includes(q);
+}
+function callingFilterRows(rows, ctx) {
+  const f = callingFilt[ctx]; if (!f) return rows;
+  const now = Date.now();
+  return rows.filter(l => (!f.cs.size || f.cs.has(l.call_status)) && (!f.crm.size || f.crm.has(l.crm_status)) && (!f.src.size || f.src.has(l.lead_source))
+    && (!f.city || l.city === f.city) && (f.age >= 365 || (now - new Date(l.created_at).getTime()) / 86400000 <= f.age));
+}
+function callingFilterCount(ctx) {
+  const f = callingFilt[ctx]; if (!f) return 0;
+  return (f.cs.size ? 1 : 0) + (f.crm.size ? 1 : 0) + (f.src.size ? 1 : 0) + (f.city ? 1 : 0) + (f.age < 365 ? 1 : 0);
+}
+function callingPagerHtml(ctx, total, page) {
+  if (!total) return '';
+  const pages = Math.ceil(total / CC_PAGE);
+  const a = (page - 1) * CC_PAGE + 1, b = Math.min(total, page * CC_PAGE);
+  const nums = [];
+  for (let i = 1; i <= pages; i++) { if (i === 1 || i === pages || Math.abs(i - page) <= 1) nums.push(i); else if (nums[nums.length - 1] !== '…') nums.push('…'); }
+  return '<span class="cc-pager-info">Showing <b>' + a + '-' + b + '</b> of <b>' + total + '</b> results</span><div class="cc-pager-btns">'
+    + '<button ' + (page <= 1 ? 'disabled' : '') + ' onclick="callingGoPage(\'' + ctx + '\',' + (page - 1) + ')"><i class="ti ti-chevron-left" aria-hidden="true"></i></button>'
+    + nums.map(n => n === '…' ? '<span>…</span>' : '<button class="' + (n === page ? 'on' : '') + '" onclick="callingGoPage(\'' + ctx + '\',' + n + ')">' + n + '</button>').join('')
+    + '<button ' + (page >= pages ? 'disabled' : '') + ' onclick="callingGoPage(\'' + ctx + '\',' + (page + 1) + ')"><i class="ti ti-chevron-right" aria-hidden="true"></i></button></div>';
+}
+function callingGoPage(ctx, p) { callingPage[ctx] = p; callingRerender(ctx); const sc = document.querySelector('#section-calling-' + (ctx === 'today' ? 'today' : ctx) + ' .cc-scroll'); if (sc) sc.scrollTop = 0; }
+function callingRerender(ctx) {
+  if (ctx === 'today') callingRenderTodayList();
+  else if (ctx === 'leads') callingRenderLeadsList();
+  else callingRenderOtherList();
+}
+function callingSearchChanged(ctx) { callingPage[ctx] = 1; callingRerender(ctx); }
+
+function callingLastTalk(l) {
+  if (!l.last_called_at && !l.last_remarks) return '<div class="cc-last cc-last-none"><i class="ti ti-message-circle-off" aria-hidden="true"></i> No conversation yet</div>';
+  const what = l.contact_status === 'Not Contacted' ? 'Not Contacted' + (l.reason ? ' (' + cEsc(l.reason) + ')' : '') : cEsc(l.disposition || l.contact_status || '');
+  return '<div class="cc-last"><i class="ti ti-message-circle-2" aria-hidden="true"></i><div><b>Last talk · ' + callingFmtDT(l.last_called_at) + '</b> ' + callingCrmBadge(l.crm_status) + ' <span class="cc-last-what">' + what + '</span>'
+    + (l.last_remarks ? '<div class="cc-last-rem">“' + cEsc(l.last_remarks) + '”</div>' : '') + '</div></div>';
+}
+function callingCardHtml(l, ctx) {
+  const veh = [l.make, l.model].filter(Boolean).join(' ') || l.vehicle_type || '';
+  const expanded = callingExpanded.has(l.id);
+  const waNum = String(l.phone || '').replace(/\D/g, '');
+  const overdue = ctx === 'today' && l.next_call_at && new Date(l.next_call_at) < callingDayStart();
+  const accent = { 'Fresh': '#2563eb', 'Try Again': '#d97706', 'Follow Up': '#7c3aed', 'Assigned': '#059669', 'Closed': '#94a3b8' }[l.call_status] || '#94a3b8';
+  const meta = [l.lead_type, l.lead_source, l.city].filter(Boolean).map(cEsc).join(' · ');
+  const canAct = true; // Update stays available even after Closed/Assigned (re-open, add a new remark, set a new follow-up)
+  const adm = callingIsAdminish();
+  return `<div class="cc-card" style="border-left-color:${accent};" onclick="callingCardClick(event,'${l.id}','${ctx}')">
+    <div class="cc-card-main">
+      ${ctx === 'leads' && adm ? `<input type="checkbox" class="cc-sel" ${callingSelectedIds.has(l.id) ? 'checked' : ''} onchange="callingToggleSel('${l.id}', this.checked)" />` : ''}
+      <div class="cc-avatar" style="background:${accent}1a;color:${accent};">${cEsc(callingInitials(l.customer_name))}</div>
+      <div class="cc-card-info">
+        <div class="cc-name">${cEsc(l.customer_name)} ${callingStatusBadge(l.call_status)} ${callingCrmBadge(l.crm_status)}${overdue ? ' <span class="cc-chip" style="color:#dc2626;background:#fee2e2;border-color:#fecaca;">Overdue</span>' : ''}</div>
+        <div class="cc-phone"><i class="ti ti-phone" aria-hidden="true"></i> ${cEsc(l.phone)}${l.alt_phone ? ` <span style="color:#94a3b8;font-weight:500;">/ ${cEsc(l.alt_phone)}</span>` : ''}</div>
+        <div class="cc-meta">${meta || '—'}${veh ? ' · <b>' + cEsc(veh) + '</b>' : ''}${l.deal_type === 'Broker' ? ' · Broker: ' + cEsc(l.broker_name || '') : ''}</div>
+        ${l.pe ? `<div class="cc-meta" style="margin-top:2px;">Assigned to <b>${cEsc(l.pe.name)}</b>${l.lead ? ` · <span class="lid">${cEsc(l.lead.lead_no)}</span> ${callingDmsBadge(l.lead)}` : ''}</div>` : ''}
+        ${callingLastTalk(l)}
+      </div>
+      <div class="cc-card-side">
+        <div class="cc-side-line"><span>Next</span><b>${callingFmtDT(l.next_call_at)}</b></div>
+        <div class="cc-side-line"><span>Attempts</span><b>${l.attempts || 0}</b></div>
+        <div class="cc-side-line"><span>CRE</span><b>${cEsc(l.cre ? l.cre.name : '—')}</b></div>
+      </div>
+      <div class="cc-card-actions">
+        <a class="cc-act cc-act-call" href="tel:${cEsc(l.phone)}" title="Call"><i class="ti ti-phone" aria-hidden="true"></i></a>
+        <button class="cc-act cc-act-wa" title="Send WhatsApp message" onclick="callingSendWa('${l.id}')"><i class="ti ti-brand-whatsapp" aria-hidden="true"></i></button>
+        ${canAct ? `<button class="btn btn-primary cc-update" onclick="openCallingDisposition('${l.id}')">Update</button>` : ''}
+        <button class="cc-link" onclick="callingCardClick(event,'${l.id}','${ctx}',true)">${expanded ? 'Hide' : 'Details'}</button>
+      </div>
+    </div>
+    ${expanded ? `<div class="cc-detail" id="ccDetail_${l.id}">${callingDetailHtml(l)}</div>` : ''}
+  </div>`;
+}
+function callingCardClick(ev, id, ctx, force) {
+  if (!force && ev.target.closest('a,button,input,select,textarea,label')) return;
+  ev.stopPropagation();
+  if (callingExpanded.has(id)) callingExpanded.delete(id); else callingExpanded.add(id);
+  callingRerender(ctx);
+}
+function callingDetailHtml(l) {
+  const hist = callingHistCache[l.id];
+  const waNum = String(l.phone || '').replace(/\D/g, '');
+  const prev = hist && hist[0];
+  const prevHtml = prev
+    ? `<div class="cc-prev"><div class="cc-prev-hd">${callingFmtDT(prev.called_at)} ${callingCrmBadge(prev.crm_status)}</div><div>${cEsc(prev.contact_status || '')}${prev.reason ? ' (' + cEsc(prev.reason) + ')' : ''} · ${cEsc(prev.disposition || '')}</div>${prev.remarks ? `<div class="cc-prev-rem">${cEsc(prev.remarks)}</div>` : ''}</div>`
+    : (hist ? '<div class="cc-prev" style="color:#94a3b8;">No previous call</div>' : '<div class="cc-prev" style="color:#94a3b8;">Loading…</div>');
+  const histHtml = hist && hist.length > 1 ? hist.slice(1).map(h => `<div class="cc-hist-row"><b>${callingFmtDT(h.called_at)}</b> ${callingCrmBadge(h.crm_status)} ${cEsc(h.contact_status || '')}${h.reason ? ' (' + cEsc(h.reason) + ')' : ''} · ${cEsc(h.disposition || '')}${h.remarks ? `<div style="color:#475569;">${cEsc(h.remarks)}</div>` : ''}</div>`).join('') : '';
+  const info = (k, v) => `<div class="cc-kv"><span>${k}</span><b>${v ? cEsc(v) : '—'}</b></div>`;
+  return `<div class="cc-detail-grid">
+    <div><div class="cc-dt-title">Lead</div>${info('Call No.', l.call_no)}${info('Lead Type', l.lead_type)}${info('Source', l.lead_source)}${info('Location', l.city)}${info('Vehicle', [l.vehicle_type, l.make, l.model].filter(Boolean).join(' · '))}${l.deal_type ? info('Deal', l.deal_type + (l.deal_type === 'Broker' ? ' — ' + (l.broker_name || '') : '')) : ''}${info('Lead Remarks', l.remarks)}${l.lead ? info('DMS Lead', l.lead.lead_no + ' · ' + callingDmsStatus(l.lead)) : ''}</div>
+    <div><div class="cc-dt-title">Previous Disposition</div>${prevHtml}<button class="btn cc-outline-btn" onclick="openCallingDisposition('${l.id}')">Update Disposition</button></div>
+    <div><div class="cc-dt-title">Communications</div>
+      <div class="cc-comm"><span>${cEsc(l.phone)}</span><a class="cc-act cc-act-call" href="tel:${cEsc(l.phone)}"><i class="ti ti-phone" aria-hidden="true"></i></a><button class="cc-act cc-act-wa" title="Send WhatsApp message" onclick="callingSendWa('${l.id}')"><i class="ti ti-brand-whatsapp" aria-hidden="true"></i></button><a class="cc-act cc-act-sms" href="sms:${cEsc(l.phone)}"><i class="ti ti-message" aria-hidden="true"></i></a></div>
+      ${l.alt_phone ? `<div class="cc-comm"><span>${cEsc(l.alt_phone)}</span><a class="cc-act cc-act-call" href="tel:${cEsc(l.alt_phone)}"><i class="ti ti-phone" aria-hidden="true"></i></a></div>` : ''}
+    </div>
+  </div>${histHtml ? `<div class="cc-hist"><div class="cc-dt-title">Earlier calls</div>${histHtml}</div>` : ''}`;
+}
+async function callingHydrateDetails(rows) {
+  for (const l of rows) {
+    if (!callingExpanded.has(l.id) || callingHistCache[l.id]) continue;
+    const { data } = await sb.from('rewire_calling_logs').select('*').eq('calling_lead_id', l.id).order('called_at', { ascending: false });
+    callingHistCache[l.id] = data || [];
+    const cell = document.getElementById('ccDetail_' + l.id);
+    if (cell) cell.innerHTML = callingDetailHtml(l);
+  }
+}
+
+// ---------------- FILTER DRAWER ----------------
+function callingOpenFilters(ctx) {
+  callingFiltCtx = ctx;
+  const f = callingFilt[ctx];
+  callingFiltTmp = { cs: new Set(f.cs), crm: new Set(f.crm), src: new Set(f.src), city: f.city, age: f.age };
+  callingRenderFilters();
+  openModal('callingFilterModal');
+}
+function callingRenderFilters() {
+  const t = callingFiltTmp, ctx = callingFiltCtx;
+  const pool = ctx === 'today' ? callingLeadsCache : callingLeadsCache;
+  const cities = Array.from(new Set(pool.map(l => l.city).filter(Boolean))).sort();
+  const chips = (arr, set, key) => arr.map(v => `<button class="cc-chipbtn ${set.has(v) ? 'on' : ''}" onclick="callingFiltToggle('${key}','${cEsc(v).replace(/'/g, '&#39;')}')">${cEsc(v)}</button>`).join('');
+  const csList = ctx === 'today' ? ['Fresh', 'Try Again', 'Follow Up'] : CALL_STATUSES;
+  document.getElementById('cfBody').innerHTML = `
+    <div class="cc-fgroup"><div class="cc-fhd">Call Status</div><div class="cc-chips">${chips(csList, t.cs, 'cs')}</div></div>
+    <div class="cc-fgroup"><div class="cc-fhd">Status</div><div class="cc-chips">${chips(CALL_CRM_PICK, t.crm, 'crm')}</div></div>
+    <div class="cc-fgroup"><div class="cc-fhd">Lead Source</div><div class="cc-chips">${chips(CALL_SOURCES, t.src, 'src')}</div></div>
+    <div class="cc-fgroup"><div class="cc-fhd">Location</div><select id="cfCity" onchange="callingFiltTmp.city=this.value"><option value="">All locations</option>${cities.map(c => `<option ${t.city === c ? 'selected' : ''}>${cEsc(c)}</option>`).join('')}</select></div>
+    <div class="cc-fgroup"><div class="cc-fhd">Lead Age <span id="cfAgeLbl" style="font-weight:500;color:#64748b;">${t.age >= 365 ? 'Any' : 'up to ' + t.age + ' days'}</span></div>
+      <input type="range" min="1" max="365" value="${t.age}" oninput="callingFiltTmp.age=+this.value;document.getElementById('cfAgeLbl').textContent=(+this.value>=365?'Any':'up to '+this.value+' days')" style="width:100%;height:auto;padding:0;border:none;" /></div>`;
+}
+function callingFiltToggle(key, v) {
+  const s = callingFiltTmp[key]; if (s.has(v)) s.delete(v); else s.add(v);
+  callingRenderFilters();
+}
+function callingFiltApply() {
+  callingFilt[callingFiltCtx] = callingFiltTmp;
+  closeModal('callingFilterModal');
+  callingPage[callingFiltCtx] = 1;
+  callingUpdateFilterBadge(callingFiltCtx);
+  callingRerender(callingFiltCtx);
+}
+function callingFiltClear() {
+  callingFiltTmp = { cs: new Set(), crm: new Set(), src: new Set(), city: '', age: 365 };
+  callingRenderFilters();
+}
+function callingUpdateFilterBadge(ctx) {
+  const el = document.getElementById(CC_PREFIX[ctx] + 'FilterCount'); if (!el) return;
+  const n = callingFilterCount(ctx);
+  el.textContent = n ? n : ''; el.style.display = n ? 'inline-flex' : 'none';
+}
+
+// ---------------- TODAY'S CALLS ----------------
+async function renderCallingTodaySection() {
+  if (!callingCreList.length && !callingPeList.length) await callingLoadPeople();
+  await callingLoadLeads();
+  callingFillSelect('ctCre', callingCreList, 'All CREs', 'id', 'name');
+  const creWrap = document.getElementById('ctCreWrap');
+  if (creWrap) creWrap.style.display = callingIsAdminish() ? '' : 'none';
+  callingUpdateFilterBadge('today');
+  await callingRenderToday();
+}
+function callingTodayBase() {
+  const dayStart = callingDayStart(), dayEnd = new Date(dayStart.getTime() + 86400000);
+  const creFilter = cVal('ctCre');
+  const mine = callingLeadsCache.filter(l => !creFilter || l.cre_id === creFilter);
+  const open = mine.filter(l => !['Assigned', 'Closed'].includes(l.call_status));
+  const due = open.filter(l => !l.next_call_at || new Date(l.next_call_at) < dayEnd);
+  const doneToday = mine.filter(l => l.last_called_at && new Date(l.last_called_at) >= dayStart);
+  return { dayStart, dayEnd, creFilter, due, doneToday };
+}
+async function callingRenderToday() {
+  const b = callingTodayBase();
+  const { data: logs } = await sb.from('rewire_calling_logs').select('cre_id, contact_status, disposition').gte('called_at', b.dayStart.toISOString()).lt('called_at', b.dayEnd.toISOString());
+  const todays = (logs || []).filter(l => !b.creFilter || l.cre_id === b.creFilter);
+  const attempts = todays.length;
+  const contacts = todays.filter(l => l.contact_status === 'Contacted').length;
+  const assigned = todays.filter(l => l.disposition === 'Assigned to PE').length;
+  const pct = (a, t) => t ? Math.round(a * 100 / t) + '%' : '';
+  const setK = (id, v, sub) => { const el = document.getElementById(id); if (el) el.innerHTML = v + (sub ? '<span class="cc-pct">' + sub + '</span>' : ''); };
+  setK('ctKpiAttempts', attempts);
+  setK('ctKpiContacts', contacts, pct(contacts, attempts));
+  setK('ctKpiAssigned', assigned, pct(assigned, contacts));
+  setK('ctKpiFollow', b.due.filter(l => l.call_status === 'Follow Up').length);
+  setK('ctKpiRetry', b.due.filter(l => l.call_status === 'Try Again').length);
+  setK('ctKpiFresh', b.due.filter(l => l.call_status === 'Fresh').length);
+  const dc = document.getElementById('ctDoneCount'); if (dc) dc.textContent = b.doneToday.length;
+  callingPage.today = 1;
+  callingRenderTodayList();
+}
+function callingRenderTodayList() {
+  const b = callingTodayBase();
+  let rows = callingShowDone ? b.doneToday : b.due;
+  rows = callingFilterRows(rows, 'today').filter(l => callingSearchMatch(l, 'ct'));
+  rows = rows.slice().sort((a, c) => (a.next_call_at ? new Date(a.next_call_at).getTime() : 0) - (c.next_call_at ? new Date(c.next_call_at).getTime() : 0));
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / CC_PAGE));
+  if (callingPage.today > pages) callingPage.today = pages;
+  const pageRows = rows.slice((callingPage.today - 1) * CC_PAGE, callingPage.today * CC_PAGE);
+  const body = document.getElementById('ccTodayList');
+  if (!body) return;
+  body.innerHTML = pageRows.length ? pageRows.map(l => callingCardHtml(l, 'today')).join('')
+    : '<div class="cc-empty"><i class="ti ti-phone-check" aria-hidden="true"></i><div>' + (callingShowDone ? 'No calls done today yet.' : 'All caught up — no calls pending for today.') + '</div></div>';
+  document.getElementById('ccTodayPager').innerHTML = callingPagerHtml('today', total, callingPage.today);
+  callingHydrateDetails(pageRows);
+}
+function callingToggleDone(checked) { callingShowDone = !!checked; callingPage.today = 1; callingRenderTodayList(); }
+
+// ---------------- DISPOSITION DRAWER ----------------
+async function callingEnsurePartners() {
+  if (callingPartners) return callingPartners;
+  if (typeof allPartners !== 'undefined' && allPartners && allPartners.length) { callingPartners = allPartners; return callingPartners; }
+  const { data } = await sb.from('rewire_partners').select('id, partner_name, mobile').order('partner_name');
+  callingPartners = data || [];
+  return callingPartners;
+}
+function openCallingDisposition(id) {
+  const l = callingLeadsCache.find(x => x.id === id);
+  if (!l) return;
+  callingActiveLeadId = id;
+  callingDispState = { contact: 'Contacted', crm: l.crm_status && CALL_CRM_PICK.includes(l.crm_status) ? l.crm_status : '', action: '', reason: '' };
+  document.getElementById('cdTitle').textContent = l.customer_name;
+  document.getElementById('cdInit').textContent = callingInitials(l.customer_name);
+  document.getElementById('cdStrip').innerHTML = `<span>Last Comm.: <b>${callingFmtDT(l.last_called_at)}</b></span><span>Next Comm.: <b>${callingFmtDT(l.next_call_at)}</b></span><span>Attempts: <b>${l.attempts || 0}</b></span>`;
+  document.getElementById('cdVeh').innerHTML = `<span>Vehicle: <b>${cEsc([l.make, l.model].filter(Boolean).join(' ') || l.vehicle_type || '—')}</b></span><span>Phone: <b>${cEsc(l.phone)}</b></span><span>Source: <b>${cEsc(l.lead_source || '—')}</b></span>`;
+  document.getElementById('cdLast').innerHTML = callingLastTalk(l);
+  document.getElementById('cdRemarks').value = '';
+  const tomorrow = new Date(Date.now() + 86400000);
+  document.getElementById('cdNextDate').value = tomorrow.toISOString().slice(0, 10);
+  document.getElementById('cdNextTime').value = '11:00';
+  callingFillSelect('cdPeSelect', callingPeList.map(p => ({ id: p.id, label: p.name + (p.role === 'Manager' ? ' (Manager)' : '') })), 'Select PE', 'id', 'label');
+  // DMS "New Lead Entry" fields — pre-filled from what the CRE already entered, so only the gaps are left to fill
+  document.getElementById('cdAsName').value = l.customer_name || '';
+  document.getElementById('cdAsPhone').value = l.phone || '';
+  document.getElementById('cdAsEmail').value = l.email || '';
+  document.getElementById('cdAsAddress').value = l.address || '';
+  document.getElementById('cdAsCity').value = l.city || '';
+  const masterSrc = (typeof getMasterListValues === 'function') ? getMasterListValues('lead_source') : [];
+  const srcList = masterSrc.length ? masterSrc : CALL_SOURCES;
+  const matchSrc = srcList.find(x => x.toLowerCase() === String(l.lead_source || '').toLowerCase()) || '';
+  document.getElementById('cdAsSource').innerHTML = '<option value="">Select source</option>' + srcList.map(x => '<option' + (x === matchSrc ? ' selected' : '') + '>' + cEsc(x) + '</option>').join('');
+  document.getElementById('cdAsLeadType').value = (l.lead_source || '').toLowerCase() === 'partner' ? 'Partner' : 'Direct';
+  const cityDl = document.getElementById('cdCityList');
+  if (cityDl && typeof getMasterListValues === 'function') cityDl.innerHTML = getMasterListValues('location').map(v => '<option value="' + cEsc(v) + '"></option>').join('');
+  callingEnsurePartners().then(ps => { document.getElementById('cdAsPartner').innerHTML = '<option value="">Select partner</option>' + ps.map(p => '<option value="' + p.id + '">' + cEsc(p.partner_name) + (p.mobile ? ' · ' + cEsc(p.mobile) : '') + '</option>').join(''); });
+  callingRenderDispUi();
+  openModal('callingDispModal');
+}
+function callingSetContact(v) { callingDispState = { contact: v, crm: callingDispState.crm, action: '', reason: '' }; callingRenderDispUi(); }
+function callingSetCrm(v) { callingDispState.crm = callingDispState.crm === v ? '' : v; callingRenderDispUi(); }
+function callingSetAction(v) { callingDispState.action = callingDispState.action === v ? '' : v; callingRenderDispUi(); }
+function callingSetReason(v) { callingDispState.reason = v; callingRenderDispUi(); }
+function callingRenderDispUi() {
+  const st = callingDispState;
+  const pill = (label, active, fn, icon, color) => `<button class="cc-pill ${active ? 'active' : ''}" ${color && active ? `style="background:${color};border-color:${color};"` : ''} onclick="${fn}">${icon ? `<i class="ti ${icon}" aria-hidden="true"></i> ` : ''}${label}</button>`;
+  document.getElementById('cdContactPills').innerHTML = pill('Contacted', st.contact === 'Contacted', "callingSetContact('Contacted')", 'ti-phone-check') + pill('Not Contacted', st.contact === 'Not Contacted', "callingSetContact('Not Contacted')", 'ti-phone-off');
+  const contacted = st.contact === 'Contacted';
+  document.getElementById('cdContactedBox').style.display = contacted ? '' : 'none';
+  document.getElementById('cdNotContactedBox').style.display = contacted ? 'none' : '';
+  document.getElementById('cdCrmPills').innerHTML = CALL_CRM_PICK.map(s => pill(s, st.crm === s, `callingSetCrm('${s}')`, '', CALL_CRM_COLORS[s])).join('');
+  const _l = callingLeadsCache.find(x => x.id === callingActiveLeadId);
+  const canAssign = !(_l && _l.converted_lead_id);
+  document.getElementById('cdActionPills').innerHTML = (canAssign ? pill('Assign to PE', st.action === 'Assign to PE', "callingSetAction('Assign to PE')", 'ti-user-share') : '') + pill('Call Later', st.action === 'Call Later', "callingSetAction('Call Later')", 'ti-clock');
+  document.getElementById('cdReasonPills').innerHTML = CALL_REASONS.map(r => pill(r, st.reason === r, `callingSetReason('${r}')`)).join('');
+  document.getElementById('cdPeBox').style.display = (st.action === 'Assign to PE') ? '' : 'none';
+  document.getElementById('cdAsPartnerWrap').style.display = cVal('cdAsLeadType') === 'Partner' ? '' : 'none';
+  const needDate = st.action === 'Call Later' || (!contacted && !st.action && st.reason && st.reason !== 'Invalid Number');
+  document.getElementById('cdNextBox').style.display = needDate ? '' : 'none';
+  document.getElementById('cdNextLabel').textContent = st.action === 'Call Later' ? 'Call Later — Date & Time' : 'Try Again — Date & Time';
+}
+async function submitCallingDisposition() {
+  const id = callingActiveLeadId;
+  const l = callingLeadsCache.find(x => x.id === id);
+  if (!l) return;
+  const st = callingDispState;
+  const contacted = st.contact === 'Contacted';
+  const remarks = cVal('cdRemarks').trim();
+  const crm = st.crm || null;
+  let nextCall = null, callStatus = l.call_status, disposition = null, reason = null;
+  const nextDate = cVal('cdNextDate'), nextTime = cVal('cdNextTime') || '11:00';
+  const nextIso = () => { const d = new Date(nextDate + 'T' + nextTime + ':00'); return isNaN(d) ? null : d.toISOString(); };
+  const nowIso = new Date().toISOString();
+
+  if (contacted && !crm) { notify('Select the Status (High Demand, Interested, …).', { icon: 'error' }); return; }
+  if (!contacted && !st.reason && !st.action) { notify('Select a reason (or Assign to PE / Call Later).', { icon: 'error' }); return; }
+  if (!contacted) reason = st.reason || null;
+
+  if (st.action === 'Assign to PE') {
+    const v = id2 => cVal(id2).trim();
+    const peId = v('cdPeSelect');
+    if (!peId) { notify('Select the PE to assign this lead to.', { icon: 'error' }); return; }
+    const data = { customer_name: v('cdAsName'), phone: v('cdAsPhone'), email: v('cdAsEmail'), address: v('cdAsAddress'), city: v('cdAsCity'),
+      lead_source: v('cdAsSource'), lead_type: v('cdAsLeadType'), partner_id: v('cdAsPartner') };
+    if (!data.customer_name || !/^\d{10}$/.test(data.phone)) { notify('Customer name and a 10-digit phone are required for the DMS lead.', { icon: 'error' }); return; }
+    if (!data.address) { notify('Address is required for the DMS lead.', { icon: 'error' }); return; }
+    if (!data.city) { notify('City is required for the DMS lead.', { icon: 'error' }); return; }
+    if (typeof isValidMasterValue === 'function' && !isValidMasterValue('location', data.city)) { notify('"' + data.city + '" is not in the Location master list — pick an existing city.', { icon: 'error', title: 'Invalid City' }); return; }
+    if (typeof normalizeMasterValue === 'function') data.city = normalizeMasterValue('location', data.city);
+    if (!data.lead_source) { notify('Select the Lead Source.', { icon: 'error' }); return; }
+    if (data.lead_type === 'Partner' && !data.partner_id) { notify('Select the Partner.', { icon: 'error' }); return; }
+    if (crm) await sb.from('rewire_calling_leads').update({ crm_status: crm }).eq('id', id);
+    const { data: leadNo, error } = await sb.rpc('assign_calling_lead_to_pe', { p_calling_id: id, p_pe_id: peId, p_remarks: remarks || null, p_data: data });
+    if (error) { notify('Could not assign: ' + error.message, { icon: 'error' }); return; }
+    await sb.from('rewire_calling_leads').update({ last_remarks: remarks || null }).eq('id', id);
+    closeModal('callingDispModal');
+    notify('Assigned to PE — DMS lead ' + leadNo + ' created.');
+    await renderCallingCurrentSection();
+    return;
+  }
+  if (st.action === 'Call Later') {
+    if (!nextDate) { notify('Select the call-later date.', { icon: 'error' }); return; }
+    disposition = 'Call Later'; nextCall = nextIso(); callStatus = 'Follow Up';
+  } else if (contacted) {
+    if (crm !== 'Closed') { notify('Select Assign to PE or Call Later.', { icon: 'error' }); return; }
+    disposition = 'Closed'; callStatus = 'Closed';
+  } else {
+    disposition = 'Not Contacted';
+    if (st.reason === 'Invalid Number') callStatus = 'Closed';
+    else {
+      if (!nextDate) { notify('Select the try-again date.', { icon: 'error' }); return; }
+      nextCall = nextIso(); callStatus = 'Try Again';
+    }
+  }
+  const { error: logErr } = await sb.from('rewire_calling_logs').insert({
+    calling_lead_id: id, cre_id: currentProfile.id, contact_status: st.contact, reason, disposition, crm_status: crm, remarks: remarks || null, next_call_at: nextCall,
+  });
+  if (logErr) { notify('Could not save: ' + logErr.message, { icon: 'error' }); return; }
+  if (l.converted_lead_id) callStatus = l.call_status; // already handed to a PE — keep it as Assigned
+  const { error } = await sb.from('rewire_calling_leads').update({
+    contact_status: st.contact, reason, disposition, call_status: callStatus, next_call_at: nextCall, crm_status: crm || l.crm_status || null,
+    last_remarks: remarks || l.last_remarks || null,
+    attempts: (l.attempts || 0) + 1, contacts: (l.contacts || 0) + (contacted ? 1 : 0),
+    last_called_at: nowIso, updated_at: nowIso,
+  }).eq('id', id);
+  if (error) { notify('Could not update lead: ' + error.message, { icon: 'error' }); return; }
+  closeModal('callingDispModal');
+  notify('Disposition saved.');
+  await renderCallingCurrentSection();
+}
+async function renderCallingCurrentSection() {
+  if (currentSectionName === 'calling-leads') await renderCallingLeadsSection();
+  else if (currentSectionName === 'calling-other') await renderCallingOtherSection();
+  else await renderCallingTodaySection();
+}
+
+// ---------------- ADD LEAD ----------------
+function callingAddTypeChanged() {
+  const lt = document.getElementById('calLeadType').value;
+  document.getElementById('calScrapBox').style.display = lt === 'Vehicle Scrap' ? '' : 'none';
+  callingAddDealChanged();
+}
+function callingAddDealChanged() {
+  const scrap = document.getElementById('calLeadType').value === 'Vehicle Scrap';
+  document.getElementById('calBrokerBox').style.display = (scrap && document.getElementById('calDealType').value === 'Broker') ? '' : 'none';
+}
+async function callingBrokerNames() {
+  const ps = await callingEnsurePartners();
+  return ps.map(p => p.partner_name).filter(Boolean);
+}
+function callingProper(el) { if (typeof toProperCase === 'function') el.value = toProperCase(el.value); }
+async function openCallingAddLead() {
+  if (!callingCreList.length && !callingPeList.length) await callingLoadPeople();
+  ['calName', 'calPhone', 'calAlt', 'calCity', 'calMake', 'calModel', 'calBrokerName', 'calRemarks'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.getElementById('calLeadType').innerHTML = '<option value="">Select</option>' + CALL_LEAD_TYPES.map(t => '<option>' + t + '</option>').join('');
+  document.getElementById('calVehType').innerHTML = '<option value="">Select</option>' + CALL_VEHICLE_TYPES.map(t => '<option>' + t + '</option>').join('');
+  document.getElementById('calDealType').innerHTML = '<option value="">Select</option>' + CALL_DEAL_TYPES.map(t => '<option>' + t + '</option>').join('');
+  document.getElementById('calSource').innerHTML = '<option value="">Select</option>' + CALL_SOURCES.map(t => '<option>' + t + '</option>').join('');
+  const opts = arr => arr.map(v => '<option value="' + cEsc(v) + '"></option>').join('');
+  if (typeof getMasterListValues === 'function') {
+    document.getElementById('calCityList').innerHTML = opts(getMasterListValues('location'));
+    document.getElementById('calMakeList').innerHTML = opts(getMasterListValues('vehicle_make'));
+  }
+  const creSel = document.getElementById('calCre');
+  if (callingIsAdminish()) {
+    callingFillSelect('calCre', callingCreList, 'Select CRE', 'id', 'name');
+    creSel.disabled = false;
+  } else {
+    creSel.innerHTML = '<option value="' + currentProfile.id + '">' + cEsc(currentProfile.name) + '</option>';
+    creSel.value = currentProfile.id; creSel.disabled = true;
+  }
+  callingAddTypeChanged();
+  openModal('callingAddLeadModal');
+  callingBrokerNames().then(n => { document.getElementById('calBrokerList').innerHTML = opts(n); });
+}
+async function submitCallingAddLead() {
+  const v = id => (document.getElementById(id).value || '').trim();
+  const name = v('calName'), ph10 = v('calPhone'), alt = v('calAlt');
+  if (!name) { notify('Customer name is required.', { icon: 'error' }); return; }
+  if (!/^\d{10}$/.test(ph10)) { notify('Enter a valid 10-digit mobile number.', { icon: 'error' }); return; }
+  if (alt && !/^\d{10}$/.test(alt)) { notify('Alt. phone must be 10 digits.', { icon: 'error' }); return; }
+  let city = v('calCity');
+  if (city && typeof isValidMasterValue === 'function' && !isValidMasterValue('location', city)) { notify('"' + city + '" is not in the Location master list — pick an existing option.', { icon: 'error', title: 'Invalid Location' }); return; }
+  if (city && typeof normalizeMasterValue === 'function') city = normalizeMasterValue('location', city);
+  if (!v('calSource')) { notify('Select the Lead Source.', { icon: 'error' }); return; }
+  const lt = v('calLeadType');
+  if (!lt) { notify('Select the Lead Type.', { icon: 'error' }); return; }
+  const cre = callingIsAdminish() ? v('calCre') : currentProfile.id;
+  if (!cre) { notify('Select the CRE for this lead.', { icon: 'error' }); return; }
+  let make = v('calMake'), deal = null, brokerName = null;
+  if (make && typeof isValidMasterValue === 'function' && !isValidMasterValue('vehicle_make', make)) { notify('"' + make + '" is not in the Make master list — pick an existing option.', { icon: 'error', title: 'Invalid Make' }); return; }
+  if (make && typeof normalizeMasterValue === 'function') make = normalizeMasterValue('vehicle_make', make);
+  if (lt === 'Vehicle Scrap') {
+    deal = v('calDealType');
+    if (!deal) { notify('Select the Deal Type.', { icon: 'error' }); return; }
+    if (deal === 'Broker') {
+      brokerName = v('calBrokerName');
+      if (!brokerName) { notify('Broker name is required.', { icon: 'error' }); return; }
+      const names = await callingBrokerNames();
+      const hit = names.find(n => n.toLowerCase() === brokerName.toLowerCase());
+      if (!hit) { notify('"' + brokerName + '" is not a registered broker/partner — pick one from the list.', { icon: 'error', title: 'Invalid Broker' }); return; }
+      brokerName = hit;
+    }
+  }
+  const { data: dup } = await sb.from('rewire_calling_leads').select('call_no').eq('phone', ph10).limit(1);
+  if (dup && dup.length && !confirm('A calling lead with this number already exists (' + dup[0].call_no + '). Add anyway?')) return;
+  const { data: dms } = await sb.from('rewire_master_data').select('lead_no').eq('phone', ph10).limit(1);
+  if (dms && dms.length && !confirm('This number is already in DMS (' + dms[0].lead_no + '). Add anyway?')) return;
+  const scrap = lt === 'Vehicle Scrap';
+  const { error } = await sb.from('rewire_calling_leads').insert({
+    customer_name: name, phone: ph10, alt_phone: alt || null, city: city || null,
+    lead_type: lt, lead_source: v('calSource'), deal_type: deal, broker_name: brokerName,
+    vehicle_type: scrap ? (v('calVehType') || null) : null, make: scrap ? (make || null) : null, model: scrap ? (v('calModel') || null) : null,
+    remarks: v('calRemarks') || null, cre_id: cre, created_by: currentProfile.id,
+  });
+  if (error) { notify('Could not add lead: ' + error.message, { icon: 'error' }); return; }
+  closeModal('callingAddLeadModal');
+  notify(scrap ? 'Lead added.' : 'Lead added — see the Other Leads tab.');
+  await renderCallingCurrentSection();
+}
+
+// ---------------- BULK UPLOAD ----------------
+function openCallingBulk() {
+  callingBulkRows = null;
+  const f = document.getElementById('callingBulkFile'); if (f) f.value = '';
+  document.getElementById('callingBulkPreview').innerHTML = '';
+  openModal('callingBulkModal');
+}
+function downloadCallingTemplate() {
+  downloadXlsx('Calling_Leads_Upload_Format.xlsx', [{
+    'Customer Name': 'Rahul Sharma', 'Phone': '9876543210', 'Alt Phone': '', 'Location': 'Jaipur', 'Vehicle Type': 'M (Cars)',
+    'Make': 'Maruti', 'Model': 'Alto', 'Lead Source': 'Exotel', 'Lead Type': 'Vehicle Scrap', 'Deal Type': 'Direct', 'Broker Name': '', 'Remarks': '', 'CRE': 'CRE name (admin only; blank = you)',
+  }], 'Calling Leads');
+}
+function callingBulkFileSelected(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' });
+      const json = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+      const rows = json.map(r => ({
+        customer_name: bulkCell(r, ['customer name', 'name']), phone: String(bulkCell(r, ['phone', 'mobile', 'mobile no']) || '').replace(/\D/g, '').replace(/^91(?=\d{10}$)/, ''),
+        alt_phone: bulkCell(r, ['alt phone', 'alternate phone']), city: bulkCell(r, ['location', 'city']),
+        vehicle_type: bulkCell(r, ['vehicle type']), make: bulkCell(r, ['make']), model: bulkCell(r, ['model']),
+        lead_source: bulkCell(r, ['lead source', 'source']), lead_type: bulkCell(r, ['lead type']), deal_type: bulkCell(r, ['deal type']), broker_name: bulkCell(r, ['broker name']), remarks: bulkCell(r, ['remarks']), cre_name: bulkCell(r, ['cre']),
+      })).filter(r => r.customer_name || r.phone);
+      const bad = rows.filter(r => !r.customer_name || r.phone.length !== 10);
+      callingBulkRows = rows.filter(r => r.customer_name && r.phone.length === 10);
+      document.getElementById('callingBulkPreview').innerHTML = '<div class="info-banner"><span><b>' + callingBulkRows.length + '</b> valid row(s)' + (bad.length ? ' · <b style="color:#dc2626;">' + bad.length + ' skipped</b> (missing name or invalid 10-digit phone)' : '') + '.</span></div>';
+    } catch (err) { notify('Could not read file: ' + err.message, { icon: 'error' }); }
+  };
+  reader.readAsArrayBuffer(file);
+}
+async function runCallingBulkUpload() {
+  if (!callingBulkRows || !callingBulkRows.length) { notify('Choose a file first.', { icon: 'error' }); return; }
+  if (!callingCreList.length) await callingLoadPeople();
+  const existing = new Set((await fetchAllRows((f, t) => sb.from('rewire_calling_leads').select('phone').range(f, t)).catch(() => [])).map(x => x.phone));
+  const creByName = {}; callingCreList.forEach(c => { creByName[c.name.toLowerCase()] = c.id; });
+  let skippedDup = 0, noCre = 0; const out = []; const seen = new Set();
+  callingBulkRows.forEach(r => {
+    if (existing.has(r.phone) || seen.has(r.phone)) { skippedDup++; return; }
+    let cre = callingIsAdminish() ? (r.cre_name ? creByName[String(r.cre_name).toLowerCase()] : null) : currentProfile.id;
+    if (!cre && callingIsAdminish()) { noCre++; return; }
+    seen.add(r.phone);
+    out.push({ customer_name: r.customer_name, phone: r.phone, alt_phone: r.alt_phone || null, city: r.city || null, vehicle_type: r.vehicle_type || null, make: r.make || null, model: r.model || null,
+      lead_source: r.lead_source || null, lead_type: r.lead_type || null, deal_type: r.deal_type || null, broker_name: r.broker_name || null, remarks: r.remarks || null, cre_id: cre, created_by: currentProfile.id });
+  });
+  let saved = 0;
+  for (let i = 0; i < out.length; i += 200) {
+    const { error } = await sb.from('rewire_calling_leads').insert(out.slice(i, i + 200));
+    if (error) { notify('Upload stopped: ' + error.message, { icon: 'error' }); break; }
+    saved += Math.min(200, out.length - i);
+  }
+  closeModal('callingBulkModal');
+  notify(saved + ' lead(s) uploaded' + (skippedDup ? ', ' + skippedDup + ' duplicate phone(s) skipped' : '') + (noCre ? ', ' + noCre + ' row(s) skipped (CRE name not found)' : '') + '.');
+  await renderCallingCurrentSection();
+}
+
+// ---------------- TOTAL LEADS ----------------
+async function renderCallingLeadsSection() {
+  if (!callingCreList.length && !callingPeList.length) await callingLoadPeople();
+  await callingLoadLeads();
+  callingSelectedIds = new Set();
+  callingFillSelect('clCre', callingCreList, 'All CREs', 'id', 'name');
+  callingFillSelect('clAssignCre', callingCreList, 'Assign selected to CRE…', 'id', 'name');
+  const adm = callingIsAdminish();
+  ['clCreWrap', 'clAssignWrap'].forEach(id => { const el = document.getElementById(id); if (el) el.style.display = adm ? '' : 'none'; });
+  callingUpdateFilterBadge('leads');
+  callingPage.leads = 1;
+  callingRenderLeadsList();
+}
+function callingFilteredLeads() {
+  const cre = cVal('clCre');
+  return callingFilterRows(callingLeadsCache.filter(l => !cre || l.cre_id === cre), 'leads').filter(l => callingSearchMatch(l, 'cl'));
+}
+function callingRenderLeadsList() {
+  const rows = callingFilteredLeads();
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / CC_PAGE));
+  if (callingPage.leads > pages) callingPage.leads = pages;
+  const pageRows = rows.slice((callingPage.leads - 1) * CC_PAGE, callingPage.leads * CC_PAGE);
+  document.getElementById('ccLeadsList').innerHTML = pageRows.length ? pageRows.map(l => callingCardHtml(l, 'leads')).join('') : '<div class="cc-empty"><i class="ti ti-database-off" aria-hidden="true"></i><div>No leads found.</div></div>';
+  document.getElementById('ccLeadsPager').innerHTML = callingPagerHtml('leads', total, callingPage.leads);
+  document.getElementById('clCount').textContent = total + ' leads';
+  callingHydrateDetails(pageRows);
+}
+function callingToggleSel(id, on) { if (on) callingSelectedIds.add(id); else callingSelectedIds.delete(id); }
+function callingToggleAll(on) {
+  const rows = callingFilteredLeads();
+  rows.slice((callingPage.leads - 1) * CC_PAGE, callingPage.leads * CC_PAGE).forEach(l => { if (on) callingSelectedIds.add(l.id); else callingSelectedIds.delete(l.id); });
+  callingRenderLeadsList();
+}
+async function callingBulkAssignCre() {
+  const cre = cVal('clAssignCre');
+  if (!cre) { notify('Pick a CRE first.', { icon: 'error' }); return; }
+  const ids = Array.from(callingSelectedIds);
+  if (!ids.length) { notify('Tick the leads to assign.', { icon: 'error' }); return; }
+  for (let i = 0; i < ids.length; i += 200) {
+    const { error } = await sb.from('rewire_calling_leads').update({ cre_id: cre, updated_at: new Date().toISOString() }).in('id', ids.slice(i, i + 200));
+    if (error) { notify('Could not assign: ' + error.message, { icon: 'error' }); return; }
+  }
+  notify(ids.length + ' lead(s) assigned.');
+  await renderCallingLeadsSection();
+}
+function exportCallingLeadsExcel() {
+  const rows = callingFilteredLeads();
+  if (!rows.length) { notify('No leads to export.', { icon: 'info' }); return; }
+  downloadXlsx('calling-leads.xlsx', rows.map(l => ({
+    'Call No.': l.call_no, 'Customer': l.customer_name, 'Phone': l.phone, 'Alt Phone': l.alt_phone || '', 'Location': l.city || '', 'Vehicle Type': l.vehicle_type || '',
+    'Make': l.make || '', 'Model': l.model || '', 'Source': l.lead_source || '', 'CRE': l.cre ? l.cre.name : '',
+    'Lead Type': l.lead_type || '', 'Deal Type': l.deal_type || '', 'Broker Name': l.broker_name || '', 'Call Status': l.call_status, 'Status': l.crm_status || '', 'Last Remarks': l.last_remarks || '', 'Attempts': l.attempts || 0, 'Last Disposition': l.disposition || '', 'Last Call': l.last_called_at ? new Date(l.last_called_at).toLocaleString() : '',
+    'Next Call': l.next_call_at ? new Date(l.next_call_at).toLocaleString() : '', 'Assigned PE': l.pe ? l.pe.name : '', 'DMS Lead No.': l.lead ? l.lead.lead_no : '', 'DMS Status': callingDmsStatus(l.lead), 'Remarks': l.remarks || '',
+  })), 'Calling Leads', ['Phone', 'Alt Phone']);
+}
+
+// ---------------- OTHER LEADS (Parts / New Vehicle / Misc) — remarks only, no calling flow ----------------
+async function renderCallingOtherSection() {
+  if (!callingCreList.length && !callingPeList.length) await callingLoadPeople();
+  await callingLoadLeads();
+  callingFillSelect('coCre', callingCreList, 'All CREs', 'id', 'name');
+  document.getElementById('coCreWrap').style.display = callingIsAdminish() ? '' : 'none';
+  callingPage.other = 1;
+  callingRenderOtherList();
+}
+function callingOtherToggleDone(on) { callingOtherShowDone = !!on; callingPage.other = 1; callingRenderOtherList(); }
+function callingRenderOtherList() {
+  const cre = cVal('coCre');
+  const done = l => l.call_status === 'Closed';
+  const doneRows = callingOtherCache.filter(done);
+  document.getElementById('coDoneCount').textContent = doneRows.length;
+  let rows = (callingOtherShowDone ? doneRows : callingOtherCache.filter(l => !done(l))).filter(l => (!cre || l.cre_id === cre) && callingSearchMatch(l, 'co'));
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / CC_PAGE));
+  if (callingPage.other > pages) callingPage.other = pages;
+  const pageRows = rows.slice((callingPage.other - 1) * CC_PAGE, callingPage.other * CC_PAGE);
+  document.getElementById('coCount').textContent = total + (callingOtherShowDone ? ' submitted' : ' pending');
+  document.getElementById('ccOtherList').innerHTML = pageRows.length ? pageRows.map(l => {
+    const waNum = String(l.phone || '').replace(/\D/g, '');
+    const isDone = done(l);
+    return `<div class="cc-card" style="border-left-color:#7c3aed;"><div class="cc-card-main">
+      <div class="cc-avatar" style="background:#7c3aed1a;color:#7c3aed;">${cEsc(callingInitials(l.customer_name))}</div>
+      <div class="cc-card-info">
+        <div class="cc-name">${cEsc(l.customer_name)} <span class="cc-chip" style="color:#7c3aed;background:#7c3aed1a;border-color:#7c3aed55;">${cEsc(l.lead_type)}</span>${isDone ? ' <span class="cc-chip" style="color:#059669;background:#0596691a;border-color:#05966955;">Submitted</span>' : ''}</div>
+        <div class="cc-phone"><i class="ti ti-phone" aria-hidden="true"></i> ${cEsc(l.phone)}</div>
+        <div class="cc-meta">${[l.call_no, l.lead_source, l.city].filter(Boolean).map(cEsc).join(' · ')} · CRE: <b>${cEsc(l.cre ? l.cre.name : '—')}</b></div>
+        ${l.remarks ? `<div class="cc-meta">Lead remarks: ${cEsc(l.remarks)}</div>` : ''}
+        ${isDone ? callingLastTalk(l) : ''}
+      </div>
+      <div class="cc-card-actions">
+        <a class="cc-act cc-act-call" href="tel:${cEsc(l.phone)}" title="Call"><i class="ti ti-phone" aria-hidden="true"></i></a>
+        <button class="cc-act cc-act-wa" title="Send WhatsApp message" onclick="callingSendWa('${l.id}')"><i class="ti ti-brand-whatsapp" aria-hidden="true"></i></button>
+      </div></div>
+      ${isDone ? '' : `<div class="cc-other-row"><input id="coRem_${l.id}" placeholder="Enter remarks…" value="${cEsc(l.last_remarks || '')}" /><button class="btn btn-primary cc-update" onclick="withLoading(this, () => submitCallingOther('${l.id}'))">Submit</button></div>`}
+    </div>`;
+  }).join('') : '<div class="cc-empty"><i class="ti ti-notes-off" aria-hidden="true"></i><div>' + (callingOtherShowDone ? 'Nothing submitted yet.' : 'No pending leads.') + '</div></div>';
+  document.getElementById('ccOtherPager').innerHTML = callingPagerHtml('other', total, callingPage.other);
+}
+async function submitCallingOther(id) {
+  const rem = cVal('coRem_' + id).trim();
+  if (!rem) { notify('Enter remarks first.', { icon: 'error' }); return; }
+  const now = new Date().toISOString();
+  const { error } = await sb.from('rewire_calling_leads').update({ last_remarks: rem, call_status: 'Closed', disposition: 'Remarks Submitted', last_called_at: now, updated_at: now }).eq('id', id);
+  if (error) { notify('Could not save: ' + error.message, { icon: 'error' }); return; }
+  notify('Submitted.');
+  await renderCallingOtherSection();
+}
+
+// ---------------- PERFORMANCE + LEADERBOARD ----------------
+function showCallingPerfTab(tab) {
+  callingPerfTab = tab;
+  document.getElementById('cpTabPerformance').className = 'cc-tab' + (tab === 'performance' ? ' on' : '');
+  document.getElementById('cpTabLeaderboard').className = 'cc-tab' + (tab === 'leaderboard' ? ' on' : '');
+  document.getElementById('cpPerformancePane').style.display = tab === 'performance' ? '' : 'none';
+  document.getElementById('cpLeaderboardPane').style.display = tab === 'leaderboard' ? '' : 'none';
+}
+async function renderCallingPerformanceSection() {
+  if (!callingCreList.length && !callingPeList.length) await callingLoadPeople();
+  const dateEl = document.getElementById('cpDate');
+  if (!dateEl.value) dateEl.value = new Date().toISOString().slice(0, 10);
+  const monthEl = document.getElementById('cpMonth');
+  if (monthEl && !monthEl.dataset.init) { monthEl.value = new Date().toISOString().slice(0, 7); monthEl.dataset.init = '1'; }
+  document.getElementById('cpCreWrap').style.display = callingIsAdminish() ? '' : 'none';
+  callingFillSelect('cpCre', callingCreList, 'Whole team', 'id', 'name');
+  showCallingPerfTab(callingPerfTab);
+  await callingRenderPerformance();
+}
+function callingRing(pct, color, label, sub) {
+  const r = 24, c = 2 * Math.PI * r, p = Math.max(0, Math.min(100, pct || 0));
+  return `<div class="cc-ring"><svg width="64" height="64" viewBox="0 0 64 64"><circle cx="32" cy="32" r="${r}" fill="none" stroke="#eef2f7" stroke-width="6"/><circle cx="32" cy="32" r="${r}" fill="none" stroke="${color}" stroke-width="6" stroke-linecap="round" stroke-dasharray="${(c * p / 100).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 32 32)"/><text x="32" y="36" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">${Math.round(p)}%</text></svg><div><div class="cc-ring-l">${label}</div><div class="cc-ring-s">${sub}</div></div></div>`;
+}
+function callingChartSvg(items) {
+  const W = 560, H = 230, L = 34, B = 26, T = 10, R = 8;
+  const rawMax = Math.max(1, ...items.map(i => i.a));
+  const step = Math.max(1, Math.ceil(rawMax / 4)), max = step * 4;
+  const iw = (W - L - R) / items.length, bw = Math.min(26, iw * 0.55);
+  const y = v => T + (H - T - B) * (1 - v / max);
+  let g = '';
+  for (let k = 0; k <= 4; k++) { const v = step * k; g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="#e2e8f0" stroke-dasharray="3 3"/><text x="${L - 6}" y="${y(v) + 3}" text-anchor="end" font-size="9" fill="#94a3b8">${v}</text>`; }
+  let bars = '', pts = [], dots = '', labs = '';
+  items.forEach((it, i) => {
+    const cx = L + iw * i + iw / 2;
+    bars += `<rect x="${cx - bw / 2}" y="${y(it.a)}" width="${bw}" height="${(H - B) - y(it.a)}" rx="3" fill="url(#ccBar)"><title>${it.label}: ${it.a} attempts, ${it.c} contacts</title></rect>`;
+    pts.push(cx + ',' + y(it.c)); dots += `<circle cx="${cx}" cy="${y(it.c)}" r="3.5" fill="#fff" stroke="#10b981" stroke-width="2"/>`;
+    labs += `<text x="${cx}" y="${H - 8}" text-anchor="middle" font-size="9" fill="#64748b">${it.label}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="xMidYMid meet"><defs><linearGradient id="ccBar" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ea6a1f"/><stop offset="1" stop-color="#f8c9a8"/></linearGradient></defs>${g}${bars}<polyline points="${pts.join(' ')}" fill="none" stroke="#10b981" stroke-width="2"/>${dots}${labs}</svg>`;
+}
+async function callingRenderPerformance() {
+  const date = cVal('cpDate');
+  const dayStart = callingDayStart(date), dayEnd = new Date(dayStart.getTime() + 86400000);
+  const weekStart = new Date(dayStart.getTime() - 6 * 86400000);
+  const creSel = callingIsAdminish() ? cVal('cpCre') : currentProfile.id;
+
+  const { data: board } = await sb.rpc('calling_leaderboard', { p_from: dayStart.toISOString(), p_to: dayEnd.toISOString() });
+  const team = board || [];
+  const medal = i => i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : (i + 1);
+  document.getElementById('tbodyCallingLeaderboard').innerHTML = team.length ? team.map((r, i) => `<tr${r.cre_id === currentProfile.id ? ' style="background:#eff6ff;font-weight:600;"' : ''}><td>${medal(i)}</td><td>${cEsc(r.cre_name)}</td><td>${r.attempts}</td><td>${r.contacts}</td><td>${r.assigned}</td><td>${r.follow_ups}</td><td><b>${r.score}</b></td></tr>`).join('')
+    : '<tr><td colspan="7" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No CRE users yet.</td></tr>';
+
+  const mine = creSel ? team.find(r => r.cre_id === creSel) : null;
+  const sum = f => team.reduce((s, r) => s + Number(r[f] || 0), 0);
+  const attempts = mine ? Number(mine.attempts) : sum('attempts'), contacts = mine ? Number(mine.contacts) : sum('contacts');
+  const assigned = mine ? Number(mine.assigned) : sum('assigned'), follow = mine ? Number(mine.follow_ups) : sum('follow_ups');
+  const score = mine ? Number(mine.score) : sum('score');
+  const rank = mine ? (team.findIndex(r => r.cre_id === creSel) + 1) : '—';
+  await callingLoadLeads();
+  const pool = callingLeadsCache.filter(l => !creSel || l.cre_id === creSel);
+  const openLeads = pool.filter(l => !['Assigned', 'Closed'].includes(l.call_status));
+  const fresh = openLeads.filter(l => l.call_status === 'Fresh').length;
+  const pendingToday = openLeads.filter(l => !l.next_call_at || new Date(l.next_call_at) < dayEnd).length;
+
+  const { data: logs } = await sb.from('rewire_calling_logs').select('cre_id, contact_status, called_at').gte('called_at', weekStart.toISOString()).lt('called_at', dayEnd.toISOString()).order('called_at');
+  const rows = (logs || []).filter(l => !creSel || l.cre_id === creSel);
+  const todayRows = rows.filter(l => new Date(l.called_at) >= dayStart);
+  let firstT = '—', lastT = '—', rate = '—';
+  if (todayRows.length) {
+    const t0 = new Date(todayRows[0].called_at), t1 = new Date(todayRows[todayRows.length - 1].called_at);
+    firstT = callingFmtTime(t0); lastT = callingFmtTime(t1);
+    rate = Math.round(todayRows.length / Math.max(1, (t1 - t0) / 3600000)) + ' calls/hr';
+  }
+  const pct = (a, b) => b ? a * 100 / b : 0;
+  document.getElementById('cpTop').innerHTML = `
+    <div class="cc-pcard cc-pcard-left"><div class="cc-pname"><i class="ti ti-user-circle" aria-hidden="true"></i> ${cEsc(mine ? mine.cre_name : (creSel ? '' : 'Whole team'))}</div>
+      <div class="cc-pbox"><span>Rank</span><b>${rank}${mine ? ' <small>/ ' + team.length + '</small>' : ''}</b></div>
+      <div class="cc-pbox"><span>Score</span><b>${score}</b></div>
+      <div class="cc-pfacts"><div><span>Calling Rate</span><b>${rate}</b></div><div><span>First Call Time</span><b>${firstT}</b></div><div><span>Last Call Time</span><b>${lastT}</b></div></div></div>
+    <div class="cc-pcard cc-pcard-right"><div class="cc-ptitle">Calling Performance <span class="cc-ptop-stats">Allotted <b>${openLeads.length}</b> &nbsp; Fresh <b>${fresh}</b> &nbsp; Pending today <b>${pendingToday}</b></span></div>
+      <div class="cc-rings">
+        ${callingRing(pct(attempts, attempts + pendingToday), '#3b82f6', 'Attempts', attempts + ' / ' + (attempts + pendingToday))}
+        ${callingRing(pct(contacts, attempts), '#ef4444', 'Contacts', contacts + ' / ' + attempts)}
+        ${callingRing(pct(assigned, contacts), '#16a34a', 'Assigned to PE', assigned + ' / ' + contacts)}
+        ${callingRing(pct(follow, contacts), '#8b5cf6', 'Follow-ups set', follow + ' / ' + contacts)}
+        ${callingRing(pct(attempts - contacts, attempts), '#f59e0b', 'Not contacted', (attempts - contacts) + ' / ' + attempts)}
+      </div></div>`;
+
+  const hourly = {}; for (let h = 8; h <= 20; h++) hourly[h] = { a: 0, c: 0 };
+  todayRows.forEach(l => { const h = Math.min(20, Math.max(8, new Date(l.called_at).getHours())); hourly[h].a++; if (l.contact_status === 'Contacted') hourly[h].c++; });
+  const daily = {}; for (let i = 0; i < 7; i++) { const d = new Date(weekStart.getTime() + i * 86400000); daily[d.toDateString()] = { label: d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }), a: 0, c: 0 }; }
+  rows.forEach(l => { const k = new Date(l.called_at).toDateString(); if (daily[k]) { daily[k].a++; if (l.contact_status === 'Contacted') daily[k].c++; } });
+  document.getElementById('cpHourly').innerHTML = callingChartSvg(Object.keys(hourly).map(h => ({ label: (h % 12 || 12) + (h < 12 ? ' AM' : ' PM'), a: hourly[h].a, c: hourly[h].c })));
+  document.getElementById('cpWeekly').innerHTML = callingChartSvg(Object.values(daily));
+  callingRenderSummary();
+}
+// Status-wise summary per CRE (like the team's Google Sheet): one row per CRE, one column per status, month-wise
+const CALL_SUM_COLS = ['Closed', 'High Demand', 'Interested', 'Open', 'Purchased', 'Vehicle Backlog', 'Vehicle HPN'];
+function callingSummaryData() {
+  const month = cVal('cpMonth');
+  const creSel = callingIsAdminish() ? cVal('cpCre') : currentProfile.id;
+  const out = {};
+  callingLeadsCache.forEach(l => {
+    if (creSel && l.cre_id !== creSel) return;
+    if (month && String(l.created_at || '').slice(0, 7) !== month) return;
+    const eff = callingDmsStatus(l.lead) === 'Purchased' ? 'Purchased' : l.crm_status;
+    if (!eff || !CALL_SUM_COLS.includes(eff)) return;
+    const name = l.cre ? l.cre.name : '—';
+    const r = out[name] = out[name] || { name, total: 0, nofu: 0 };
+    r[eff] = (r[eff] || 0) + 1; r.total++;
+    if (!['Assigned', 'Closed'].includes(l.call_status) && !l.next_call_at) r.nofu++;
+  });
+  return Object.values(out).sort((a, b) => a.name.localeCompare(b.name));
+}
+function callingRenderSummary() {
+  const el = document.getElementById('cpSummary'); if (!el) return;
+  const rows = callingSummaryData();
+  const tot = { total: 0, nofu: 0 }; CALL_SUM_COLS.forEach(c => tot[c] = 0);
+  rows.forEach(r => { CALL_SUM_COLS.forEach(c => tot[c] += (r[c] || 0)); tot.total += r.total; tot.nofu += r.nofu; });
+  const td = v => '<td>' + (v || 0) + '</td>';
+  el.innerHTML = '<table class="cc-sum"><thead><tr><th style="text-align:left;">CRE Name</th>' + CALL_SUM_COLS.map(c => '<th>' + c + '</th>').join('') + '<th>Total</th><th class="cc-sum-y">Without Next Follow-up Date</th></tr></thead><tbody>'
+    + (rows.length ? rows.map(r => '<tr><td style="text-align:left;font-weight:600;">' + cEsc(r.name) + '</td>' + CALL_SUM_COLS.map(c => td(r[c])).join('') + '<td><b>' + r.total + '</b></td><td class="cc-sum-yc">' + r.nofu + '</td></tr>').join('')
+      + '<tr class="cc-sum-tot"><td style="text-align:left;">Total</td>' + CALL_SUM_COLS.map(c => '<td>' + tot[c] + '</td>').join('') + '<td>' + tot.total + '</td><td class="cc-sum-y">' + tot.nofu + '</td></tr>'
+      : '<tr><td colspan="' + (CALL_SUM_COLS.length + 3) + '" style="text-align:center;color:#94a3b8;padding:22px;">No status-tagged leads for this month.</td></tr>')
+    + '</tbody></table>';
+}
+function exportCallingSummaryExcel() {
+  const rows = callingSummaryData();
+  if (!rows.length) { notify('Nothing to export.', { icon: 'info' }); return; }
+  downloadXlsx('calling-summary-' + (cVal('cpMonth') || 'all') + '.xlsx', rows.map(r => {
+    const o = { 'CRE Name': r.name }; CALL_SUM_COLS.forEach(c => o[c] = r[c] || 0); o['Total'] = r.total; o['Without Next Follow-up Date'] = r.nofu; return o;
+  }), 'Summary');
+}
+</script>

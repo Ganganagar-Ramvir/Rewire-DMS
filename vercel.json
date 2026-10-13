@@ -1,0 +1,17 @@
+{
+  "buildCommand": "node scripts/build.js",
+  "outputDirectory": "public",
+  "functions": {
+    "api/rpc.js": { "maxDuration": 60, "memory": 1536 },
+    "api/cron/daily-reports.js": { "maxDuration": 60 },
+    "api/cron/sale-reports.js": { "maxDuration": 60 }
+  },
+  "rewrites": [
+    { "source": "/", "has": [{ "type": "query", "key": "page", "value": "login" }], "destination": "/login.html" },
+    { "source": "/", "has": [{ "type": "query", "key": "page", "value": "manifest" }], "destination": "/manifest.webmanifest" }
+  ],
+  "crons": [
+    { "path": "/api/cron/daily-reports", "schedule": "30 4 * * *" },
+    { "path": "/api/cron/sale-reports",  "schedule": "30 3 * * *" }
+  ]
+}

@@ -1,0 +1,1442 @@
+<script>
+// PIPELINE: submit functions for every stage form (Valuation through Head Approval) + RC dispatch from the PE side. Pairs with Modals-Pipeline.html.
+// ------------------------------------------------------------
+// STAGE 1 — VALUATION
+// ------------------------------------------------------------
+async function submitValuationForm() {
+  if (!activeLeadId) { notify('No lead selected'); return; }
+  const status = document.getElementById('valStatus').value;
+  if (!status) { notify('Please select a Status', { icon: 'error', title: 'Missing field' }); return; }
+
+  if (status === 'Lost') {
+    const { error } = await sb.from('rewire_master_data').update({
+      overall_status: 'Closed Lost', lead_status: 'Closed Lost with Reason', lost_at_stage: 'Valuation', last_updated_by: currentProfile.id,
+    }).eq('id', activeLeadId);
+    if (error) { notify('Error marking lost: ' + error.message, { icon: 'error' }); return; }
+    notify('Lead marked as Lost.');
+    closeModal('valModal');
+    await refreshLeadsTable();
+    return;
+  }
+
+  // Fetched here (rather than lower down, where it used to live) since the
+  // RC Copy mandatory-check below needs to know if a file was already
+  // uploaded on an earlier save of this same lead — file inputs can't be
+  // pre-filled, so on a re-edit an empty file input doesn't mean "missing".
+  // findLeadInAnyPage only searches the Need Analysis/Qualified/Closed Lost
+  // caches, so editing Valuation on a lead that's past those stages (e.g.
+  // reopened via View Lead's "Edit" link on a Purchased vehicle) always
+  // came back null here — wrongly treating an already-uploaded RC Copy as
+  // missing and blocking Save (Ramvir, Sept 2026 bug report). Fall back to
+  // a direct fetch of just this one column when the cache lookup misses.
+  let existingLead = findLeadInAnyPage(activeLeadId);
+  if (!existingLead) {
+    const { data: freshValLead } = await sb.from('rewire_master_data').select('val_rc_copy_url, current_stage').eq('id', activeLeadId).single();
+    existingLead = freshValLead;
+  }
+
+  const vehicleNo = document.querySelector('#valModal [data-field="vehicle_number"]').value || activeLeadNo;
+  const fileInput = document.querySelector('#valModal input[type="file"][data-field="rc_copy"]');
+  let rcCopyUrl = null;
+  if (fileInput && fileInput.files.length) rcCopyUrl = await uploadFile(fileInput.files[0], vehicleNo, 'RC_Copy');
+  if (!rcCopyUrl && !(existingLead && existingLead.val_rc_copy_url)) {
+    notify('Upload RC Copy is required.', { icon: 'error', title: 'Missing field' });
+    return;
+  }
+
+  // Every field in this form is mandatory (per Admin's requirement) —
+  // checked here in one place instead of scattering individual `if`s.
+  const valMissing = findMissingRequiredField('#valModal', [
+    { selector: '#valCustomerName', label: 'Customer Name' },
+    { selector: '#valPhone', label: 'Phone' },
+    { selector: '#valCity', label: 'City' },
+    { selector: '#valAddress', label: 'Address' },
+    { selector: '[data-field="vehicle_type"]', label: 'Vehicle Type' },
+    { selector: '[data-field="vehicle_number"]', label: 'Vehicle Number' },
+    { selector: '#valMake', label: 'Make' },
+    { selector: '[data-field="model_variant"]', label: 'Model / Variant' },
+    { selector: '[data-field="registration_year"]', label: 'Registration Year' },
+    { selector: '[data-field="kerb_weight"]', label: 'Kerb Weight' },
+    { selector: '[data-field="engine_no"]', label: 'Engine No.' },
+    { selector: '[data-field="chassis_no"]', label: 'Chassis No.' },
+    { selector: '#rcTypeVal', label: 'RC Type' },
+    { selector: '[data-field="fuel_type"]', label: 'Fuel Type' },
+    { selector: '[data-field="spare_wheel"]', label: 'Spare Wheel' },
+    { selector: '[data-field="stereo"]', label: 'Stereo' },
+    { selector: '[data-field="speakers"]', label: 'Speakers' },
+    { selector: '[data-field="tool_kit"]', label: 'Tool Kit' },
+    { selector: '[data-field="battery"]', label: 'Battery' },
+    { selector: '[data-field="vehicle_operational"]', label: 'Vehicle Operational' },
+    { selector: '[data-field="vehicle_accidental"]', label: 'Vehicle Accidental' },
+    { selector: '[data-field="alloy_wheel"]', label: 'Alloy Wheel' },
+    { selector: '[data-field="remarks"]', label: 'Remarks' },
+  ]);
+  if (valMissing) { notify(valMissing + ' is required.', { icon: 'error', title: 'Missing field' }); return; }
+
+  // Vehicle Number must actually look like a registration number, not a
+  // phone number typed into the wrong field — a PE occasionally pastes the
+  // customer's phone number here by mistake, which is always all-digits
+  // with no letters at all (a real reg. no. always has letters in it).
+  if (/^[0-9]+$/.test(vehicleNo)) {
+    notify('Vehicle Number me letters nahi hai (jaise ek phone number) — sahi vehicle registration number check karke daalo.', { icon: 'error', title: 'Invalid Vehicle Number' });
+    return;
+  }
+
+  // Duplicate-vehicle guard — the same Vehicle Number sitting on another
+  // lead can only be re-entered once THAT lead is Closed Lost (e.g. the
+  // same vehicle genuinely comes back around through a different deal).
+  // Still Active or already Purchased blocks re-entry outright — no
+  // second lead for a vehicle that's already in the pipeline or bought.
+  const { data: dupVehicleLeads, error: dupVehicleErr } = await sb.from('rewire_master_data')
+    .select('lead_no, overall_status')
+    .eq('val_vehicle_number', vehicleNo)
+    .neq('id', activeLeadId);
+  if (dupVehicleErr) { notify('Could not check for duplicate vehicle number: ' + dupVehicleErr.message, { icon: 'error' }); return; }
+  const blockingVehicleLead = (dupVehicleLeads || []).find(l => l.overall_status !== 'Closed Lost');
+  if (blockingVehicleLead) {
+    notify(`This Vehicle Number is already on lead ${blockingVehicleLead.lead_no}, which isn't Closed Lost. Double-check the number, or wait until that lead is closed before re-entering it.`, { icon: 'error', title: 'Duplicate Vehicle Number' });
+    return;
+  }
+
+  const payload = readFields('#valModal', {
+    val_vehicle_type: 'vehicle_type', val_vehicle_number: 'vehicle_number',
+    val_make: 'make', val_model_variant: 'model_variant',
+    val_registration_year: 'registration_year', val_kerb_weight_kg: 'kerb_weight',
+    val_engine_no: 'engine_no', val_chassis_no: 'chassis_no',
+    val_fuel_type: 'fuel_type', val_spare_wheel: 'spare_wheel', val_stereo: 'stereo',
+    val_speakers: 'speakers', val_tool_kit: 'tool_kit', val_battery: 'battery',
+    val_vehicle_operational: 'vehicle_operational', val_vehicle_accidental: 'vehicle_accidental',
+    val_alloy_wheel: 'alloy_wheel', val_remarks: 'remarks',
+  });
+  if (payload.val_make && !isValidMasterValue('vehicle_make', payload.val_make)) {
+    notify('"' + payload.val_make + '" is not in the Make master list. Ask Admin to add it in Settings → Master Data, or pick an existing option.', { icon: 'error', title: 'Invalid Make' });
+    return;
+  }
+  if (payload.val_make) payload.val_make = normalizeMasterValue('vehicle_make', payload.val_make);
+  payload.val_rc_type = document.getElementById('rcTypeVal').value;
+  if (rcCopyUrl) payload.val_rc_copy_url = rcCopyUrl; // only overwrite when a new file was actually picked — re-editing shouldn't wipe the existing upload
+  payload.val_filled_by = currentProfile.id;
+  payload.val_filled_on = new Date().toISOString();
+  payload.val_status = 'Complete';
+  payload.customer_name = document.getElementById('valCustomerName').value.trim();
+  payload.phone = document.getElementById('valPhone').value.trim();
+  payload.city = document.getElementById('valCity').value.trim();
+  payload.address = document.getElementById('valAddress').value.trim();
+  // "One stage back" re-editing can reopen this form after the lead has
+  // already moved further along — never regress current_stage in that case.
+  // (existingLead was already fetched above, for the RC Copy check.)
+  const priorStage = existingLead ? existingLead.current_stage : 0;
+  const isFreshSave = priorStage < 1;
+  payload.current_stage = Math.max(priorStage, 1);
+  payload.last_updated_by = currentProfile.id;
+
+  const { error } = await sb.from('rewire_master_data').update(payload).eq('id', activeLeadId);
+  if (error) { notify('Error saving valuation: ' + error.message); return; }
+
+  notify(isFreshSave ? 'Valuation saved. Stage advanced.' : 'Valuation updated.');
+  closeModal('valModal');
+  await refreshLeadsTable();
+  if (isFreshSave && typeof setStage === 'function') setStage(2); // -> Price Negotiation (Valuation Verify removed) — only auto-advance the tab on a genuinely fresh save
+}
+
+// Valuation Verify stage removed from the pipeline — Valuation now
+// advances straight to Price Negotiation (see setStage(2) call above).
+
+// ------------------------------------------------------------
+// STAGE 2 — PRICE NEGOTIATION
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+// PRICE NEGOTIATION — Deal Type / Payment Type conditional logic
+// (mirrors the original RVSF Price Negotiation form's business rules)
+// ------------------------------------------------------------
+// Status-dropdown-gates-the-form pattern, shared by Valuation, Price
+// Negotiation, Bank KYC and Upload Delivery — the rest of the form stays
+// fully hidden (not just greyed out) until the stage-name option is
+// picked; selecting "Lost" keeps it hidden too, since a lost lead needs
+// no deal-detail fields filled in.
+function handlePnStatus(v) {
+  document.getElementById('pnFieldset').style.display = (v === 'Price Negotiation') ? '' : 'none';
+}
+function handleValStatus(v) {
+  document.getElementById('valFieldset').style.display = (v === 'Valuation') ? '' : 'none';
+}
+function handleBkStatus(v) {
+  document.getElementById('bkFieldset').style.display = (v === 'Bank KYC') ? '' : 'none';
+}
+function handleUdStatus(v) {
+  document.getElementById('udFieldset').style.display = (v === 'Upload Delivery') ? '' : 'none';
+}
+
+function handlePnDealType(v) {
+  const broker = document.getElementById('pnBroker');
+  const trader = document.getElementById('pnTrader');
+  const cust = document.getElementById('pnCustomerPayment');
+  const brokerPay = document.getElementById('pnBrokerPayment');
+  const cod = document.getElementById('pnCodPayment');
+
+  [broker, trader, cust, brokerPay, cod].forEach(el => el.disabled = true);
+
+  switch (v) {
+    case 'Customer Keeping the COD / Direct Deal':
+      cust.disabled = false;
+      break;
+    case 'Customer Keeping the COD / Broker Deal':
+      broker.disabled = false; cust.disabled = false; brokerPay.disabled = false;
+      break;
+    case 'Trader Keeping COD / Broker Deal':
+      broker.disabled = false; trader.disabled = false; cust.disabled = false; brokerPay.disabled = false; cod.disabled = false;
+      break;
+    case 'Trader Keeping COD / Direct Deal':
+      trader.disabled = false; cust.disabled = false; cod.disabled = false;
+      break;
+    case 'No COD / Broker Deal':
+      broker.disabled = false; cust.disabled = false; brokerPay.disabled = false;
+      break;
+    case 'No COD / Direct Deal':
+      cust.disabled = false;
+      break;
+  }
+  // (Ramvir, Oct 2026) Trader Keeping COD (Broker / Direct deal): COD amount comes pre-filled with
+  // 11000 (editable). Every other deal type keeps COD disabled and empty.
+  if (v === 'Trader Keeping COD / Broker Deal' || v === 'Trader Keeping COD / Direct Deal') {
+    if (!cod.value || parseFloat(cod.value) === 0) cod.value = 11000;
+    cod.disabled = false;  // pre-filled 11000 but EDITABLE again (Ramvir, Oct 2026)
+  } else {
+    cod.value = '';
+  }
+  if (trader.disabled) {
+    trader.value = '';
+    const otherField = document.getElementById('pnTraderOtherField');
+    if (otherField) { otherField.style.display = 'none'; document.getElementById('pnTraderOtherInput').value = ''; }
+  }
+
+  // Broker's read-only bank reference only makes sense once the Broker
+  // field itself is actually usable for this deal type.
+  if (broker.disabled) {
+    const brokerBankWrap = document.getElementById('pnBrokerBankWrap');
+    if (brokerBankWrap) brokerBankWrap.style.display = 'none';
+  }
+
+  calcPnTotal();
+}
+
+// Trader Name dropdown — reveal a free-text field only when "Other" is picked
+function handlePnTraderSelect(v) {
+  const otherField = document.getElementById('pnTraderOtherField');
+  if (!otherField) return;
+  otherField.style.display = v === 'Other' ? '' : 'none';
+  if (v !== 'Other') document.getElementById('pnTraderOtherInput').value = '';
+}
+
+function handlePnPaymentType(v) {
+  const omni = document.getElementById('pnOmniPay');
+  const qr = document.getElementById('pnQrCode');
+  const omniTo = document.getElementById('pnOmniPayTo');
+
+  // Remember the real name list before Instant Payments swaps it for the single UPI option,
+  // so switching back to Omini Pay restores the names.
+  if (!omni.dataset.orig) omni.dataset.orig = omni.innerHTML;
+  if (v !== 'Instant Payments' && omni.dataset.orig && omni.innerHTML !== omni.dataset.orig) omni.innerHTML = omni.dataset.orig;
+  if (v === 'Instant Payments') {
+    omni.disabled = false;
+    omni.innerHTML = '<option value="GVUPL-UPI-PAYZApp" selected>GVUPL-UPI-PAYZApp</option>';
+    qr.disabled = true;
+    // Instant Payment now needs "Omini/InstantPay To" enabled too, same as
+    // Omini Pay — whichever party (Customer/Broker/Both) gets picked here
+    // decides who submitPriceNegotiation() emails the payment details to.
+    if (omniTo) omniTo.disabled = false;
+  } else if (v === 'Omini Pay') {
+    omni.disabled = false;
+    qr.disabled = false;
+    if (omniTo) omniTo.disabled = false;
+  } else {
+    omni.disabled = true; omni.value = '';
+    qr.disabled = true;
+    if (omniTo) { omniTo.disabled = true; omniTo.value = ''; }
+  }
+  // Re-sync whichever party was already picked in "Omini/InstantPay To" —
+  // switching Payment Type can re-enable that dropdown without the person
+  // re-touching it, so the Broker/Customer fields it should be unlocking
+  // (see handlePnOmniPayToChange below) need re-checking here too.
+  if (omniTo) handlePnOmniPayToChange(omniTo.value);
+}
+
+// "Omini/InstantPay To" decides who actually gets paid for Instant Payment /
+// Omini Pay — completely independent of Deal Type, which is what normally
+// gates whether the Broker/Broker Payment/Customer Offer fields are even
+// enabled. Without this, a PE could pick "Broker" here while Deal Type
+// still leaves the Broker search field disabled (e.g. a Direct Deal type)
+// — the broker autocomplete stays unusable, no broker ever gets selected,
+// its read-only bank block (pnBrokerBankWrap) never populates, and the
+// Instant Payment email fires with the broker's name/amount/bank details
+// all blank (this was the actual root cause: the email code was reading
+// real, correct field IDs, but the fields themselves had no way to ever
+// get filled in for this combination). Same reasoning for Customer.
+function handlePnOmniPayToChange(v) {
+  const paymentType = document.getElementById('pnPaymentType').value;
+  if (paymentType !== 'Instant Payments' && paymentType !== 'Omini Pay') return;
+  const broker = document.getElementById('pnBroker');
+  const brokerPay = document.getElementById('pnBrokerPayment');
+  const cust = document.getElementById('pnCustomerPayment');
+  if (v === 'Broker' || v === 'Both') {
+    if (broker) broker.disabled = false;
+    if (brokerPay) brokerPay.disabled = false;
+  }
+  if (v === 'Customer' || v === 'Both') {
+    if (cust) cust.disabled = false;
+  }
+}
+
+function calcPnTotal() {
+  const cust = parseFloat(document.getElementById('pnCustomerPayment').value) || 0;
+  const broker = parseFloat(document.getElementById('pnBrokerPayment').value) || 0;
+  const cod = parseFloat(document.getElementById('pnCodPayment').value) || 0;
+  const cash = parseFloat(document.getElementById('pnCash').value) || 0;
+  const gst = parseFloat(document.getElementById('pnGstAmount').value) || 0;
+  document.getElementById('pnTotalOfferPrice').value = cust + broker + cod + cash + gst;
+}
+
+// Vehicle Rate per KG — pure display formula, recomputed live, never
+// stored on its own (avoids it ever going stale against the 2 inputs it's
+// derived from). Blank/zero weight just leaves it blank rather than
+// showing Infinity/NaN.
+function calcPnVehicleRate() {
+  const amount = parseFloat(document.getElementById('pnVehicleAmount').value) || 0;
+  const weight = parseFloat(document.getElementById('pnVehicleWeight').value) || 0;
+  document.getElementById('pnVehicleRatePerKg').value = weight > 0 ? (amount / weight).toFixed(2) : '';
+}
+
+// GST Amount only makes sense once someone's actually going to receive it
+// — "GST Pay To" picks Broker or Customer, which is also what
+// create_payment_rows() (DB trigger) reads to fold this amount into that
+// party's own rewire_payments row at payment-record-creation time.
+// Picking blank ("no GST") hides + clears the amount field entirely.
+function handlePnGstPayTo(v) {
+  const field = document.getElementById('pnGstAmountField');
+  const input = document.getElementById('pnGstAmount');
+  const show = v === 'Broker' || v === 'Customer';
+  if (field) field.style.display = show ? '' : 'none';
+  if (!show && input) input.value = '';
+  calcPnTotal();
+}
+
+// ------------------------------------------------------------
+// CASH COMMISSION PAYOUT — "Pay Number of Person" (0-5). Renders that
+// many searchable name-pickers (same widget pattern as the Broker
+// search box) with no GST requirement. Selected people + their share
+// of pn_cash_commission feed the new Commission tab on save.
+// ------------------------------------------------------------
+function handlePnCommissionCount(v) {
+  const n = parseInt(v, 10) || 0;
+  const wrap = document.getElementById('pnCommissionPersons');
+  wrap.innerHTML = '';
+  for (let i = 0; i < n; i++) {
+    const field = document.createElement('div');
+    field.className = 'form-field';
+    field.innerHTML = `<label>Commission Person ${i + 1} Name</label>
+      <div class="partner-search-wrap">
+        <div class="ps-input-row" onclick="togglePSD('psdComm${i}',event)">
+          <i class="ti ti-search" aria-hidden="true"></i>
+          <input id="pnCommissionName${i}" placeholder="Search or add name…" oninput="filterCommissionPS(${i},this.value)" onclick="openPSD('psdComm${i}');event.stopPropagation()" autocomplete="off" />
+        </div>
+        <div class="ps-dropdown" id="psdComm${i}"><div class="ps-list" id="pListComm${i}"></div></div>
+      </div>
+      <input id="pnCommissionAmount${i}" type="number" min="0" onwheel="this.blur()" placeholder="Amount (₹)" style="margin-top:6px;" />`;
+    wrap.appendChild(field);
+  }
+}
+
+async function submitPriceNegotiation() {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+  const status = document.getElementById('pnStatus').value;
+  if (!status) { notify('Please select a Status', { icon: 'error', title: 'Missing field' }); return; }
+
+  if (status === 'Lost') {
+    const { error } = await sb.from('rewire_master_data').update({
+      overall_status: 'Closed Lost', lead_status: 'Closed Lost with Reason', lost_at_stage: 'Price Negotiation', last_updated_by: currentProfile.id,
+    }).eq('id', activeLeadId);
+    if (error) { notify('Error marking lost: ' + error.message, { icon: 'error' }); return; }
+    notify('Lead marked as Lost.');
+    closeModal('pnModal');
+    await refreshLeadsTable();
+    return;
+  }
+
+  // Payment Type is marked required (*) in the form but was never actually
+  // enforced here — a lead saved with it left blank matches NEITHER branch
+  // of every downstream stage query (each one checks either
+  // .eq('pn_payment_type','Post Delivery') or .in('pn_payment_type',
+  // ALT_PAYMENT_TYPES), and a blank string satisfies neither), so it
+  // silently vanishes from every Qualified Pipeline tab from Bank KYC
+  // onward — permanently stuck with no error ever shown to anyone.
+  if (!document.getElementById('pnPaymentType').value) {
+    notify('Please select a Payment Type.', { icon: 'error', title: 'Missing field' });
+    return;
+  }
+
+  // Vehicle Rate Calculation — Vehicle Amount, COD Amount, Vehicle Weight
+  // are mandatory (Vehicle Rate per KG is the readonly computed one).
+  const pnVrMissing = findMissingRequiredField('#pnModal', [
+    { selector: '#pnVehicleAmount', label: 'Vehicle Amount' },
+    { selector: '#pnCodAmount', label: 'COD Amount' },
+    { selector: '#pnVehicleWeight', label: 'Vehicle Weight' },
+  ]);
+  if (pnVrMissing) { notify(pnVrMissing + ' is required.', { icon: 'error', title: 'Missing field' }); return; }
+
+  // Location, Sub-Location (when that Location has any) and Transportation
+  // Type are mandatory at PN now (Ramvir, Oct 2026).
+  const pnLocMissing = findMissingRequiredField('#pnModal', [
+    { selector: '#pnVehicleParking', label: 'Location' },
+  ]);
+  if (pnLocMissing) { notify(pnLocMissing + ' is required.', { icon: 'error', title: 'Missing field' }); return; }
+  const pnSub = document.getElementById('pnVehicleSubParking');
+  if (pnSub && !pnSub.disabled && pnSub.options.length > 1 && !pnSub.value) { notify('Sub-Location is required.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!document.getElementById('pnTransportationType').value) { notify('Transportation Type is required.', { icon: 'error', title: 'Missing field' }); return; }
+
+  const fileInput = document.getElementById('pnQrCode');
+  let qrUrl = null;
+  const pnPaymentTypeVal = document.getElementById('pnPaymentType').value;
+
+  // Omini Pay — "Omini Payments By Name", "Omini/InstantPay To" and the QR
+  // Code were all shown as required (*) on the form but never actually
+  // enforced here, same gap as Payment Type above. A lead saved without
+  // "Omini/InstantPay To" in particular is exactly what left L7102680
+  // stuck — its single Omini Pay row landed with party_type left blank
+  // (see trg_create_omini_pay), making it impossible to tell whether
+  // Customer, Broker, or both were meant to be paid through it.
+  // Root cause of "Instant Payment email not going" (Ramvir, Sept 2026):
+  // this whole block — including the "Omini/InstantPay To" requirement —
+  // used to only run for pnPaymentTypeVal === 'Omini Pay', even though
+  // handlePnPaymentType() enables/needs that exact same dropdown for
+  // Instant Payments too (its own comment says so: "whichever party gets
+  // picked here decides who submitPriceNegotiation() emails the payment
+  // details to"). So a PE could save an Instant Payments PN with "Omini/
+  // InstantPay To" left blank — nothing stopped them — and
+  // submitVerificationZoho()'s shouldSendInstantEmail check later requires
+  // pn_omni_pay_to to be truthy, so the email silently never fired, with
+  // no error anywhere pointing at the real cause. Widened to require it
+  // for Instant Payments too. "Omini Payments By Name" is included in the
+  // same widened check only for consistency/safety — Instant Payments
+  // actually auto-fills it (line ~219, forced to 'GVUPL-UPI-PAYZApp'), so
+  // it's already never blank for that type in practice.
+  if (pnPaymentTypeVal === 'Omini Pay' || pnPaymentTypeVal === 'Instant Payments') {
+    if (!document.getElementById('pnOmniPay').value) {
+      notify('Please select Omini Payments By Name.', { icon: 'error', title: 'Missing field' });
+      return;
+    }
+    if (!document.getElementById('pnOmniPayTo').value) {
+      notify('Please select Omini/InstantPay To.', { icon: 'error', title: 'Missing field' });
+      return;
+    }
+  }
+  // QR Code stays Omini Pay-only — handlePnPaymentType() disables/hides it
+  // entirely for Instant Payments (qr.disabled = true), so it's never
+  // applicable there.
+  if (pnPaymentTypeVal === 'Omini Pay') {
+    if (fileInput && !fileInput.disabled && fileInput.files.length === 0) {
+      // No new file picked this save — only okay if one was already
+      // uploaded on an earlier save (re-editing this form again).
+      // pn_qr_code_url isn't kept in any client-side cache, so check the
+      // real DB value directly rather than risk a false "missing".
+      const { data: qrCheck } = await sb.from('rewire_master_data').select('pn_qr_code_url').eq('id', activeLeadId).single();
+      if (!qrCheck || !qrCheck.pn_qr_code_url) {
+        notify('Please upload the QR Code.', { icon: 'error', title: 'Missing field' });
+        return;
+      }
+    }
+  }
+
+  if (fileInput && !fileInput.disabled && fileInput.files.length) qrUrl = await uploadFile(fileInput.files[0], getVehicleFolderName(), 'QR_Code');
+
+  const payload = {
+    pn_deal_type: document.getElementById('pnDealType').value,
+    pn_payment_type: document.getElementById('pnPaymentType').value,
+    pn_partner_name: document.getElementById('pnBroker').value.trim() || null,
+    pn_trader_name: (document.getElementById('pnTrader').value === 'Other'
+      ? document.getElementById('pnTraderOtherInput').value.trim()
+      : document.getElementById('pnTrader').value) || null,
+    pn_customer_payment: document.getElementById('pnCustomerPayment').value || null,
+    pn_broker_payment: document.getElementById('pnBrokerPayment').value || null,
+    pn_cod_payment: document.getElementById('pnCodPayment').value || null,
+    pn_cash_commission: document.getElementById('pnCash').value || null,
+    pn_gst_pay_to: document.getElementById('pnGstPayTo').value || null,
+    pn_gst_amount: document.getElementById('pnGstAmount').value || null,
+    pn_total_offer_price: document.getElementById('pnTotalOfferPrice').value || null,
+    pn_vehicle_weight_kg: document.getElementById('pnVehicleWeight').value || null,
+    pn_vehicle_amount: document.getElementById('pnVehicleAmount').value || null,
+    pn_cod_amount: document.getElementById('pnCodAmount').value || null,
+    pn_omni_payments_by_name: document.getElementById('pnOmniPay').value || null,
+    pn_omni_pay_to: document.getElementById('pnOmniPayTo').value || null,
+    pn_vehicle_parking: document.getElementById('pnVehicleParking').value.trim() || null,
+    pn_vehicle_sub_parking: document.getElementById('pnVehicleSubParking').value || null,
+    pn_transportation_type: document.getElementById('pnTransportationType').value || null,
+  };
+  if (qrUrl) payload.pn_qr_code_url = qrUrl; // only overwrite when a new file was actually picked — re-editing shouldn't wipe the existing upload
+
+  // Keep partner_id (the FK every downstream screen actually joins
+  // through — Payments, Purchase Summary, Qualified Pipeline cards, every
+  // Reports export) in sync with whatever broker got picked here. Until
+  // now this only ever wrote pn_partner_name (a free-text snapshot) —
+  // partner_id was set once at lead creation and NEVER touched again, so
+  // if the PE picked a different broker during Price Negotiation than
+  // whoever the lead was originally attributed to, every FK-joined
+  // "Partner"/"Broker" column kept showing the ORIGINAL broker forever,
+  // while only this raw pn_partner_name column (and the read-only view
+  // that happens to read it directly) reflected the change. Only updates
+  // partner_id when a broker was actually picked here and it resolves to
+  // a real partner — a Direct Deal (no broker in this negotiation at all)
+  // leaves the lead's original partner_id/attribution untouched.
+  if (payload.pn_partner_name) {
+    const matchedBrokerPn = (typeof allPartners !== 'undefined' ? allPartners : []).find(p => (p.partner_name || '').trim().toLowerCase() === payload.pn_partner_name.trim().toLowerCase()); // trim/case-insensitive — a stored name with a trailing space (e.g. "Gaganjyot Singh ") used to fail the exact match, leaving partner_id on the OLD broker (L7103548, Oct 2026)
+    if (matchedBrokerPn) payload.partner_id = matchedBrokerPn.id;
+  }
+
+  // Customer's own bank account is no longer captured on this form at all
+  // — Bank KYC is the sole place that collects it now (see
+  // handleBkBankLock/submitBankKyc). PN only decides, via Customer Offer
+  // > 0, whether Bank KYC will need it.
+
+  payload.pn_filled_by = currentProfile.id;
+  payload.pn_filled_on = new Date().toISOString();
+  payload.pn_status = 'Complete';
+  // "One stage back" re-editing can reopen this form after the lead has
+  // already moved further along — never regress current_stage in that case.
+  // Fixed (Ramvir, Sept 2026 full-code audit): findLeadInAnyPage only
+  // searches the Not-Assigned/Qualified/Closed-Lost caches, so it always
+  // missed for a lead already past PN — priorStagePn silently fell back to
+  // 1, wrongly regressing current_stage back to 2 AND wrongly marking the
+  // re-edit as a "fresh save" (which then re-inserted duplicate Omini Pay
+  // rows below, see isFreshSavePn). Fresh DB fetch fixes both.
+  const { data: existingLeadPn } = await sb.from('rewire_master_data').select('current_stage').eq('id', activeLeadId).maybeSingle();
+  const priorStagePn = existingLeadPn ? existingLeadPn.current_stage : 1;
+  const isFreshSavePn = priorStagePn < 2;
+  payload.current_stage = Math.max(priorStagePn, 2);
+  payload.last_updated_by = currentProfile.id;
+  // Instant Payments — no Manager/Head approval needed to release the
+  // payment (that's the whole point of this payment type — email goes
+  // out and the transfer happens straight away). Auto-approve the release
+  // right here so it shows up in the Instant Payment tab immediately,
+  // instead of waiting on an approval step that never happens for this
+  // type. Delivery + Accessories Check + the FINAL Head Approval still
+  // happen later, same as every other payment type.
+  if (payload.pn_payment_type === 'Instant Payments') {
+    payload.payment_release_status = 'Approved';
+    payload.payment_release_by = currentProfile.id;
+    payload.payment_release_at = new Date().toISOString();
+  }
+
+  const { error } = await sb.from('rewire_master_data').update(payload).eq('id', activeLeadId);
+  if (error) { notify('Error saving negotiation: ' + error.message); return; }
+
+  // Omini Pay routing — "OminiPay to" decides who the pay-out is for.
+  // "Both" creates two separate Pending entries (Customer + Broker) in
+  // the Omini Pay tab. Inserted directly here since row-creation isn't
+  // otherwise visible in the client code for this table. Skipped on a
+  // re-edit save — the original rows from the first save already exist,
+  // and re-inserting would duplicate them.
+  if (isFreshSavePn && payload.pn_payment_type === 'Omini Pay' && payload.pn_omni_pay_to) {
+    const parties = payload.pn_omni_pay_to === 'Both' ? ['Customer', 'Broker'] : [payload.pn_omni_pay_to];
+    for (const party of parties) {
+      const { error: opErr } = await sb.from('rewire_omini_pay').insert({ lead_id: activeLeadId, status: 'Pending', party_type: party });
+      if (opErr) console.error('Omini Pay row insert failed for ' + party + ':', opErr.message);
+    }
+  }
+
+  // Instant Payment — the "go make the transfer" email no longer fires
+  // here. It now fires once Verification & Zoho reaches Complete (see
+  // submitVerificationZoho() in this file) so Accounts is only notified
+  // after Back Office has checked documents/bank details. Payment release
+  // itself (payment_release_status='Approved' above) still happens
+  // immediately at this save — only the notification moved.
+
+  // Cash Commission payout — one Pending row per selected person in the
+  // new Commission tab. New names typed in are added to the commission
+  // person directory on the fly (no GST/bank details required). Skipped
+  // on a re-edit save, same reasoning as the Omini Pay block above.
+  const commCount = isFreshSavePn ? (parseInt(document.getElementById('pnCommissionCount').value, 10) || 0) : 0;
+  for (let i = 0; i < commCount; i++) {
+    const nameEl = document.getElementById('pnCommissionName' + i);
+    const amtEl = document.getElementById('pnCommissionAmount' + i);
+    const name = nameEl ? nameEl.value.trim() : '';
+    const amount = amtEl ? amtEl.value : '';
+    if (!name || !amount) continue;
+    let personId = (nameEl.dataset.personId || '').trim();
+    if (!personId) {
+      const existing = allCommissionPersons.find(p => p.name.toLowerCase() === name.toLowerCase());
+      if (existing) {
+        personId = existing.id;
+      } else {
+        const { data: newPerson, error: personErr } = await sb.from('rewire_commission_persons')
+          .insert({ name, created_by: currentProfile.id }).select().single();
+        if (personErr) { console.error('Error saving commission person:', personErr.message); continue; }
+        personId = newPerson.id;
+        allCommissionPersons.push(newPerson);
+      }
+    }
+    const { error: commErr } = await sb.from('rewire_commission').insert({
+      lead_id: activeLeadId, person_id: personId || null, person_name: name, amount, status: 'Pending', created_by: currentProfile.id,
+    });
+    if (commErr) console.error('Commission row insert failed:', commErr.message);
+  }
+
+  notify(isFreshSavePn ? 'Price Negotiation saved.' : 'Price Negotiation updated.');
+  closeModal('pnModal');
+  await refreshLeadsTable();
+  if (isFreshSavePn && typeof setStage === 'function') setStage(3); // -> Bank KYC — only auto-advance the tab on a genuinely fresh save
+}
+
+// Admin recovery action — resend the Instant Payment email for a lead
+// whose PN was saved before this email step existed, or where it
+// genuinely failed the first time (see the withFailureHandler in
+// submitPriceNegotiation above). Rebuilds the exact same payload
+// sendInstantPaymentEmail() expects, but from the lead's already-SAVED
+// data instead of live form inputs: customer bank details come from
+// Bank KYC (kyc_*, same columns the PN form itself copies from), broker
+// bank details come from the linked Partner's saved bank details (same
+// source showPnBrokerBankDetails() in JS-Core.html reads from when the
+// PN form is open). Called from the "Resend Instant Payment Email" link
+// in View Lead Details (JS-Wiring.html) — Admin-only there.
+async function resendInstantPaymentEmail(leadId) {
+  const { data: lead, error } = await sb.from('rewire_master_data').select(`
+    lead_no, customer_name, val_vehicle_number, val_make, val_model_variant,
+    pn_payment_type, pn_omni_pay_to, pn_customer_payment, pn_broker_payment, pn_partner_name,
+    kyc_account_holder_name, kyc_bank_name, kyc_ifsc_code, kyc_account_number,
+    manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)
+  `).eq('id', leadId).single();
+  if (error || !lead) { notify('Could not load lead for resend.', { icon: 'error' }); return; }
+  if (lead.pn_payment_type !== 'Instant Payments') {
+    notify('This lead is not an Instant Payments lead.', { icon: 'error' });
+    return;
+  }
+
+  // Leads saved before the PN mandatory-field fix (Sept 2026) can have
+  // pn_omni_pay_to = null — sendInstantPaymentEmail()'s Customer/Broker
+  // blocks in Mail.gs both key off toParty, so a null value sent an email
+  // with NO bank account details at all (just vehicle number/model), with
+  // no error anywhere — this is what Ramvir saw on L7102938/Dharu Singh.
+  // Rather than silently repeating that, ask the admin who this resend
+  // should actually go to, and save it back to the lead so it's fixed for
+  // good (and so a second resend doesn't need to ask again).
+  let toParty = lead.pn_omni_pay_to;
+  if (!toParty) {
+    const hint = lead.pn_broker_payment > 0 && !(lead.pn_customer_payment > 0) ? ' (Broker Payment is filled on this lead)'
+      : lead.pn_customer_payment > 0 && !(lead.pn_broker_payment > 0) ? ' (Customer Payment is filled on this lead)' : '';
+    const { value: pickedParty } = await Swal.fire({
+      icon: 'warning',
+      title: 'Omini/InstantPay To was never set',
+      html: `This lead's Price Negotiation was saved without "Omini/InstantPay To"${hint} — that's why the last resend had no bank details. Who should this payment go to?`,
+      input: 'select',
+      inputOptions: { Customer: 'Customer', Broker: 'Broker', Both: 'Both' },
+      inputPlaceholder: 'Select party',
+      showCancelButton: true,
+      confirmButtonColor: '#1d4ed8',
+      confirmButtonText: 'Save & Continue',
+      inputValidator: (v) => !v && 'Please select a party',
+    });
+    if (!pickedParty) return;
+    const { error: fixErr } = await sb.from('rewire_master_data').update({ pn_omni_pay_to: pickedParty }).eq('id', leadId);
+    if (fixErr) { notify('Could not save Omini/InstantPay To: ' + fixErr.message, { icon: 'error' }); return; }
+    toParty = pickedParty;
+  }
+
+  const ok = await confirmDialog(`Resend the Instant Payment email for ${lead.lead_no}?`);
+  if (!ok) return;
+  // Resolved by pn_partner_name (the broker actually picked in Price
+  // Negotiation), not the rewire_partners FK — matches
+  // getPaymentBankDetails() (JS-Payments.html), which already does this
+  // the right way. The FK-based lookup this used to do stayed locked to
+  // whichever partner was set at lead CREATION, so if PN picked a
+  // different broker, a resend here would have gone out with the wrong
+  // broker's bank details — a real money-routing risk, not just a stale
+  // label.
+  const brokerNameForResend = (lead.pn_partner_name || '').trim().toLowerCase();
+  const partner = brokerNameForResend
+    ? (typeof allPartners !== 'undefined' ? allPartners : []).find(x => x.partner_name.trim().toLowerCase() === brokerNameForResend)
+    : null;
+  google.script.run
+    .withSuccessHandler(() => { markInstantEmailResult(leadId, 'Sent'); notify('Instant Payment email resent.'); })
+    .withFailureHandler((err) => { markInstantEmailResult(leadId, 'Failed', err.message); notify('Resend failed: ' + err.message, { icon: 'error' }); })
+    .sendInstantPaymentEmail({
+      leadNo: lead.lead_no,
+      customerName: lead.customer_name,
+      vehicleNumber: lead.val_vehicle_number,
+      vehicleModel: `${lead.val_make || ''} ${lead.val_model_variant || ''}`.trim(),
+      toParty: lead.pn_omni_pay_to,
+      customerAmount: lead.pn_customer_payment || 0,
+      brokerAmount: lead.pn_broker_payment || 0,
+      customerBank: {
+        holder: lead.kyc_account_holder_name || '',
+        bank: lead.kyc_bank_name || '',
+        ifsc: lead.kyc_ifsc_code || '',
+        acct: lead.kyc_account_number || '',
+      },
+      brokerBank: {
+        holder: partner ? partner.account_holder_name : '',
+        bank: partner ? partner.bank_name : '',
+        ifsc: partner ? partner.ifsc_code : '',
+        acct: partner ? partner.account_number : '',
+      },
+      senderName: lead.manager ? lead.manager.name : '',
+    });
+}
+
+// ------------------------------------------------------------
+// STAGE 3 — BANK KYC
+// ------------------------------------------------------------
+async function submitBankKyc() {
+  if (!activeLeadId) { notify('No lead selected'); return; }
+  const status = document.getElementById('bkStatus').value;
+  if (!status) { notify('Please select a Status', { icon: 'error', title: 'Missing field' }); return; }
+
+  if (status === 'Lost') {
+    const { error } = await sb.from('rewire_master_data').update({
+      overall_status: 'Closed Lost', lead_status: 'Closed Lost with Reason', lost_at_stage: 'Bank KYC', last_updated_by: currentProfile.id,
+    }).eq('id', activeLeadId);
+    if (error) { notify('Error marking lost: ' + error.message, { icon: 'error' }); return; }
+    notify('Lead marked as Lost.');
+    closeModal('bkModal');
+    await refreshLeadsTable();
+    return;
+  }
+
+  // Every field in this form is mandatory (per Admin's requirement) except
+  // GST Number / Upload GST, which stay optional — not every customer has
+  // a GST number, same as elsewhere in the app (e.g. Partner Register).
+  // Bank Details (Account Holder Name / Bank Name / Branch Name / Account
+  // Number / IFSC / Cheque Photo) are the exception: same rule as PN's
+  // Customer Account Details — only required if the customer is actually
+  // being paid directly (pn_customer_payment > 0, not Omini Pay). If PN
+  // didn't need it, Bank KYC shouldn't force it either.
+  // Same findLeadInAnyPage bug as Upload Delivery (see fix note below) —
+  // it only searches the Not-Assigned/Qualified/Closed-Lost caches, so for
+  // an in-pipeline lead this always came back null: bkBankDetailsNeeded(null)
+  // silently skipped the bank-fields requirement, and the Aadhar/PAN/Cheque
+  // "already uploaded" checks further down always treated real uploads as
+  // missing. Fetching fresh fixes both.
+  const { data: existingLeadBkCheck } = await sb.from('rewire_master_data')
+    .select('pn_customer_payment, pn_payment_type, kyc_aadhar_url, kyc_pan_url, kyc_gst_url, kyc_cheque_url')
+    .eq('id', activeLeadId).maybeSingle();
+  const bkBankNeeded = bkBankDetailsNeeded(existingLeadBkCheck);
+  const bkRequiredFields = [
+    { selector: '[data-field="aadhar_number"]', label: 'Aadhar Number' },
+    { selector: '[data-field="aadhar_linked_phone"]', label: 'Aadhar Linked Phone' },
+    { selector: '[data-field="pan_number"]', label: 'PAN Number' },
+    { selector: '[data-field="customer_email"]', label: 'Email ID' },
+  ];
+  if (bkBankNeeded) {
+    bkRequiredFields.push(
+      { selector: '[data-field="account_holder_name"]', label: 'Account Holder Name' },
+      { selector: '[data-field="bank_name"]', label: 'Bank Name' },
+      { selector: '[data-field="branch_name"]', label: 'Branch Name' },
+      { selector: '[data-field="account_number"]', label: 'Account Number' },
+      { selector: '[data-field="ifsc_code"]', label: 'IFSC Code' },
+    );
+  }
+  const bkMissing = findMissingRequiredField('#bkModal', bkRequiredFields);
+  if (bkMissing) { notify(bkMissing + ' is required.', { icon: 'error', title: 'Missing field' }); return; }
+
+  const aadharFile = document.querySelector('#bkModal [data-field="aadhar_doc"]');
+  const panFile = document.querySelector('#bkModal [data-field="pan_doc"]');
+  const gstFile = document.querySelector('#bkModal [data-field="gst_doc"]');
+  const chequeFile = document.querySelector('#bkModal [data-field="cheque_doc"]');
+  if (!(aadharFile && aadharFile.files.length) && !(existingLeadBkCheck && existingLeadBkCheck.kyc_aadhar_url)) {
+    notify('Upload Aadhar is required.', { icon: 'error', title: 'Missing field' }); return;
+  }
+  if (!(panFile && panFile.files.length) && !(existingLeadBkCheck && existingLeadBkCheck.kyc_pan_url)) {
+    notify('Upload PAN is required.', { icon: 'error', title: 'Missing field' }); return;
+  }
+  if (bkBankNeeded && !(chequeFile && chequeFile.files.length) && !(existingLeadBkCheck && existingLeadBkCheck.kyc_cheque_url)) {
+    notify('Upload Cheque Photo is required.', { icon: 'error', title: 'Missing field' }); return;
+  }
+  const vFolder = getVehicleFolderName();
+  const aadharUrl = aadharFile && aadharFile.files.length ? await uploadFile(aadharFile.files[0], vFolder, 'Aadhar') : null;
+  const panUrl = panFile && panFile.files.length ? await uploadFile(panFile.files[0], vFolder, 'PAN') : null;
+  const gstUrl = gstFile && gstFile.files.length ? await uploadFile(gstFile.files[0], vFolder, 'GST') : null;
+  const chequeUrl = chequeFile && chequeFile.files.length ? await uploadFile(chequeFile.files[0], vFolder, 'Cheque') : null;
+
+  // Was an inline literal duplicating BK_FIELD_MAP field-for-field —
+  // switched to the shared constant so adding Email ID here (which needed
+  // both this save path AND the prefill path in openStageForm) only meant
+  // touching BK_FIELD_MAP once instead of two copies drifting apart.
+  const payload = readFields('#bkModal', BK_FIELD_MAP);
+  // Only overwrite each upload URL when a new file was actually picked —
+  // re-editing shouldn't wipe an existing upload.
+  if (aadharUrl) payload.kyc_aadhar_url = aadharUrl;
+  if (panUrl) payload.kyc_pan_url = panUrl;
+  if (gstUrl) payload.kyc_gst_url = gstUrl;
+  if (chequeUrl) payload.kyc_cheque_url = chequeUrl;
+  payload.kyc_filled_by = currentProfile.id;
+  payload.kyc_filled_on = new Date().toISOString();
+  payload.kyc_status = 'Complete';
+  // "One stage back" re-editing can reopen this form after the lead has
+  // already moved further along — never regress current_stage in that case.
+  // Fixed (Ramvir, Sept 2026 full-code audit) — same findLeadInAnyPage cache
+  // miss as the upload-existence check above, just for stage math this
+  // time: was regressing current_stage to 3 and wrongly flagging re-edits
+  // as fresh saves.
+  const { data: existingLeadBk } = await sb.from('rewire_master_data').select('current_stage').eq('id', activeLeadId).maybeSingle();
+  const priorStageBk = existingLeadBk ? existingLeadBk.current_stage : 2;
+  const isFreshSaveBk = priorStageBk < 3;
+  payload.current_stage = Math.max(priorStageBk, 3);
+  payload.last_updated_by = currentProfile.id;
+
+  const { error } = await sb.from('rewire_master_data').update(payload).eq('id', activeLeadId);
+  if (error) { notify('Error saving KYC: ' + error.message); return; }
+  notify(isFreshSaveBk ? 'Bank KYC saved.' : 'Bank KYC updated.');
+  closeModal('bkModal');
+  await refreshLeadsTable();
+  if (isFreshSaveBk && typeof setStage === 'function') setStage(4); // -> Upload Delivery — only auto-advance the tab on a genuinely fresh save
+}
+
+// ------------------------------------------------------------
+// STAGE 5 — VERIFICATION & ZOHO (Back Office, separate table)
+// Now runs AFTER Upload Delivery instead of before it — current_stage
+// target (5) and the setStage(6) call below are unchanged from before
+// because removing Valuation Verify (-1 position) and moving this stage
+// past Upload Delivery (+1 position) cancel out.
+// ------------------------------------------------------------
+async function submitVerificationZoho() {
+  if (!activeLeadId) { notify('No lead selected'); return; }
+  // Permanent fix for "Instant Payment email never goes" (Ramvir, Sept
+  // 2026 — checked the DB: pn_instant_email_status was null on literally
+  // every single Instant Payments lead ever, whether pn_omni_pay_to was
+  // filled in or not — a 100% failure rate, not an edge case). Root cause:
+  // rewire_verification_zoho has an AFTER INSERT trigger (trg_mirror_vz ->
+  // mirror_verification_zoho()) that immediately copies the new status
+  // onto rewire_master_data.vz_status the moment the insert below runs.
+  // The old code fetched vz_status AFTER that insert to check "was this
+  // already Complete before this save" (so a re-save never re-sends) — but
+  // by then the trigger had already mirrored it to 'Complete', so that
+  // check read 'Complete' on EVERY first-time save too, permanently
+  // disabling shouldSendInstantEmail with no error anywhere to point at
+  // why. Fetching the PRIOR vz_status here, before the insert/trigger ever
+  // runs, is the only way to see its real previous value.
+  const { data: priorVzLead } = await sb.from('rewire_master_data').select('vz_status').eq('id', activeLeadId).single();
+  const priorVzStatus = priorVzLead ? priorVzLead.vz_status : null;
+  const f2aFile = document.querySelector('#vzModal [data-field="form_2a"]');
+  const authFile = document.querySelector('#vzModal [data-field="authorization_letter"]');
+  const chequeFile = document.querySelector('#vzModal [data-field="vz_cheque_replace"]');
+  const vFolder2 = getVehicleFolderName();
+  const f2aUrl = f2aFile && f2aFile.files.length ? await uploadFile(f2aFile.files[0], vFolder2, 'Form_2A') : null;
+  const authUrl = authFile && authFile.files.length ? await uploadFile(authFile.files[0], vFolder2, 'Authorization_Letter') : null;
+  const chequeUrl = chequeFile && chequeFile.files.length ? await uploadFile(chequeFile.files[0], vFolder2, 'Cheque_Corrected') : null;
+  const remark = document.querySelector('#vzModal [data-field="remark"]').value.trim();
+  const status = document.getElementById('vzStatus').value;
+
+  // Fix (Ramvir, Sept 2026 — L7103179: Form 2A/Authorization Letter showed
+  // blank even though vz_status was Complete). Root cause: this used to be a
+  // plain .insert() on every save, including re-verify/re-edit saves — so a
+  // lead re-saved without re-uploading files (f2aUrl/authUrl null that time)
+  // got a SECOND row with blank URLs, and the read side (loadPipelineRows in
+  // JS-Tracking.html) just took whatever row came back last for that
+  // lead_id, silently hiding the real, already-uploaded files. Fetching the
+  // existing row first and upserting on lead_id (unique constraint added in
+  // migration dedupe_verification_zoho_and_add_unique) keeps exactly one row
+  // per lead; only overwriting a URL when a new file was actually picked
+  // this time preserves a prior upload across a re-save, same pattern
+  // already used for Bank KYC/Upload Delivery uploads above.
+  const { data: existingVz } = await sb.from('rewire_verification_zoho')
+    .select('id, form_2a_url, authorization_letter_url').eq('lead_id', activeLeadId).maybeSingle();
+  const { error } = await sb.from('rewire_verification_zoho').upsert({
+    lead_id: activeLeadId,
+    form_2a_url: f2aUrl || (existingVz ? existingVz.form_2a_url : null),
+    authorization_letter_url: authUrl || (existingVz ? existingVz.authorization_letter_url : null),
+    remark, status, verified_by: currentProfile.id,
+  }, { onConflict: 'lead_id' });
+  if (error) { notify('Error saving: ' + error.message); return; }
+
+  // Bank details are shown here editable so a wrong account
+  // number/IFSC/etc caught during verification gets corrected on the lead
+  // itself, not just noted somewhere — this is what Payments/Omini Pay
+  // read from later.
+  const bankPayload = { last_updated_by: currentProfile.id };
+  Object.entries(BK_FIELD_MAP).forEach(([dbCol, attr]) => {
+    const el = document.querySelector(`#vzModal [data-field="${attr}"]`);
+    if (el) bankPayload[dbCol] = (typeof el.value === 'string' ? el.value.trim() : el.value) || null;
+  });
+  if (chequeUrl) bankPayload.kyc_cheque_url = chequeUrl;
+  await sb.from('rewire_master_data').update(bankPayload).eq('id', activeLeadId);
+
+  if (status === 'Complete') {
+    // Post Delivery reaches VZ after Delivery already consumed
+    // current_stage 4, so VZ-complete lands on 5. Advance Payment/Omini
+    // Pay/Instant Payments skip the Delivery slot entirely (Delivery is
+    // decoupled — happens independently, any time) so VZ-complete for
+    // them lands on 4 instead. See supabase-batch29-payment-type-flow-
+    // redesign.sql for the full threshold ladder this must match.
+    let leadForVz = findLeadInAnyPage(activeLeadId);
+    if (!leadForVz || !leadForVz.pn_payment_type) {
+      const { data: freshVzLead } = await sb.from('rewire_master_data').select('pn_payment_type').eq('id', activeLeadId).single();
+      leadForVz = freshVzLead;
+    }
+    const isAltFlowVz = isAltFlowPaymentType(leadForVz && leadForVz.pn_payment_type);
+    // vz_status was never actually being written to rewire_master_data
+    // here — same class of bug already found and fixed for ma_status
+    // (see JS-Pipeline.html submitManagerApproval). check_stage_progression()
+    // requires coalesce(vz_status,'Pending')='Complete' whenever
+    // current_stage advances to >=5 (Post Delivery) or >=4 (Alt types) —
+    // exactly the update this line performs — so without this, the DB
+    // should reject this update outright unless something else (a DB-side
+    // sync trigger not present in any tracked SQL file, or historical
+    // manual backfills) has been quietly covering for it. Writing it
+    // explicitly here matches the pattern every other stage-submit
+    // function already uses (ma_status, ha_status, payment_release_status
+    // are all written in the same update that advances current_stage) and
+    // is safe either way — a no-op if something else already sets it,
+    // the actual fix if nothing does.
+    // Instant Payment — the actual "go make the transfer" notification now
+    // fires here (Verification & Zoho reaching Complete) instead of at
+    // Price Negotiation save, so Accounts only gets emailed once Back
+    // Office has verified documents/bank details are correct. Guarded on
+    // vz_status not already being 'Complete' before this save (fetched
+    // BEFORE the update below), so re-verifying/re-saving VZ for the same
+    // lead never re-sends the email. payment_release_status itself is
+    // still set immediately at Price Negotiation save — only this
+    // notification moved.
+    const { data: freshInstantLead } = await sb.from('rewire_master_data')
+      .select(`vz_status, pn_payment_type, pn_omni_pay_to, pn_customer_payment, pn_broker_payment,
+        pn_partner_name, customer_name, val_vehicle_number, val_make, val_model_variant,
+        kyc_account_holder_name, kyc_bank_name, kyc_ifsc_code, kyc_account_number, current_stage,
+        manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)`)
+      .eq('id', activeLeadId).single();
+    // Uses priorVzStatus (captured BEFORE the rewire_verification_zoho
+    // insert above, and therefore before trg_mirror_vz had a chance to
+    // mirror the new status onto vz_status) — NOT freshInstantLead.vz_status,
+    // which by this point already reads 'Complete' regardless of whether
+    // this is genuinely the first time or a re-save. See the comment at the
+    // top of this function for the full story.
+    const shouldSendInstantEmail = !!(freshInstantLead && priorVzStatus !== 'Complete'
+      && freshInstantLead.pn_payment_type === 'Instant Payments' && freshInstantLead.pn_omni_pay_to);
+
+    // Re-verifying/re-saving an already-Complete VZ (explicitly allowed —
+    // see the email-guard comment above) must NEVER regress current_stage.
+    // This used to unconditionally write 4/5 on every save, so a lead that
+    // had already cleared Manager Approval (and even Payment Release) got
+    // silently pushed backward the moment VZ was re-saved for any reason —
+    // reported by Ramvir on L7100644 (Advance Payment, ma_status AND
+    // payment_release_status both 'Approved', current_stage sitting at 4,
+    // ma_status 'Approved' 3 separate times in rewire_manager_approval —
+    // each Manager Approval submission correctly bumped it to 6, but a
+    // later VZ re-save silently pulled it back to 4, putting it back in
+    // the Manager Approval tab's queue). Every other stage-submit function
+    // in this app already guards with Math.max(priorStage, target) — this
+    // one just never had it.
+    const priorStageVz = freshInstantLead && typeof freshInstantLead.current_stage === 'number' ? freshInstantLead.current_stage : 0;
+    const targetStageVz = isAltFlowVz ? 4 : 5;
+    const { error: vzStageErr } = await sb.from('rewire_master_data')
+      .update({ current_stage: Math.max(priorStageVz, targetStageVz), vz_status: status, last_updated_by: currentProfile.id })
+      .eq('id', activeLeadId);
+    if (vzStageErr) { notify('Verification & Zoho recorded, but failed to advance the lead: ' + vzStageErr.message, { icon: 'error' }); return; }
+
+    if (shouldSendInstantEmail) {
+      const brokerPartnerVz = (typeof allPartners !== 'undefined' ? allPartners : [])
+        .find(p => (p.partner_name || '').trim().toLowerCase() === (freshInstantLead.pn_partner_name || '').trim().toLowerCase());
+      google.script.run
+        .withSuccessHandler(() => { markInstantEmailResult(activeLeadId, 'Sent'); notify('Instant Payment email sent.'); })
+        .withFailureHandler((err) => { markInstantEmailResult(activeLeadId, 'Failed', err.message); notify('Verification & Zoho saved, but the Instant Payment email failed to send: ' + err.message, { icon: 'error' }); })
+        .sendInstantPaymentEmail({
+          leadNo: activeLeadNo,
+          customerName: freshInstantLead.customer_name || '',
+          vehicleNumber: freshInstantLead.val_vehicle_number || '',
+          vehicleModel: `${freshInstantLead.val_make || ''} ${freshInstantLead.val_model_variant || ''}`.trim(),
+          toParty: freshInstantLead.pn_omni_pay_to,
+          customerAmount: freshInstantLead.pn_customer_payment || 0,
+          brokerAmount: freshInstantLead.pn_broker_payment || 0,
+          brokerName: freshInstantLead.pn_partner_name || '',
+          customerBank: {
+            holder: freshInstantLead.kyc_account_holder_name || '',
+            bank: freshInstantLead.kyc_bank_name || '',
+            ifsc: freshInstantLead.kyc_ifsc_code || '',
+            acct: freshInstantLead.kyc_account_number || '',
+          },
+          brokerBank: {
+            holder: brokerPartnerVz ? brokerPartnerVz.account_holder_name || '' : '',
+            bank: brokerPartnerVz ? brokerPartnerVz.bank_name || '' : '',
+            ifsc: brokerPartnerVz ? brokerPartnerVz.ifsc_code || '' : '',
+            acct: brokerPartnerVz ? brokerPartnerVz.account_number || '' : '',
+          },
+          senderName: freshInstantLead.manager ? freshInstantLead.manager.name : '',
+        });
+    }
+  } else if (status === 'Lost') {
+    await sb.from('rewire_master_data').update({ overall_status: 'Closed Lost', lead_status: 'Closed Lost with Reason', lost_at_stage: 'Verification & Zoho', lost_reason: remark }).eq('id', activeLeadId);
+  }
+  notify('Verification & Zoho saved.');
+  closeModal('vzModal');
+  await refreshLeadsTable();
+  if (status === 'Complete' && typeof setStage === 'function') setStage(6);
+}
+
+// ------------------------------------------------------------
+// STAGE 4 — UPLOAD DELIVERY (now right after Bank KYC — PE enters delivery here)
+// ------------------------------------------------------------
+async function submitUploadDelivery() {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+  const status = document.getElementById('udStatus').value;
+  if (!status) { notify('Please select a Status', { icon: 'error', title: 'Missing field' }); return; }
+
+  if (status === 'Lost') {
+    const { error } = await sb.from('rewire_master_data').update({
+      overall_status: 'Closed Lost', lead_status: 'Closed Lost with Reason', lost_at_stage: 'Upload Delivery', last_updated_by: currentProfile.id,
+    }).eq('id', activeLeadId);
+    if (error) { notify('Error marking lost: ' + error.message, { icon: 'error' }); return; }
+    notify('Lead marked as Lost.');
+    closeModal('udModal');
+    await refreshLeadsTable();
+    return;
+  }
+
+  const cylinderType = document.getElementById('udCylinderType').value;
+  const cylinderPhotoEl = document.querySelector('#udModal [data-field="ud_cylinder_photo"]');
+  if ((cylinderType === 'CNG' || cylinderType === 'LPG') && (!cylinderPhotoEl || !cylinderPhotoEl.files.length)) {
+    notify('Cylinder photo is required for CNG/LPG vehicles.', { icon: 'error', title: 'Missing photo' });
+    return;
+  }
+
+  const toolKitVal = document.querySelector('#udModal [data-field="ud_tool_kit"]').value;
+  const jackVal = document.querySelector('#udModal [data-field="ud_jack"]').value;
+  if (toolKitVal === 'Yes' && !jackVal) {
+    notify('Jack is required when Tool Kit is Yes.', { icon: 'error', title: 'Missing field' });
+    return;
+  }
+
+  const rcReceivedType = document.getElementById('udRcReceivedType').value;
+  if (!rcReceivedType) {
+    notify('Please select RC Received with Vehicle.', { icon: 'error', title: 'Missing field' });
+    return;
+  }
+
+  // Every universally-applicable field in this form is mandatory (per
+  // Admin's requirement). Deliberately NOT made mandatory here: Customer/
+  // Broker/Trader Payment, Cash Commission, GST Amount, UPI Number/Amount/
+  // Screenshot, Other Screenshot, and Delivery Remark — these are deal-type-
+  // and payment-mode-specific (e.g. a direct-deal lead has no broker
+  // payment at all), so forcing them mandatory would block valid saves.
+  // Flagged to Admin — see summary.
+  // Fixed (Ramvir, Sept 2026 — Delivery Form kept asking to re-upload Spare
+  // Wheel Photo etc. even though it was already on file, e.g. L7103177).
+  // Root cause: this used to read findLeadInAnyPage(activeLeadId), which
+  // only searches the Not-Assigned/Qualified/Closed-Lost dashboard caches —
+  // an in-pipeline lead like this one (overall_status 'Active') is never in
+  // any of those, so the lookup silently came back null and every "already
+  // uploaded" photo looked missing. Fetching the lead's own upload columns
+  // fresh from the DB here works regardless of which page/cache it's in.
+  const { data: existingLeadUdCheck } = await sb.from('rewire_master_data')
+    .select('ud_spare_wheel_photo_url, ud_stereo_photo_url, ud_speakers_photo_url, ud_tool_kit_photo_url, ud_battery_photo_url, ud_alloy_wheel_photo_url, ud_inventory_slip_url, ud_delivery_photo_url')
+    .eq('id', activeLeadId).maybeSingle();
+  const udMissing = findMissingRequiredField('#udModal', [
+    { selector: '[data-field="ud_fuel_type"]', label: 'Fuel Type' },
+    { selector: '[data-field="ud_spare_wheel"]', label: 'Spare Wheel' },
+    { selector: '[data-field="ud_stereo"]', label: 'Stereo' },
+    { selector: '[data-field="ud_speakers"]', label: 'Speakers' },
+    { selector: '[data-field="ud_tool_kit"]', label: 'Tool Kit' },
+    { selector: '[data-field="ud_jack"]', label: 'Jack' },
+    { selector: '[data-field="ud_rod"]', label: 'ROD' },
+    { selector: '[data-field="ud_pana"]', label: 'Pana' },
+    { selector: '[data-field="ud_battery"]', label: 'Battery' },
+    { selector: '#udVehicleParking', label: 'Vehicle Parking' },
+    { selector: '#udTransportationType', label: 'Transportation Type' },
+    { selector: '[data-field="ud_vehicle_operational"]', label: 'Vehicle Operational' },
+    { selector: '[data-field="ud_vehicle_accidental"]', label: 'Vehicle Accidental' },
+    { selector: '[data-field="ud_alloy_wheel"]', label: 'Alloy Wheel' },
+    { selector: '#udVehicleAmount', label: 'Vehicle Amount' },
+    { selector: '#udCodAmount', label: 'COD Amount' },
+    { selector: '#udVehicleWeight', label: 'Vehicle Weight' },
+  ]);
+  if (udMissing) { notify(udMissing + ' is required.', { icon: 'error', title: 'Missing field' }); return; }
+  const udSub = document.getElementById('udVehicleSubParking');
+  if (udSub && !udSub.disabled && udSub.options.length > 1 && !udSub.value) { notify('Sub-Location is required.', { icon: 'error', title: 'Missing field' }); return; }
+
+  // Spare Wheel/Stereo/Speakers/Tool Kit/Battery/Alloy Wheel photos are only
+  // mandatory when their own accessory field says the item is actually
+  // present (same show/hide + mandatory/optional rule as Cylinder Type,
+  // driven by the handleUd*() functions in JS-Wiring.html). Inventory Slip
+  // and Delivery Photo remain unconditionally required.
+  const speakersCountUd = parseInt(document.querySelector('#udModal [data-field="ud_speakers"]').value, 10) || 0;
+  const alloyWheelCountUd = parseInt(document.querySelector('#udModal [data-field="ud_alloy_wheel"]').value, 10) || 0;
+  const toolKitGroupYesUd = ['ud_tool_kit', 'ud_jack', 'ud_rod', 'ud_pana'].some(f =>
+    document.querySelector(`#udModal [data-field="${f}"]`).value === 'Yes');
+  const udRequiredUploads = [
+    { field: 'ud_spare_wheel_photo', urlCol: 'ud_spare_wheel_photo_url', label: 'Upload Spare Wheel Photo', when: document.querySelector('#udModal [data-field="ud_spare_wheel"]').value === 'Yes' },
+    { field: 'ud_stereo_photo', urlCol: 'ud_stereo_photo_url', label: 'Upload Stereo Photo', when: document.querySelector('#udModal [data-field="ud_stereo"]').value === 'Yes' },
+    { field: 'ud_speakers_photo', urlCol: 'ud_speakers_photo_url', label: 'Upload Speakers Photo', when: speakersCountUd > 0 },
+    { field: 'ud_tool_kit_photo', urlCol: 'ud_tool_kit_photo_url', label: 'Upload Tool Kit Photo', when: toolKitGroupYesUd },
+    { field: 'ud_battery_photo', urlCol: 'ud_battery_photo_url', label: 'Upload Battery Photo', when: document.querySelector('#udModal [data-field="ud_battery"]').value === 'Yes' },
+    { field: 'ud_alloy_wheel_photo', urlCol: 'ud_alloy_wheel_photo_url', label: 'Upload Alloy Wheel Photo', when: alloyWheelCountUd > 0 },
+    { field: 'ud_inventory_slip', urlCol: 'ud_inventory_slip_url', label: 'Upload Inventory Slip', when: false },
+    { field: 'ud_delivery_photo', urlCol: 'ud_delivery_photo_url', label: 'Delivery Photo', when: true },
+  ];
+  for (const u of udRequiredUploads) {
+    if (!u.when) continue;
+    const el = document.querySelector(`#udModal [data-field="${u.field}"]`);
+    const hasNewFile = el && el.files.length;
+    const hasExisting = existingLeadUdCheck && existingLeadUdCheck[u.urlCol];
+    if (!hasNewFile && !hasExisting) { notify(u.label + ' is required.', { icon: 'error', title: 'Missing field' }); return; }
+  }
+
+  const uploads = ['ud_spare_wheel_photo','ud_stereo_photo','ud_speakers_photo','ud_tool_kit_photo',
+    'ud_battery_photo','ud_cylinder_photo','ud_alloy_wheel_photo','ud_inventory_slip','ud_delivery_photo',
+    'ud_upi_screenshot','ud_other_screenshot'];
+  const vFolder3 = getVehicleFolderName();
+  const urls = {};
+  // Run all file uploads in parallel instead of one-by-one — this is the
+  // main reason this form felt slow (11 possible uploads, each a round trip).
+  await Promise.all(uploads.map(async (key) => {
+    const el = document.querySelector(`#udModal [data-field="${key}"]`);
+    urls[key + '_url'] = el && el.files.length ? await uploadFile(el.files[0], vFolder3, key) : null;
+  }));
+
+  // A photo was picked but its upload failed -> stop here instead of silently saving without it.
+  const udFailed = uploads.filter(k => { const el = document.querySelector(`#udModal [data-field="${k}"]`); return el && el.files.length && !urls[k + '_url']; });
+  if (udFailed.length) { notify('Photo upload failed for: ' + udFailed.join(', ') + '. Nothing was saved - please press Save again.', { icon: 'error', title: 'Upload failed' }); return; }
+
+  const payload = readFields('#udModal', {
+    ud_fuel_type: 'ud_fuel_type', ud_spare_wheel: 'ud_spare_wheel', ud_stereo: 'ud_stereo', ud_speakers: 'ud_speakers',
+    ud_tool_kit: 'ud_tool_kit', ud_jack: 'ud_jack', ud_rod: 'ud_rod', ud_pana: 'ud_pana',
+    ud_battery: 'ud_battery',
+    ud_vehicle_operational: 'ud_vehicle_operational', ud_vehicle_accidental: 'ud_vehicle_accidental', ud_alloy_wheel: 'ud_alloy_wheel',
+    ud_upi_number: 'ud_upi_number', ud_upi_amount: 'ud_upi_amount', ud_delivery_remark: 'ud_delivery_remark',
+  });
+  payload.ud_cylinder_type = cylinderType;
+  let parkingVal = document.getElementById('udVehicleParking').value.trim();
+  if (parkingVal && !isValidMasterValue('location', parkingVal)) {
+    notify('"' + parkingVal + '" is not in the Location master list. Ask Admin to add it in Settings → Master Data, or pick an existing option.', { icon: 'error', title: 'Invalid Location' });
+    return;
+  }
+  if (parkingVal) parkingVal = normalizeMasterValue('location', parkingVal);
+  payload.ud_vehicle_parking = parkingVal;
+  payload.ud_vehicle_sub_parking = document.getElementById('udVehicleSubParking').value || null;
+  payload.transportation_type = document.getElementById('udTransportationType').value || null;
+  payload.ud_rc_received_type = rcReceivedType; // authoritative for RC Tracking eligibility — see renderRcTrackingSection/exportRcTrackingReport
+  payload.ud_total_offer_price = document.getElementById('udTotalOfferPrice').value || null;
+  payload.ud_customer_payment = document.getElementById('udCustomerPayment').value || null;
+  payload.ud_broker_payment = document.getElementById('udBrokerPayment').value || null;
+  payload.ud_trader_payment = document.getElementById('udTraderPayment').value || null;
+  payload.ud_cash_commission = document.getElementById('udCashCommission').value || null;
+  payload.ud_gst_amount = document.getElementById('udGstAmount').value || null;
+  payload.ud_vehicle_weight_kg = document.getElementById('udVehicleWeight').value || null;
+  payload.ud_vehicle_amount = document.getElementById('udVehicleAmount').value || null;
+  payload.ud_cod_amount = document.getElementById('udCodAmount').value || null;
+  payload.ud_instapay_done_by_name = document.getElementById('udOmniPayField').style.display !== 'none'
+    ? document.getElementById('udOmniPayDoneBy').value : null;
+  // Only overwrite each upload URL when a new file was actually picked —
+  // re-editing shouldn't wipe an existing upload.
+  Object.keys(urls).forEach(k => { if (urls[k]) payload[k] = urls[k]; });
+  payload.ud_filled_by = currentProfile.id;
+  payload.ud_filled_on = new Date().toISOString();
+  payload.ud_status = 'Complete';
+  // "One stage back" re-editing can reopen this form after the lead has
+  // already moved further along — never regress current_stage in that case.
+  // Fixed (Ramvir, Sept 2026 full-code audit) — findLeadInAnyPage cache miss
+  // here didn't just regress current_stage, it also made isAltFlowUd below
+  // wrongly evaluate false for a real Alt-flow lead (Advance Payment/Omini
+  // Pay/Instant Payments), which then force-advanced current_stage and
+  // could get the save REJECTED by the check_stage_progression() DB
+  // trigger. Fresh fetch of both columns needed for this decision.
+  const { data: existingLeadUd } = await sb.from('rewire_master_data').select('current_stage, pn_payment_type').eq('id', activeLeadId).maybeSingle();
+  const priorStageUd = existingLeadUd ? existingLeadUd.current_stage : 3;
+  const isFreshSaveUd = priorStageUd < 4;
+  // Advance Payment/Omini Pay/Instant Payments: Delivery is decoupled from
+  // current_stage entirely (PE fills it any time, in parallel with VZ/
+  // Manager Approval/Payment Release, which are the ones actually driving
+  // current_stage for these types) — leave current_stage untouched here,
+  // otherwise a Delivery filled before VZ is done would push current_stage
+  // past the VZ threshold and get rejected by check_stage_progression().
+  const isAltFlowUd = isAltFlowPaymentType(existingLeadUd && existingLeadUd.pn_payment_type);
+  if (!isAltFlowUd) payload.current_stage = Math.max(priorStageUd, 4);
+  payload.last_updated_by = currentProfile.id;
+
+  const { error } = await sb.from('rewire_master_data').update(payload).eq('id', activeLeadId);
+  if (error) { notify('Error saving delivery form: ' + error.message); return; }
+  notify(isFreshSaveUd ? 'Upload Delivery saved.' : 'Upload Delivery updated.');
+  closeModal('udModal');
+  await refreshLeadsTable();
+  if (isFreshSaveUd && typeof setStage === 'function') setStage(5); // -> Verification & Zoho — only auto-advance the tab on a genuinely fresh save
+}
+
+// ------------------------------------------------------------
+// STAGE 6 — MANAGER APPROVAL (separate table)
+// ------------------------------------------------------------
+async function submitManagerApproval(decision, managerName, remarks) {
+  if (!activeLeadId || !decision) { notify('Select a decision'); return; }
+  managerName = (managerName || '').trim();
+  remarks = (remarks || '').trim();
+
+  const { error } = await sb.from('rewire_manager_approval').insert({
+    lead_id: activeLeadId, manager_name: managerName, decision, remarks,
+  });
+  if (error) { notify('Error saving approval: ' + error.message); return; }
+
+  // ma_status was never actually being written to rewire_master_data here
+  // — only current_stage was bumped on Approved, and Rejected did nothing
+  // at all. That's what let a Rejected lead sit around still looking
+  // "Active" with no ma_status recorded. Fixed to write ma_status on both
+  // outcomes, and to close out a Rejected lead the same way every other
+  // "Lost" point in the app does.
+  const maPayload = { ma_status: decision, last_updated_by: currentProfile.id };
+  if (decision === 'Approved') {
+    maPayload.current_stage = 6; // same slot for every eligible payment type — see loadQualTab
+  } else if (decision === 'Rejected') {
+    maPayload.overall_status = 'Closed Lost';
+    maPayload.lead_status = 'Closed Lost with Reason';
+    maPayload.lost_at_stage = 'Manager Approval';
+  }
+  const { error: maErr } = await sb.from('rewire_master_data').update(maPayload).eq('id', activeLeadId);
+  if (maErr) { notify('Approval recorded, but failed to update lead status: ' + maErr.message, { icon: 'error' }); return; }
+
+  notify(`Manager Approval: ${decision}`);
+  closeModal('maModal');
+  await refreshLeadsTable();
+  // Post Delivery goes straight to Accessories Check (7) next, same as
+  // before. Advance Payment/Omini Pay go to the new Payment Release (10)
+  // step first — Head releases payment before Delivery/Accessories Check.
+  if (decision === 'Approved' && typeof setStage === 'function') {
+    // findLeadInAnyPage cache miss here just meant the wrong tab index
+    // opened after Approve for an Alt-flow lead (Ramvir, Sept 2026 audit) —
+    // fresh fetch so it lands on the right tab every time.
+    const { data: leadForMa } = await sb.from('rewire_master_data').select('pn_payment_type').eq('id', activeLeadId).maybeSingle();
+    const isAltFlowMa = isAltFlowPaymentType(leadForMa && leadForMa.pn_payment_type);
+    setStage(isAltFlowMa ? 10 : 7);
+  }
+}
+
+// ------------------------------------------------------------
+// PAYMENT RELEASE — Advance Payment / Omini Pay only (new). Early Head
+// sign-off right after Manager Approval, releases payment BEFORE
+// Delivery/Accessories Check happen. Does NOT touch ha_status or
+// overall_status — the deal isn't closed yet, just released for payment.
+// The FINAL Head Approval (submitHeadApproval, below) still happens later.
+// ------------------------------------------------------------
+async function submitPaymentRelease(decision, headName, remarks) {
+  if (!activeLeadId || !decision) { notify('Select a decision'); return; }
+  headName = (headName || '').trim();
+  remarks = (remarks || '').trim();
+
+  const { error } = await sb.from('rewire_payment_release').insert({
+    lead_id: activeLeadId, head_name: headName, decision, remarks,
+  });
+  if (error) { notify('Error saving release decision: ' + error.message); return; }
+
+  const relPayload = { payment_release_status: decision, payment_release_by: currentProfile.id, payment_release_at: new Date().toISOString(), last_updated_by: currentProfile.id };
+  if (decision === 'Approved') {
+    relPayload.current_stage = 6;
+  } else if (decision === 'Rejected') {
+    relPayload.overall_status = 'Closed Lost';
+    relPayload.lead_status = 'Closed Lost with Reason';
+    relPayload.lost_at_stage = 'Payment Release';
+  }
+  const { error: relErr } = await sb.from('rewire_master_data').update(relPayload).eq('id', activeLeadId);
+  if (relErr) { notify('Decision recorded, but failed to update lead status: ' + relErr.message, { icon: 'error' }); return; }
+
+  notify(`Payment Release: ${decision}`);
+  closeModal('releaseModal');
+  await refreshLeadsTable();
+  // Approved leads now sit in Payments (see JS-Payments.html) and, in
+  // parallel, are open for Delivery any time (Upload Delivery tab) — no
+  // single "next" tab to jump to, so just refresh the current one.
+  if (typeof setStage === 'function') setStage(10);
+}
+
+// ------------------------------------------------------------
+// STAGE 8 — HEAD APPROVAL (separate table, auto-locks lead when Approved)
+// ------------------------------------------------------------
+// Live-recomputes the Net Approved Amount shown in the Head Approval modal
+// as Head edits the deduction field, and flags when it no longer matches
+// what Accessories Check originally deducted (so it's obvious at decision
+// time, not just later, that the figure is being overridden).
+function calcHaNetAmount() {
+  const totalEl = document.getElementById('haDealTotalAmount');
+  const deductEl = document.getElementById('haDeductionAmount');
+  const netEl = document.getElementById('haNetAmount');
+  const warnEl = document.getElementById('haDeductionOverrideNote');
+  if (!totalEl || !deductEl || !netEl) return;
+  const total = parseFloat(totalEl.dataset.raw) || 0;
+  const deduct = parseFloat(deductEl.value) || 0;
+  netEl.value = total ? '₹' + (total - deduct).toLocaleString('en-IN') : '—';
+  if (warnEl) {
+    const orig = parseFloat(deductEl.dataset.origDeduction || '0') || 0;
+    if (orig > 0 && deduct !== orig) {
+      warnEl.style.display = '';
+      warnEl.textContent = `⚠ Accessories Check had deducted ₹${orig.toLocaleString('en-IN')} — you are approving with ₹${deduct.toLocaleString('en-IN')} deducted instead.`;
+    } else {
+      warnEl.style.display = 'none';
+    }
+  }
+}
+
+async function submitHeadApproval() {
+  if (!activeLeadId) { notify('No lead selected'); return; }
+  const decision = document.getElementById('haDecision').value;
+  const headName = document.getElementById('haHeadName').value.trim();
+  const remarks = document.getElementById('haRemarks').value.trim();
+  if (!decision) { notify('Select a decision'); return; }
+
+  const { error } = await sb.from('rewire_head_approval').insert({
+    lead_id: activeLeadId, head_name: headName, decision, remarks,
+  });
+  if (error) { notify('Error saving approval: ' + error.message); return; }
+
+  // Same gap as Manager Approval had — this never wrote ha_status back to
+  // rewire_master_data at all, on either decision, which is why "Approved"
+  // leads never actually moved to Purchased and kept sitting as pending
+  // forever. Approved -> current_stage 8 (Post Delivery) or 9 (Advance
+  // Payment/Omini Pay/Instant Payments — this IS the final closure for
+  // those types too, just reached via a different current_stage ladder;
+  // 9 is the "fully closed" marker check_stage_progression() expects for
+  // them), overall_status 'Purchased' (matches the value the historical
+  // import used for closed deals). Rejected -> Closed Lost, same pattern
+  // as every other rejection point.
+  const { data: haLeadType } = await sb.from('rewire_master_data').select('pn_payment_type').eq('id', activeLeadId).single();
+  const isAltFlowHa = isAltFlowPaymentType(haLeadType && haLeadType.pn_payment_type);
+  const haPayload = { ha_status: decision, last_updated_by: currentProfile.id };
+  if (decision === 'Approved') {
+    haPayload.current_stage = isAltFlowHa ? 9 : 8;
+    haPayload.overall_status = 'Purchased';
+  } else if (decision === 'Rejected') {
+    haPayload.overall_status = 'Closed Lost';
+    haPayload.lead_status = 'Closed Lost with Reason';
+    haPayload.lost_at_stage = 'Head Approval';
+  }
+  // Head can see the deal total + what Accessories Check already deducted,
+  // then override the deduction (down to 0 to approve the full amount, or
+  // any other figure) before approving. Stored separately from
+  // accessories_deduction_amount on purpose — that column stays exactly as
+  // Accessories Check left it, so viewing both side by side later makes it
+  // visible when Head's final figure didn't match what Accessories Check flagged.
+  const haDeductEl = document.getElementById('haDeductionAmount');
+  const haTotalEl = document.getElementById('haDealTotalAmount');
+  if (haDeductEl) {
+    const dealTotal = parseFloat(haTotalEl ? haTotalEl.dataset.raw : '') || 0;
+    const finalDeduction = parseFloat(haDeductEl.value) || 0;
+    haPayload.ha_deduction_amount = finalDeduction;
+    haPayload.ha_final_amount = dealTotal ? (dealTotal - finalDeduction) : null;
+  }
+  const { error: haErr } = await sb.from('rewire_master_data').update(haPayload).eq('id', activeLeadId);
+  if (haErr) { notify('Approval recorded, but failed to update lead status: ' + haErr.message, { icon: 'error' }); return; }
+
+  notify(`Head Approval: ${decision}`);
+  closeModal('haModal');
+  await refreshLeadsTable();
+}
+
+
+// ------------------------------------------------------------
+// RC TRACKING — PE dispatch (rewire_master_data) + Back Office tracking (rewire_rc_tracking)
+// ------------------------------------------------------------
+async function submitRcTracking() {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+
+  // PE section — Status + conditional courier fields
+  const peStatus = document.getElementById('rcPeStatus').value;
+  if (peStatus) {
+    const payload = { rc_pe_status: peStatus, rc_status: peStatus, last_updated_by: currentProfile.id };
+    if (peStatus === 'Send to City Office' || peStatus === 'Send to Plant') {
+      // Dispatch Mode — Courier (existing courier-shaped fields) or By Hand
+      // (just who's carrying it, no photo/signature — Ramvir, Sept 2026).
+      const dispatchMode = document.getElementById('rcDispatchMode').value || 'Courier';
+      payload.rc_dispatch_mode = dispatchMode;
+      if (dispatchMode !== 'Courier') {   // By Hand / Driver / Crane: just who carries it
+        payload.rc_carried_by = document.getElementById('rcCarriedByField').value.trim();
+        payload.rc_dispatch_date = document.getElementById('rcHandDateField').value || null;
+        // Clear any stale courier-mode values so a lead switched from
+        // Courier to By Hand doesn't keep showing an old courier name.
+        payload.rc_courier_name = null;
+        payload.rc_pod_no = null;
+      } else {
+        payload.rc_courier_name = document.getElementById('rcCourierName').value.trim();
+        payload.rc_pod_no = document.getElementById('rcPodNoField').value.trim();
+        payload.rc_dispatch_date = document.getElementById('rcCourierDateField').value || null;
+        const imgFile = document.getElementById('rcPodImageField');
+        if (imgFile && imgFile.files.length) {
+          payload.rc_pod_image_url = await uploadFile(imgFile.files[0], getVehicleFolderName(), 'POD_Image');
+        }
+        payload.rc_carried_by = null;
+      }
+      payload.rc_dispatched_by = currentProfile.id;
+      payload.rc_dispatched_on = new Date().toISOString();
+    }
+    const { error } = await sb.from('rewire_master_data').update(payload).eq('id', activeLeadId);
+    if (error) { notify('Error saving RC status: ' + error.message, { icon: 'error' }); return; }
+  }
+
+  // Back Office section — confirm receipt
+  const received = document.getElementById('rcReceivedStatus').value;
+  if (received === 'Received') {
+    const { error } = await sb.from('rewire_rc_tracking').insert({
+      lead_id: activeLeadId,
+      received_status: 'Received',
+      received_by: currentProfile.id,
+      received_on: new Date().toISOString(),
+      remarks: document.getElementById('rcRemarks').value.trim(),
+      tracked_by: currentProfile.id,
+    });
+    if (error) { notify('Error confirming receipt: ' + error.message, { icon: 'error' }); return; }
+  }
+
+  notify('RC Tracking saved.');
+  closeModal('rcModal');
+  await refreshLeadsTable();
+  if (typeof renderRcTrackingSection === 'function' && document.getElementById('section-rc-tracking').style.display !== 'none') {
+    renderRcTrackingSection(rcTrackPage);
+  }
+}
+
+async function submitEditLead() {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+  const stVal = document.getElementById('stEdit').value;
+
+  // (Ramvir, Oct 2026) — block reverting a lead to "Need Analysis" once its
+  // Valuation form has actually been filled (val_status='Complete'). Found
+  // on L7103484: status was manually set back to "Need Analysis" here
+  // while the lead had already gone all the way through Valuation, Price
+  // Negotiation AND Bank KYC (current_stage=3, all three *_status
+  // 'Complete') — this save never touched those stage columns, so the
+  // lead ended up stuck half "unqualified", half "Bank KYC done", and the
+  // Edit button kept offering "Edit — Bank KYC" on a lead that looked
+  // unqualified in the list. current_stage alone isn't a safe check here —
+  // every lead starts at current_stage=1 by default before Valuation is
+  // even opened, so that's normal and not reverted; val_status='Complete'
+  // is the real signal that pipeline work has actually been done.
+  if (stVal === 'Need Analysis') {
+    const { data: stageRow } = await sb.from('rewire_master_data').select('val_status').eq('id', activeLeadId).single();
+    if (stageRow && stageRow.val_status === 'Complete') {
+      notify('This lead\'s Valuation form is already filled, so it can\'t be set back to "Need Analysis" — that would leave the pipeline stage and the status out of sync. Use "Closed Lost" instead if this deal is actually dead.', { icon: 'error', title: 'Cannot revert status' });
+      return;
+    }
+  }
+
+  const custLocked = document.querySelector('#editModal [data-field="e_customer_name"]').disabled;
+  const payload = {
+    lead_status: stVal === 'CLR' ? 'Closed Lost with Reason' : stVal === 'CLC' ? 'Closed Lost to Competitor' : stVal,
+    sub_status: document.getElementById('sdSelEdit').value || null,
+    last_updated_by: currentProfile.id,
+  };
+  if (!custLocked) {
+    payload.customer_name = document.querySelector('#editModal [data-field="e_customer_name"]').value.trim();
+    payload.phone = document.querySelector('#editModal [data-field="e_phone"]').value.trim();
+    payload.email = document.querySelector('#editModal [data-field="e_email"]').value.trim();
+    payload.address = document.querySelector('#editModal [data-field="e_address"]').value.trim();
+    payload.city = document.querySelector('#editModal [data-field="e_city"]').value.trim();
+    payload.lead_source = document.querySelector('#editModal [data-field="e_lead_source"]').value;
+  }
+  if (stVal === 'CLR' || stVal === 'CLC') payload.overall_status = 'Closed Lost';
+
+  const peSel = document.getElementById('editPeId');
+  if (peSel && peSel.closest('#editReassignSection').style.display !== 'none' && peSel.value) {
+    payload.pe_id = peSel.value;
+  }
+  const mgrSelEdit = document.getElementById('editManagerId');
+  if (mgrSelEdit && mgrSelEdit.closest('#editManagerField').style.display !== 'none' && mgrSelEdit.value) {
+    payload.manager_id = mgrSelEdit.value;
+  }
+
+  const { error } = await sb.from('rewire_master_data').update(payload).eq('id', activeLeadId);
+  if (error) { notify('Error updating lead: ' + error.message, { icon: 'error' }); return; }
+
+  notify('Lead updated.');
+  closeModal('editModal');
+  await refreshLeadsTable();
+}
+
+
+</script>

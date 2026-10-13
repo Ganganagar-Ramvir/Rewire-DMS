@@ -1,0 +1,897 @@
+<!-- MODALS - PIPELINE: the stage-by-stage lead forms — Valuation, Price Negotiation, Bank KYC, Verification & Zoho, Upload Delivery, Manager Approval, Head Approval — plus RC Tracking, View Lead Details, Edit Lead. -->
+<!-- VALUATION FORM MODAL (Stage 1) -->
+<div class="modal-backdrop" id="valModal" style="display:none;" onclick="bdClose(event,'valModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-clipboard-list" aria-hidden="true"></i></div>
+      <div><h2>Valuation Form</h2><div class="modal-sub" id="valModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('valModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Status <span class="req">*</span></label>
+          <select id="valStatus" onchange="handleValStatus(this.value)">
+            <option value="">Select</option>
+            <option value="Valuation">Valuation</option>
+            <option value="Lost">Lost</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div id="valFieldset" style="display:none;">
+    <div class="form-section">
+      <div class="form-section-label">Lead / Customer Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Lead No.</label><input id="valLeadNo" readonly /></div>
+        <div class="form-field"><label>Customer Name <span class="req">*</span></label><input id="valCustomerName" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Phone <span class="req">*</span></label><input id="valPhone" maxlength="10" oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)" /></div>
+        <div class="form-field"><label>City <span class="req">*</span></label><input id="valCity" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field fg-full"><label>Address <span class="req">*</span></label><input id="valAddress" onblur="this.value=toProperCase(this.value)" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Vehicle Type <span class="req">*</span></label><select data-field="vehicle_type"><option value="">Select</option><option value="M (Cars)">M (Cars)</option><option value="N (Commercial Vehicles)">N (Commercial Vehicles)</option><option value="L (2W)">L (2W)</option><option value="3 Wheeler">3 Wheeler</option><option value="O (Other)">O (Other)</option></select></div>
+        <div class="form-field"><label>Vehicle Number <span class="req">*</span></label><input data-field="vehicle_number" placeholder="RJ14AB1234" style="text-transform:uppercase;" oninput="this.value=this.value.toUpperCase().replace(/\s+/g,'')" /></div>
+        <div class="form-field"><label>Make <span class="req">*</span></label>
+          <div class="partner-search-wrap">
+            <div class="ps-input-row" onclick="toggleMasterSearchDD('valMake',event)">
+              <i class="ti ti-search" aria-hidden="true"></i>
+              <input id="valMake" data-field="make" data-masterlist="vehicle_make" placeholder="Search make…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('valMake');event.stopPropagation()" autocomplete="off" />
+              <i class="ti ti-chevron-down" aria-hidden="true"></i>
+            </div>
+            <div class="ps-dropdown" id="msd_valMake"><div class="ps-list" id="msl_valMake"></div></div>
+          </div>
+        </div>
+        <div class="form-field"><label>Model / Variant <span class="req">*</span></label><input data-field="model_variant" placeholder="e.g. Swift VXi" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Registration Year <span class="req">*</span></label><input data-field="registration_year" placeholder="e.g. 2019" /></div>
+        <div class="form-field"><label>Kerb Weight (KG) <span class="req">*</span></label><input data-field="kerb_weight" type="number" min="0" onwheel="this.blur()" placeholder="e.g. 1050" /></div>
+        <div class="form-field"><label>Engine No. (as on RC) <span class="req">*</span></label><input data-field="engine_no" placeholder="Engine number" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Chassis No. (as on RC) <span class="req">*</span></label><input data-field="chassis_no" placeholder="Chassis number" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>RC Type <span class="req">*</span></label>
+          <select id="rcTypeVal" onchange="handleRCType(this.value)">
+            <option value="">Select</option><option value="eRC">eRC</option><option value="Physical RC">Physical RC</option><option value="FIR_NCR">FIR_NCR</option>
+          </select>
+        </div>
+        <div class="form-field"><label>Upload RC Copy <span class="req">*</span></label><input type="file" data-field="rc_copy" class="upload-field-input" /></div>
+        <div class="form-field"><label>Fuel Type <span class="req">*</span></label><select data-field="fuel_type"><option value="">Select</option><option>Petrol</option><option>CNG</option><option>Diesel</option><option>EV</option></select></div>
+      </div>
+      <div class="info-banner" id="rcPhysicalNote" style="display:none;">
+        <i class="ti ti-info-circle" aria-hidden="true"></i>
+        <span><strong>Physical RC guessed.</strong> This is just a pre-estimate — the actual "RC Received with Vehicle" is confirmed at Upload Delivery, and that's what unlocks the RC Tracking Form.</span>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Condition Checklist</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Spare Wheel <span class="req">*</span></label><select data-field="spare_wheel"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Stereo <span class="req">*</span></label><select data-field="stereo"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Speakers (0–10) <span class="req">*</span></label><select data-field="speakers"><option value="">Count</option><option>0</option><option>2</option><option>4</option><option>6</option><option>8</option><option>10</option></select></div>
+        <div class="form-field"><label>Tool Kit <span class="req">*</span></label><select data-field="tool_kit"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Battery <span class="req">*</span></label><select data-field="battery"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Vehicle Operational <span class="req">*</span></label><select data-field="vehicle_operational"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Vehicle Accidental <span class="req">*</span></label><select data-field="vehicle_accidental"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Alloy Wheel <span class="req">*</span></label><select data-field="alloy_wheel"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field fg-full"><label>Remarks <span class="req">*</span></label><input data-field="remarks" placeholder="Any additional remarks…" /></div>
+      </div>
+    </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('valModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitValuationForm())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Valuation</button>
+  </div>
+</div></div>
+
+<!-- Valuation Verify stage removed — Valuation now advances straight to Price Negotiation. -->
+
+<!-- PRICE NEGOTIATION MODAL -->
+<div class="modal-backdrop" id="pnModal" style="display:none;" onclick="bdClose(event,'pnModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-currency-rupee" aria-hidden="true"></i></div>
+      <div><h2>Price Negotiation</h2><div class="modal-sub" id="pnModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('pnModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Status <span class="req">*</span></label>
+          <select id="pnStatus" onchange="handlePnStatus(this.value)">
+            <option value="">Select</option>
+            <option value="Price Negotiation">Price Negotiation</option>
+            <option value="Lost">Lost</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div id="pnFieldset" style="display:none;">
+    <div class="form-section">
+      <div class="form-section-label">Deal Details</div>
+      <div class="form-grid">
+        <div class="form-field fg-full"><label>Deal Type <span class="req">*</span></label>
+          <select id="pnDealType" onchange="handlePnDealType(this.value)">
+            <option value="">Select</option>
+            <option value="Customer Keeping the COD / Direct Deal">Customer Keeping the COD / Direct Deal</option>
+            <option value="Customer Keeping the COD / Broker Deal">Customer Keeping the COD / Broker Deal</option>
+            <option value="Trader Keeping COD / Broker Deal">Trader Keeping COD / Broker Deal</option>
+            <option value="Trader Keeping COD / Direct Deal">Trader Keeping COD / Direct Deal</option>
+            <option value="No COD / Broker Deal">No COD / Broker Deal</option>
+            <option value="No COD / Direct Deal">No COD / Direct Deal</option>
+          </select>
+        </div>
+        <div class="form-field"><label>Payment Type <span class="req">*</span></label>
+          <select id="pnPaymentType" onchange="handlePnPaymentType(this.value)">
+            <option value="">Select</option>
+            <option value="Advance Payment">Advance Payment</option>
+            <option value="Post Delivery">Post Delivery</option>
+            <!-- Credit (Ramvir, Sept 2026) — follows the exact same stage
+                 progression as Post Delivery (see every isAltFlow* check
+                 across JS-Pipeline/JS-Wiring/JS-Core/JS-Operations/
+                 JS-Dashboard, all widened to treat 'Credit' same as 'Post
+                 Delivery'). The only difference is where it lands once it
+                 reaches Payments: instead of the normal Pending queue, it
+                 goes to its own "Credit Payment" tab (since the actual
+                 amount gets adjusted/settled later) and is marked Complete
+                 directly from there — see renderCreditPaymentSection(),
+                 JS-Payments.html. -->
+            <option value="Credit">Credit</option>
+            <option value="Omini Pay">Omini Pay</option>
+            <option value="Instant Payments">Instant Payment</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>Broker Name</label>
+          <div class="partner-search-wrap">
+            <div class="ps-input-row" onclick="togglePSD('psdPn',event)">
+              <i class="ti ti-search" aria-hidden="true"></i>
+              <input id="pnBroker" placeholder="Search broker/partner…" disabled oninput="filterPS('Pn',this.value)" onclick="openPSD('psdPn');event.stopPropagation()" autocomplete="off" />
+            </div>
+            <div class="ps-dropdown" id="psdPn"><div class="ps-list" id="pListPn"></div></div>
+          </div>
+        </div>
+        <div class="form-field"><label>Trader Name</label>
+          <select id="pnTrader" disabled onchange="handlePnTraderSelect(this.value)">
+            <option value="">Select trader</option>
+            <option value="Ganganagar Vehicles Pvt. Ltd.">Ganganagar Vehicles Pvt. Ltd.</option>
+            <option value="Other">Other (type name)</option>
+          </select>
+        </div>
+        <div class="form-field" id="pnTraderOtherField" style="display:none;"><label>Trader Name (Other)</label><input id="pnTraderOtherInput" placeholder="Type trader name" /></div>
+      </div>
+    </div>
+    <!-- Broker's bank details — read-only, filled from Partners directory the
+         moment a broker is picked above, purely for reference during
+         negotiation (nothing here gets saved back to the partner record). -->
+    <div class="form-section" id="pnBrokerBankWrap" style="display:none;">
+      <div class="form-section-label">Broker Bank Details (Reference — Read-only)</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Account Holder</label><input id="pnBrokerAccountHolder" readonly style="font-size:12px;background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Bank Name</label><input id="pnBrokerBankName" readonly style="font-size:12px;background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Branch Name</label><input id="pnBrokerBranchName" readonly style="font-size:12px;background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Account Number</label><input id="pnBrokerAccountNumber" readonly style="font-size:12px;background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>IFSC Code</label><input id="pnBrokerIfsc" readonly style="font-size:12px;background:var(--color-background-secondary);" /></div>
+      </div>
+    </div>
+    <!-- Customer's own bank account is NO LONGER captured here — Bank KYC
+         is the sole place that collects it now (see handleBkBankLock /
+         submitBankKyc in JS-Wiring.html & JS-Pipeline.html). PN only
+         decides, via Customer Offer > 0, whether Bank KYC will need it. -->
+    <div class="form-section">
+      <div class="form-section-label">Payment Split</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Customer Offer (₹)</label><input id="pnCustomerPayment" type="number" min="0" onwheel="this.blur()" placeholder="Amount" disabled oninput="calcPnTotal()" /></div>
+        <div class="form-field"><label>Broker/Partner Commission (₹)</label><input id="pnBrokerPayment" type="number" min="0" onwheel="this.blur()" placeholder="Amount" disabled oninput="calcPnTotal()" /></div>
+        <div class="form-field"><label>COD Offer (₹)</label><input id="pnCodPayment" type="number" min="0" onwheel="this.blur()" placeholder="Amount" disabled oninput="calcPnTotal()" /></div>
+        <div class="form-field"><label>Cash Commission (₹)</label><input id="pnCash" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcPnTotal()" /></div>
+        <div class="form-field"><label>GST Pay To</label>
+          <select id="pnGstPayTo" onchange="handlePnGstPayTo(this.value)">
+            <option value="">Select (no GST)</option>
+            <option value="Broker">Broker</option>
+            <option value="Customer">Customer</option>
+          </select>
+        </div>
+        <div class="form-field" id="pnGstAmountField" style="display:none;"><label>GST Amount (₹)</label><input id="pnGstAmount" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcPnTotal()" /></div>
+        <div class="form-field fg-full"><label>Total Offer Price (₹) <span class="req">*</span></label><input id="pnTotalOfferPrice" type="number" readonly min="0" onwheel="this.blur()" style="background:var(--color-background-secondary);font-weight:700;" /></div>
+      </div>
+    </div>
+    <div class="form-section" style="background:#fffbeb;border:1.5px solid #f59e0b;border-radius:8px;padding:12px 14px;">
+      <div class="form-section-label" style="color:#b45309;display:flex;align-items:center;gap:6px;">
+        <i class="ti ti-alert-triangle" style="font-size:14px;" aria-hidden="true"></i> Vehicle Rate Calculation — fill carefully
+      </div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Vehicle Amount (₹) <span title="Including Cash Commission">(Incl. Cash Commission)</span> <span class="req">*</span></label><input id="pnVehicleAmount" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcPnVehicleRate()" /></div>
+        <div class="form-field"><label>COD Amount (₹) <span class="req">*</span></label><input id="pnCodAmount" type="number" min="0" onwheel="this.blur()" placeholder="Amount" /></div>
+        <div class="form-field"><label>Vehicle Weight (KG) <span class="req">*</span></label><input id="pnVehicleWeight" type="number" min="0" onwheel="this.blur()" placeholder="Weight" oninput="calcPnVehicleRate()" /></div>
+        <div class="form-field"><label>Vehicle Rate per KG (₹)</label><input id="pnVehicleRatePerKg" type="number" readonly style="background:var(--color-background-secondary);" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Cash Commission Payout</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Pay Number of Person</label>
+          <select id="pnCommissionCount" onchange="handlePnCommissionCount(this.value)">
+            <option value="0">0</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-grid" id="pnCommissionPersons"></div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Instant / Omini Pay</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Omini Payments By Name <span class="req">*</span></label>
+          <select id="pnOmniPay" disabled>
+            <option value="">Select</option>
+            <option value="Sourabh Agarwal">Sourabh Agarwal</option>
+            <option value="Himanshu Brahmbhatt">Himanshu Brahmbhatt</option>
+            <option value="Puneet Chaudhary">Puneet Chaudhary</option>
+            <option value="Nikhil Goel">Nikhil Goel</option>
+            <option value="Ravindra Suman">Ravindra Suman</option>
+            <option value="Saurav Sharma">Saurav Sharma</option>
+            <option value="Praveen Singh Bhati">Praveen Singh Bhati</option>
+          </select>
+        </div>
+        <div class="form-field"><label>Omini/InstantPay To <span class="req">*</span></label>
+          <select id="pnOmniPayTo" disabled onchange="handlePnOmniPayToChange(this.value)">
+            <option value="">Select</option>
+            <option value="Customer">Customer</option>
+            <option value="Broker">Broker</option>
+            <option value="Both">Both</option>
+          </select>
+        </div>
+        <div class="form-field"><label>Upload QR Code <span class="req">*</span></label><input type="file" id="pnQrCode" class="upload-field-input" disabled /></div>
+      </div>
+    </div>
+    <!-- Location / Sub-Location (Ramvir, Sept 2026) — optional at PN stage,
+         so far only captured at Upload Delivery (ud_vehicle_parking).
+         Saved here as pn_vehicle_parking/pn_vehicle_sub_parking; Upload
+         Delivery's own Location field pre-fills FROM these (still fully
+         editable there — see openUploadDeliveryForm, JS-Wiring.html) so
+         PE/Manager doesn't have to re-type it if it's already known this
+         early, but nothing here is mandatory since it very often isn't
+         known yet at negotiation time. -->
+    <div class="form-section">
+      <div class="form-section-label">Location &amp; Transport</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Location <span class="req">*</span></label>
+          <div class="partner-search-wrap">
+            <div class="ps-input-row" onclick="toggleMasterSearchDD('pnVehicleParking',event)">
+              <i class="ti ti-search" aria-hidden="true"></i>
+              <input id="pnVehicleParking" data-masterlist="location" placeholder="Search location…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('pnVehicleParking');event.stopPropagation()" onblur="refreshSubLocationSelect('pnVehicleSubParking',this.value)" autocomplete="off" />
+              <i class="ti ti-chevron-down" aria-hidden="true"></i>
+            </div>
+            <div class="ps-dropdown" id="msd_pnVehicleParking"><div class="ps-list" id="msl_pnVehicleParking"></div></div>
+          </div>
+        </div>
+        <div class="form-field"><label>Sub-Location <span class="req">*</span></label>
+          <select id="pnVehicleSubParking" disabled><option value="">— None —</option></select>
+        </div>
+        <div class="form-field"><label>Transportation Type <span class="req">*</span></label>
+          <select id="pnTransportationType"><option value="">— Select —</option><option value="Self Customer">Self Customer</option><option value="PE Self">PE Self</option><option value="Driver">Driver</option><option value="Towing">Towing</option><option value="Crane">Crane</option></select>
+        </div>
+      </div>
+    </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('pnModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#d97706;border-color:#d97706;" onclick="withLoading(this, () => submitPriceNegotiation())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Negotiation</button>
+  </div>
+</div></div>
+
+<!-- BANK KYC MODAL (Stage 4) -->
+<div class="modal-backdrop" id="bkModal" style="display:none;" onclick="bdClose(event,'bkModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-building-bank" aria-hidden="true"></i></div>
+      <div><h2>Bank / KYC Form</h2><div class="modal-sub" id="bkModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('bkModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Status <span class="req">*</span></label>
+          <select id="bkStatus" onchange="handleBkStatus(this.value)">
+            <option value="">Select</option>
+            <option value="Bank KYC">Bank KYC</option>
+            <option value="Lost">Lost</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div id="bkFieldset" style="display:none;">
+    <div class="form-section">
+      <div class="form-section-label">Customer KYC Documents</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Aadhar Number <span class="req">*</span></label><input data-field="aadhar_number" placeholder="12-digit Aadhar" /></div>
+        <div class="form-field"><label>Upload Aadhar <span class="req">*</span></label><input type="file" data-field="aadhar_doc" class="upload-field-input" /></div>
+        <div class="form-field"><label>Aadhar Linked Phone <span class="req">*</span></label><input data-field="aadhar_linked_phone" type="tel" placeholder="Linked mobile" /></div>
+        <div class="form-field"><label>PAN Number <span class="req">*</span></label><input data-field="pan_number" placeholder="ABCDE1234F" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Upload PAN <span class="req">*</span></label><input type="file" data-field="pan_doc" class="upload-field-input" /></div>
+        <!-- Prefilled from the email captured at New Lead Entry
+             (rewire_master_data.email) — editable/correctable here, and
+             saved back to that same column on submit (see BK_FIELD_MAP,
+             JS-Wiring.html). -->
+        <div class="form-field"><label>Email ID <span class="req">*</span></label><input data-field="customer_email" type="email" placeholder="customer@example.com" /></div>
+        <div class="form-field"><label>GST Number</label><input data-field="gst_number" placeholder="GST (if applicable)" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Upload GST</label><input type="file" data-field="gst_doc" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section" id="bkBankSection">
+      <div class="form-section-label">Bank Details</div>
+      <div class="form-field" id="bkBankLockedNote" style="display:none;color:var(--color-text-tertiary);font-size:12px;margin-bottom:8px;">
+        <i class="ti ti-lock" aria-hidden="true"></i> Already captured during Price Negotiation — locked. If this is wrong, Back Office can correct it at Verification &amp; Zoho.
+      </div>
+      <div class="form-grid">
+        <div class="form-field"><label>Account Holder Name <span class="req">*</span></label><input data-field="account_holder_name" placeholder="As per bank records" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Bank Name <span class="req">*</span></label><input data-field="bank_name" placeholder="e.g. HDFC Bank" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Branch Name <span class="req">*</span></label><input data-field="branch_name" placeholder="Branch" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Account Number <span class="req">*</span></label><input data-field="account_number" placeholder="Account number" /></div>
+        <div class="form-field"><label>IFSC Code <span class="req">*</span></label><input data-field="ifsc_code" placeholder="HDFC0001234" oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Upload Cheque Photo <span class="req">*</span></label><input type="file" data-field="cheque_doc" class="upload-field-input" /></div>
+      </div>
+    </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('bkModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitBankKyc())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save KYC</button>
+  </div>
+</div></div>
+
+<!-- VERIFICATION & ZOHO MODAL (Stage 5 — Back Office) -->
+<div class="modal-backdrop" id="vzModal" style="display:none;" onclick="bdClose(event,'vzModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-purple"><i class="ti ti-file-check" aria-hidden="true"></i></div>
+      <div><h2>Verification &amp; Zoho Form</h2><div class="modal-sub" id="vzModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('vzModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <!-- Bank details section only shown when the customer is actually being
+         paid something directly (Customer Payment > 0, not Omini Pay) — same
+         rule as Bank KYC's bkBankDetailsNeeded()/handleBkBankLock(), mirrored
+         here via handleVzBankLock() so VZ doesn't ask Back Office to verify
+         bank details that were never collected in the first place. -->
+    <div class="form-section" id="vzBankSection">
+      <div style="font-size:12px;font-weight:700;color:#1d4ed8;border-bottom:1px solid var(--color-border-tertiary);padding-bottom:6px;margin-bottom:10px;">Customer Bank Details — check against the cheque copy and correct if wrong</div>
+      <div class="form-grid">
+        <div class="form-field fg-full" id="vzChequeLinkWrap" style="display:none;">
+          <label>Current Cheque Copy on File</label>
+          <div><a href="javascript:void(0)" id="vzChequeLink" style="color:#1d4ed8;text-decoration:underline;font-size:13px;">View Cheque Copy</a></div>
+        </div>
+        <div class="form-field"><label>Account Holder Name</label><input data-field="account_holder_name" /></div>
+        <div class="form-field"><label>Bank Name</label><input data-field="bank_name" /></div>
+        <div class="form-field"><label>Branch Name</label><input data-field="branch_name" /></div>
+        <div class="form-field"><label>Account Number</label><input data-field="account_number" /></div>
+        <div class="form-field"><label>IFSC Code</label><input data-field="ifsc_code" /></div>
+        <div class="form-field"><label>Replace Cheque Copy (only if wrong)</label><input type="file" data-field="vz_cheque_replace" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Upload Form-2A <span class="req">*</span></label><input type="file" data-field="form_2a" class="upload-field-input" /></div>
+        <div class="form-field"><label>Upload Authorization Letter <span class="req">*</span></label><input type="file" data-field="authorization_letter" class="upload-field-input" /></div>
+        <div class="form-field fg-full"><label>Remark</label><textarea data-field="remark" rows="2" placeholder="Any remarks…"></textarea></div>
+        <div class="form-field fg-full"><label>Status <span class="req">*</span></label><select id="vzStatus"><option value="Complete">Complete</option><option value="Lost">Mark as Lost</option></select></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('vzModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#7c3aed;border-color:#7c3aed;" onclick="withLoading(this, () => submitVerificationZoho())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Submit</button>
+  </div>
+</div></div>
+
+<!-- UPLOAD DELIVERY MODAL (Stage 6) -->
+<div class="modal-backdrop" id="udModal" style="display:none;" onclick="bdClose(event,'udModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-green"><i class="ti ti-truck-delivery" aria-hidden="true"></i></div>
+      <div><h2>Upload Delivery Form</h2><div class="modal-sub" id="udModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('udModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Status <span class="req">*</span></label>
+          <select id="udStatus" onchange="handleUdStatus(this.value)">
+            <option value="">Select</option>
+            <option value="Upload Delivery">Upload Delivery</option>
+            <option value="Lost">Lost</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div id="udFieldset" style="display:none;">
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Condition &amp; Photos</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Fuel Type <span class="req">*</span></label><select data-field="ud_fuel_type"><option value="">Select</option><option>Petrol</option><option>CNG</option><option>Diesel</option><option>EV</option></select></div>
+        <div class="form-field"><label>Spare Wheel <span class="req">*</span></label><select data-field="ud_spare_wheel" onchange="handleUdSpareWheel(this.value)"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field" id="udSpareWheelPhotoField" style="display:none;"><label>Upload Spare Wheel Photo <span class="req">*</span></label><input type="file" data-field="ud_spare_wheel_photo" class="upload-field-input" /></div>
+        <div class="form-field"><label>Stereo <span class="req">*</span></label><select data-field="ud_stereo" onchange="handleUdStereo(this.value)"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field" id="udStereoPhotoField" style="display:none;"><label>Upload Stereo Photo <span class="req">*</span></label><input type="file" data-field="ud_stereo_photo" class="upload-field-input" /></div>
+        <div class="form-field"><label>Speakers <span class="req">*</span></label><select data-field="ud_speakers" onchange="handleUdSpeakers(this.value)"><option value="">Count</option><option>0</option><option>2</option><option>4</option><option>6</option><option>8</option><option>10</option></select></div>
+        <div class="form-field" id="udSpeakersPhotoField" style="display:none;"><label>Upload Speakers Photo <span class="req">*</span></label><input type="file" data-field="ud_speakers_photo" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Tool Kit Details</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Tool Kit <span class="req">*</span></label><select data-field="ud_tool_kit" onchange="handleUdToolKitGroup()"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Jack <span class="req">*</span></label><select data-field="ud_jack" onchange="handleUdToolKitGroup()"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>ROD <span class="req">*</span></label><select data-field="ud_rod" onchange="handleUdToolKitGroup()"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Pana <span class="req">*</span></label><select data-field="ud_pana" onchange="handleUdToolKitGroup()"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field" id="udToolKitPhotoField" style="display:none;"><label>Upload Tool Kit Photo <span class="req">*</span></label><input type="file" data-field="ud_tool_kit_photo" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Battery &amp; CNG Details</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Battery <span class="req">*</span></label><select data-field="ud_battery" onchange="handleUdBattery(this.value)"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field" id="udBatteryPhotoField" style="display:none;"><label>Upload Battery Photo <span class="req">*</span></label><input type="file" data-field="ud_battery_photo" class="upload-field-input" /></div>
+        <div class="form-field"><label>Cylinder Type</label><select id="udCylinderType" onchange="handleCylinderType(this.value)"><option value="No">No</option><option value="CNG">CNG</option><option value="LPG">LPG</option></select></div>
+        <div class="form-field" id="udCylinderPhotoField" style="display:none;"><label>Upload Cylinder Photo <span class="req">*</span></label><input type="file" data-field="ud_cylinder_photo" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Parking &amp; Crane</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Vehicle Parking <span class="req">*</span></label>
+          <div class="partner-search-wrap">
+            <div class="ps-input-row" onclick="toggleMasterSearchDD('udVehicleParking',event)">
+              <i class="ti ti-search" aria-hidden="true"></i>
+              <input id="udVehicleParking" data-masterlist="location" placeholder="Search location…" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('udVehicleParking');event.stopPropagation()" onblur="refreshSubLocationSelect('udVehicleSubParking',this.value)" autocomplete="off" />
+              <i class="ti ti-chevron-down" aria-hidden="true"></i>
+            </div>
+            <div class="ps-dropdown" id="msd_udVehicleParking"><div class="ps-list" id="msl_udVehicleParking"></div></div>
+          </div>
+        </div>
+        <!-- Sub-Location (e.g. Location=Udaipur -> Sub-Location=TLC Udaipur).
+             Plain <select> instead of the search widget above since its
+             options depend on the Location just picked — populated by
+             refreshSubLocationSelect() (JS-Core.html), called on pick
+             (pickMasterSearchValue) and on blur (in case the exact text
+             was typed without clicking a suggestion). Optional — not every
+             Location needs a Sub-Location breakdown. -->
+        <div class="form-field"><label>Sub-Location <span class="req">*</span></label>
+          <select id="udVehicleSubParking" disabled><option value="">— None —</option></select>
+        </div>
+        <div class="form-field"><label>Transportation Type <span class="req">*</span></label>
+          <select id="udTransportationType"><option value="">— Select —</option><option value="Self Customer">Self Customer</option><option value="PE Self">PE Self</option><option value="Driver">Driver</option><option value="Towing">Towing</option><option value="Crane">Crane</option></select>
+        </div>
+        <div class="form-field"><label>RC Received with Vehicle <span class="req">*</span></label>
+          <select id="udRcReceivedType">
+            <option value="">Select</option>
+            <option value="eRC">eRC</option>
+            <option value="Physical RC">Physical RC</option>
+            <option value="FIR_NCR">FIR_NCR</option>
+          </select>
+        </div>
+      </div>
+      <div class="info-banner" style="margin-top:10px;">
+        <i class="ti ti-info-circle" aria-hidden="true"></i>
+        <span>This confirms what actually came with the vehicle at delivery — it drives RC Tracking, not the RC Type guessed at Valuation.</span>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Inspection</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Vehicle Operational <span class="req">*</span></label><select data-field="ud_vehicle_operational"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Vehicle Accidental <span class="req">*</span></label><select data-field="ud_vehicle_accidental"><option value="">Select</option><option>Yes</option><option>No</option></select></div>
+        <div class="form-field"><label>Alloy Wheel (Count) <span class="req">*</span></label><select data-field="ud_alloy_wheel" onchange="handleUdAlloyWheel(this.value)"><option value="">Select</option><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></div>
+        <div class="form-field" id="udAlloyWheelPhotoField" style="display:none;"><label>Upload Alloy Wheel Photo <span class="req">*</span></label><input type="file" data-field="ud_alloy_wheel_photo" class="upload-field-input" /></div>
+        <div class="form-field"><label>Upload Inventory Slip</label><input type="file" data-field="ud_inventory_slip" class="upload-field-input" /></div>
+        <div class="form-field"><label>Delivery Photo <span class="req">*</span></label><input type="file" data-field="ud_delivery_photo" class="upload-field-input" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Payment Details</div>
+      <div class="info-banner" id="udPaymentCompletedNote" style="display:none;margin-bottom:10px;">
+        <i class="ti ti-circle-check" aria-hidden="true"></i>
+        <span id="udPaymentCompletedNoteText"></span>
+      </div>
+      <div class="form-grid">
+        <div class="form-field"><label>Customer Payment (₹)</label><input id="udCustomerPayment" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcUdTotal()" /></div>
+        <div class="form-field"><label>Broker Payment (₹)</label><input id="udBrokerPayment" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcUdTotal()" /></div>
+        <div class="form-field"><label>Trader Payment (₹)</label><input id="udTraderPayment" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcUdTotal()" /></div>
+        <div class="form-field"><label>Cash Commission (₹)</label><input id="udCashCommission" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcUdTotal()" /></div>
+        <div class="form-field"><label>GST Amount (₹)</label><input id="udGstAmount" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcUdTotal()" /></div>
+        <div class="form-field"><label>Total Offer Price (₹)</label><input id="udTotalOfferPrice" type="number" readonly min="0" onwheel="this.blur()" style="background:var(--color-background-secondary);font-weight:700;" /></div>
+        <div class="form-field" id="udOmniPayField" style="display:none;"><label>Omini Pay Done By Name</label><input id="udOmniPayDoneBy" readonly /></div>
+        <div class="form-field"><label>UPI Number</label><input data-field="ud_upi_number" placeholder="UPI ID or number" /></div>
+        <div class="form-field"><label>UPI Amount (₹)</label><input data-field="ud_upi_amount" type="number" min="0" onwheel="this.blur()" placeholder="Amount" /></div>
+        <div class="form-field"><label>UPI Screenshot</label><input type="file" data-field="ud_upi_screenshot" class="upload-field-input" /></div>
+        <div class="form-field"><label>Other Screenshot</label><input type="file" data-field="ud_other_screenshot" class="upload-field-input" /></div>
+        <div class="form-field fg-full"><label>Delivery Remark</label><textarea data-field="ud_delivery_remark" rows="2" placeholder="Any delivery remarks…"></textarea></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Rate Calculation</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Vehicle Amount (₹) <span title="Including Cash Commission">(Incl. Cash Commission)</span> <span class="req">*</span></label><input id="udVehicleAmount" type="number" min="0" onwheel="this.blur()" placeholder="Amount" oninput="calcUdVehicleRate()" /></div>
+        <div class="form-field"><label>COD Amount (₹) <span class="req">*</span></label><input id="udCodAmount" type="number" min="0" onwheel="this.blur()" placeholder="Amount" /></div>
+        <div class="form-field"><label>Vehicle Weight (KG) <span class="req">*</span></label><input id="udVehicleWeight" type="number" min="0" onwheel="this.blur()" placeholder="Weight" oninput="calcUdVehicleRate()" /></div>
+        <div class="form-field"><label>Vehicle Rate per KG (₹)</label><input id="udVehicleRatePerKg" type="number" readonly style="background:var(--color-background-secondary);" /></div>
+      </div>
+    </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('udModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#059669;border-color:#059669;" onclick="withLoading(this, () => submitUploadDelivery())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save Delivery Form</button>
+  </div>
+</div></div>
+
+<!-- MANAGER APPROVAL MODAL (Stage 7) -->
+<div class="modal-backdrop" id="maModal" style="display:none;" onclick="bdClose(event,'maModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-purple"><i class="ti ti-user-check" aria-hidden="true"></i></div>
+      <div><h2>Manager Approval</h2><div class="modal-sub" id="maModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('maModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Rate Calculation (Reference)</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Vehicle Amount (₹)</label><input id="maVehicleAmount" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>COD Amount (₹)</label><input id="maCodAmount" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Vehicle Weight (KG)</label><input id="maVehicleWeight" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Vehicle Rate per KG (₹)</label><input id="maVehicleRatePerKg" readonly style="background:var(--color-background-secondary);" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Decision <span class="req">*</span></label>
+          <select id="maDecision"><option value="">Select decision</option><option value="Approved">Approved</option><option value="Rejected">Rejected</option></select>
+        </div>
+        <div class="form-field"><label>Manager Name <span class="req">*</span></label><input id="maManagerName" placeholder="Manager Name" readonly /></div>
+        <div class="form-field fg-full"><label>Remarks / Reason</label><textarea id="maRemarks" rows="2" placeholder="Approval or rejection remarks…"></textarea></div>
+      </div>
+    </div>
+    <div class="info-banner">
+      <i class="ti ti-info-circle" aria-hidden="true"></i>
+      <span>If <strong>Approved</strong>, the lead moves to Head Approval.</span>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('maModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#7c3aed;border-color:#7c3aed;" onclick="withLoading(this, () => submitManagerApproval(document.getElementById('maDecision').value, document.getElementById('maManagerName').value, document.getElementById('maRemarks').value))"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Submit</button>
+  </div>
+</div></div>
+
+<!-- PAYMENT RELEASE MODAL (new — Advance Payment / Omini Pay only, early
+     Head sign-off right after Manager Approval, releases payment BEFORE
+     Delivery/Accessories Check happen. The FINAL Head Approval — same
+     haModal below — still happens later, after Accessories Check. -->
+<div class="modal-backdrop" id="releaseModal" style="display:none;" onclick="bdClose(event,'releaseModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-cash" aria-hidden="true"></i></div>
+      <div><h2>Payment Release</h2><div class="modal-sub" id="releaseModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('releaseModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Payment Type</label><input id="releasePaymentType" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Total Deal Amount (₹)</label><input id="releaseDealTotalAmount" readonly style="background:var(--color-background-secondary);font-weight:700;" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Rate Calculation (Reference)</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Vehicle Amount (₹)</label><input id="releaseVehicleAmount" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>COD Amount (₹)</label><input id="releaseCodAmount" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Vehicle Weight (KG)</label><input id="releaseVehicleWeight" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Vehicle Rate per KG (₹)</label><input id="releaseVehicleRatePerKg" readonly style="background:var(--color-background-secondary);" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Decision <span class="req">*</span></label>
+          <select id="releaseDecision"><option value="">Select decision</option><option value="Approved">Approved — Release Payment</option><option value="Rejected">Rejected</option></select>
+        </div>
+        <div class="form-field"><label>Head Name <span class="req">*</span></label><input id="releaseHeadName" placeholder="Head / GM Name" readonly /></div>
+        <div class="form-field fg-full"><label>Remarks / Reason</label><textarea id="releaseRemarks" rows="2" placeholder="Approval or rejection remarks…"></textarea></div>
+      </div>
+    </div>
+    <div class="info-banner">
+      <i class="ti ti-info-circle" aria-hidden="true"></i>
+      <span>Approving here sends the lead to <strong>Payments</strong> — Delivery and Accessories Check still happen after this, and a separate <strong>final Head Approval</strong> closes the deal once those are done.</span>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('releaseModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#7c3aed;border-color:#7c3aed;" onclick="withLoading(this, () => submitPaymentRelease(document.getElementById('releaseDecision').value, document.getElementById('releaseHeadName').value, document.getElementById('releaseRemarks').value))"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Submit</button>
+  </div>
+</div></div>
+
+<!-- HEAD APPROVAL MODAL (Stage 8) -->
+<div class="modal-backdrop" id="haModal" style="display:none;" onclick="bdClose(event,'haModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-slate"><i class="ti ti-stamp" aria-hidden="true"></i></div>
+      <div><h2>Head Approval</h2><div class="modal-sub" id="haModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('haModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section" id="haAccessoriesSummaryWrap" style="display:none;">
+      <div class="form-section-label">Accessories Check — Shortage / Excess</div>
+      <table class="crm-table" style="margin-bottom:0;">
+        <thead><tr><th>Item</th><th>Valuation</th><th>Delivery</th><th>Result</th></tr></thead>
+        <tbody id="haAccessoriesSummaryBody"></tbody>
+      </table>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Deal Amount & Accessories Deduction</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Total Deal Amount (₹)</label><input id="haDealTotalAmount" readonly style="background:var(--color-background-secondary);font-weight:700;" /></div>
+        <div class="form-field"><label>Deducted at Accessories Check (₹)</label><input id="haAccessoriesDeduction" readonly style="background:var(--color-background-secondary);font-weight:700;color:#dc2626;" /></div>
+        <div class="form-field fg-full" id="haAccessoriesDeductionReasonWrap" style="display:none;"><label>Accessories Check — Deduction Reason</label><div class="sub" id="haAccessoriesDeductionReason" style="font-size:12px;color:var(--color-text-secondary);"></div></div>
+        <!-- Manager's Accessories Review remark (Ramvir, Sept 2026) — only
+             shown when the deduction went through the Accessories Review
+             step (i.e. deduction was > 0), so Head sees both the original
+             reason AND the Manager's own take before deciding. -->
+        <div class="form-field fg-full" id="haAccessoriesManagerRemarksWrap" style="display:none;"><label>Manager's Remarks (Accessories Review)</label><div class="sub" id="haAccessoriesManagerRemarks" style="font-size:12px;color:var(--color-text-secondary);"></div></div>
+        <div class="form-field"><label>Final Deduction (editable) (₹)</label><input type="number" id="haDeductionAmount" min="0" onwheel="this.blur()" placeholder="0" oninput="calcHaNetAmount()" /></div>
+        <div class="form-field"><label>Net Approved Amount</label><input id="haNetAmount" readonly style="background:var(--color-background-secondary);font-weight:700;color:#059669;" /></div>
+        <div class="form-field fg-full" id="haDeductionOverrideNote" style="display:none;color:#d97706;font-size:12px;font-weight:600;"></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Vehicle Rate Calculation (Reference)</div>
+      <div class="form-grid cols3">
+        <div class="form-field"><label>Vehicle Amount (₹)</label><input id="haVehicleAmount" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>COD Amount (₹)</label><input id="haCodAmount" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Vehicle Weight (KG)</label><input id="haVehicleWeight" readonly style="background:var(--color-background-secondary);" /></div>
+        <div class="form-field"><label>Vehicle Rate per KG (₹)</label><input id="haVehicleRatePerKg" readonly style="background:var(--color-background-secondary);" /></div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-grid">
+        <div class="form-field"><label>Decision <span class="req">*</span></label>
+          <select id="haDecision"><option value="">Select decision</option><option value="Approved">Approved</option><option value="Rejected">Rejected</option></select>
+        </div>
+        <div class="form-field"><label>Head Name <span class="req">*</span></label><input id="haHeadName" placeholder="Head / GM Name" readonly /></div>
+        <div class="form-field fg-full"><label>Remarks / Reason</label><textarea id="haRemarks" rows="2" placeholder="Approval or rejection remarks…"></textarea></div>
+      </div>
+    </div>
+    <div class="info-banner">
+      <i class="ti ti-info-circle" aria-hidden="true"></i>
+      <span>Approving here <strong>locks the lead</strong> — no further edits will be possible.</span>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('haModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="withLoading(this, () => submitHeadApproval())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Submit</button>
+  </div>
+</div></div>
+
+<!-- RC TRACKING MODAL -->
+<div class="modal-backdrop" id="rcModal" style="display:none;" onclick="bdClose(event,'rcModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-pink"><i class="ti ti-package" aria-hidden="true"></i></div>
+      <div><h2>RC Tracking Form</h2><div class="modal-sub" id="rcModalSub">Available only for Physical RC type</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('rcModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section" id="rcPeSection">
+      <div class="form-section-label">PE — RC Status</div>
+      <div class="form-grid">
+        <div class="form-field fg-full"><label>Status <span class="req">*</span></label>
+          <select id="rcPeStatus" onchange="handleRcPeStatus(this.value)">
+            <option value="">Select</option>
+            <option value="With PE">With PE</option>
+            <option value="Send to City Office">Send to City Office</option>
+            <option value="Send to Plant">Send to Plant</option>
+          </select>
+        </div>
+      </div>
+      <div id="rcPeCourierFields" style="display:none;">
+        <div class="form-grid" style="margin-top:12px;">
+          <div class="form-field fg-full"><label>Dispatch Mode</label>
+            <select id="rcDispatchMode" onchange="handleRcDispatchMode(this.value)">
+              <option value="Courier">Courier</option>
+              <option value="By Hand">By Hand</option>
+              <option value="Driver">Driver</option>
+              <option value="Crane">Crane</option>
+            </select>
+          </div>
+          <div id="rcCourierModeFields" class="form-grid" style="display:contents;">
+            <div class="form-field"><label>Courier Name</label><input id="rcCourierName" placeholder="e.g. DTDC, BlueDart" /></div>
+            <div class="form-field"><label>POD No.</label><input id="rcPodNoField" placeholder="Proof of Delivery No." oninput="this.value=this.value.toUpperCase()" /></div>
+            <div class="form-field"><label>Courier Date</label><input type="date" id="rcCourierDateField" /></div>
+            <div class="form-field"><label>Upload POD Image</label><input type="file" id="rcPodImageField" class="upload-field-input" /></div>
+          </div>
+          <div id="rcByHandFields" style="display:none;">
+            <div class="form-field fg-full"><label id="rcCarriedByLabel">Carried By (Name)</label><input id="rcCarriedByField" placeholder="Who is carrying the RC" style="font-size:15px;padding:10px 12px;" /></div>
+            <div class="form-field fg-full"><label>Date</label><input type="date" id="rcHandDateField" style="font-size:15px;padding:10px 12px;" /></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="form-section" id="rcBackOfficeSection">
+      <div class="form-section-label">Back Office — Confirm Receipt</div>
+      <div class="form-grid">
+        <!-- Only shown once the RC has actually been dispatched (Send to
+             City Office/Plant above) — a lead still "With PE"/never sent has
+             nothing to confirm receipt of yet. Toggled in openStageFormRc(),
+             JS-Tracking.html. -->
+        <div class="form-field fg-full" id="rcNotDispatchedNote" style="display:none;color:var(--color-text-tertiary);font-size:12px;">
+          <i class="ti ti-info-circle" aria-hidden="true"></i> RC hasn't been dispatched yet — nothing to confirm receipt of. Set it to "Send to City Office" or "Send to Plant" above first.
+        </div>
+        <div class="form-field fg-full" id="rcReceivedStatusWrap"><label>Mark as Received</label>
+          <select id="rcReceivedStatus"><option value="">Select</option><option value="Received">Received</option></select>
+        </div>
+        <div class="form-field fg-full"><label>Remarks</label><input id="rcRemarks" placeholder="Any remarks…" /></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('rcModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#be185d;border-color:#be185d;" onclick="withLoading(this, () => submitRcTracking())"><i class="ti ti-device-floppy" style="font-size:13px;" aria-hidden="true"></i> Save RC Tracking</button>
+  </div>
+</div></div>
+
+<!-- RC BULK SEND (Ramvir, Oct 2026) -->
+<div class="modal-backdrop" id="rcBulkModal" style="display:none;" onclick="bdClose(event,'rcBulkModal')">
+<div class="modal md">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-pink"><i class="ti ti-send" aria-hidden="true"></i></div>
+      <div><h2>Send RCs</h2><div class="modal-sub" id="rcBulkModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('rcBulkModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="form-field fg-full"><label>Send To <span class="req">*</span></label>
+        <select id="rcBulkStatus"><option value="">Select</option><option value="Send to City Office">Send to City Office</option><option value="Send to Plant">Send to Plant</option></select>
+      </div>
+      <div class="form-field fg-full"><label>Dispatch Mode</label>
+        <select id="rcBulkMode" onchange="handleRcBulkMode(this.value)"><option value="Courier">Courier</option><option value="By Hand">By Hand</option><option value="Driver">Driver</option><option value="Crane">Crane</option></select>
+      </div>
+      <div id="rcBulkCourierFields" style="display:contents;">
+        <div class="form-field"><label>Courier Name <span class="req">*</span></label><input id="rcBulkCourierName" placeholder="e.g. DTDC, BlueDart" /></div>
+        <div class="form-field"><label>POD No. <span class="req">*</span></label><input id="rcBulkPodNo" placeholder="Proof of Delivery No." oninput="this.value=this.value.toUpperCase()" /></div>
+        <div class="form-field"><label>Courier Date</label><input type="date" id="rcBulkCourierDate" /></div>
+        <div class="form-field"><label>Upload POD Image</label><input type="file" id="rcBulkPodImage" class="upload-field-input" /></div>
+      </div>
+      <div id="rcBulkHandFields" style="display:none;">
+        <div class="form-field fg-full"><label id="rcBulkCarriedByLabel">Carried By (Name) <span class="req">*</span></label><input id="rcBulkCarriedBy" placeholder="Who is carrying the RCs" /></div>
+        <div class="form-field fg-full"><label>Date</label><input type="date" id="rcBulkHandDate" /></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('rcBulkModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#be185d;border-color:#be185d;" onclick="withLoading(this, () => submitRcBulkSend())"><i class="ti ti-send" style="font-size:13px;" aria-hidden="true"></i> Send</button>
+  </div>
+</div></div>
+
+<!-- VIEW LEAD DETAILS MODAL (read-only) -->
+<div class="modal-backdrop" id="viewLeadModal" style="display:none;" onclick="bdClose(event,'viewLeadModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-blue"><i class="ti ti-file-text" aria-hidden="true"></i></div>
+      <div><h2 id="vlLeadNo">Lead</h2><div class="modal-sub" id="vlCustomerName">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('viewLeadModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body" id="vlBody">
+    <div style="text-align:center;color:var(--color-text-tertiary);padding:24px;">Loading…</div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('viewLeadModal')">Close</button>
+    <button class="btn btn-primary" id="vlEditBtn" onclick="closeModal('viewLeadModal')"><i class="ti ti-edit" style="font-size:13px;" aria-hidden="true"></i> Edit This Lead</button>
+  </div>
+</div></div>
+
+<!-- EDIT LEAD MODAL -->
+<div class="modal-backdrop" id="editModal" style="display:none;" onclick="bdClose(event,'editModal')">
+<div class="modal">
+  <div class="modal-hdr">
+    <div class="modal-title">
+      <div class="modal-icon mi-amber"><i class="ti ti-edit" aria-hidden="true"></i></div>
+      <div><h2>Edit Lead</h2><div class="modal-sub" id="editModalSub">—</div></div>
+    </div>
+    <button class="modal-close" onclick="closeModal('editModal')"><i class="ti ti-x" style="font-size:16px;" aria-hidden="true"></i></button>
+  </div>
+  <div class="modal-body">
+    <div class="form-section">
+      <div class="form-section-label">Customer Information</div>
+      <div class="info-banner" id="editCustomerInfoLockedNote" style="display:none;margin-bottom:12px;">
+        <i class="ti ti-lock" aria-hidden="true"></i>
+        <span>Customer Information is locked once Valuation has started — only Admin can still edit it.</span>
+      </div>
+      <div class="form-grid">
+        <div class="form-field fg-full"><label>Customer Name</label><input data-field="e_customer_name" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Phone</label><input data-field="e_phone" /></div>
+        <div class="form-field"><label>Email</label><input data-field="e_email" /></div>
+        <div class="form-field fg-full"><label>Address</label><input data-field="e_address" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>City</label><input data-field="e_city" onblur="this.value=toProperCase(this.value)" /></div>
+        <div class="form-field"><label>Lead Source</label>
+          <select data-field="e_lead_source">
+            <option value="">Select source</option>
+            <option>Exotel</option><option>Heion</option><option>Just Dial</option><option>NCD</option>
+            <option>OLX</option><option>Partner</option><option>Reference</option><option>Telein</option>
+            <option>TML</option><option>UCD</option><option>Walkin</option><option>WhatsApp</option><option>Workshop</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="form-section" id="editReassignSection" style="display:none;">
+      <div class="form-section-label">Assignment</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Procurement Executive</label>
+          <select id="editPeId"><option value="">Select PE</option></select>
+        </div>
+        <div class="form-field" id="editManagerField" style="display:none;"><label>Manager</label>
+          <select id="editManagerId"><option value="">Select Manager</option></select>
+        </div>
+      </div>
+    </div>
+    <div class="form-section">
+      <div class="form-section-label">Status</div>
+      <div class="form-grid">
+        <div class="form-field"><label>Lead Status <span class="req">*</span></label>
+          <select id="stEdit" onchange="handleST('Edit',this.value)">
+            <option value="Need Analysis">Need Analysis</option>
+            <option value="Qualified">Qualified</option>
+            <option value="CLR">Closed Lost with Reason</option>
+            <option value="CLC">Closed Lost to Competitor</option>
+          </select>
+        </div>
+        <div class="form-field status-dep" id="sdEdit">
+          <label id="sdLblEdit">Sub-Status</label>
+          <select id="sdSelEdit"><option value="">Select…</option></select>
+        </div>
+      </div>
+      <div class="info-banner" id="editLockedNote" style="display:none;">
+        <i class="ti ti-lock" aria-hidden="true"></i>
+        <span>This lead is Closed Lost — only Admin can change its status further.</span>
+      </div>
+    </div>
+    <div class="form-section" id="editLeadJourney">
+      <div class="form-section-label">Lead Journey — captured so far (read-only)</div>
+      <div class="vd-card" id="editJourneyBody">
+        <div class="vd-row"><span class="vd-label">Loading…</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn" onclick="closeModal('editModal')">Cancel</button>
+    <button class="btn btn-primary" style="background:#d97706;border-color:#d97706;" onclick="withLoading(this, () => submitEditLead())"><i class="ti ti-check" style="font-size:13px;" aria-hidden="true"></i> Update Lead</button>
+  </div>
+</div></div>

@@ -1,0 +1,582 @@
+<script>
+// ============================================================
+// CONVEYANCE MODULE (Ramvir, Oct 2026)
+// ============================================================
+// Replaces the manual "KHEMRAJ CONVEYANCE FORMAT JULY 26.xlsx" paper claim
+// bill — one Start Trip (morning, starting KM + odometer photo) and one
+// End Trip (evening, ending KM + odometer photo) per PE per day, same
+// shape as the old paper format's one-row-per-day (Date/Time Out/Time
+// In/Starting km/Last Km/Running/Rate/Cost), but now photo-verified instead
+// of hand-typed numbers nobody could check. Rate (₹/km) is admin-editable
+// and versioned by effective_from (rewire_conveyance_rate) so a rate change
+// never alters an already-logged trip's amount — each trip snapshots
+// whichever rate was active on its own trip_date.
+//
+// Confirmed with Ramvir (Oct 2026): one Start/End trip per PE per day
+// (not multiple cycles) — matches the existing paper format exactly.
+// ------------------------------------------------------------
+
+let conveyanceTripsCache = [];
+let conveyanceExpensesCache = [];   // Bus / Train / Tour / Auto claims (rewire_conveyance_expenses)
+let conveyanceExpenseDetailId = null;
+let conveyancePeOpenId = null;
+let conveyanceTodayType = 'Bike';
+const CONVEYANCE_TYPES = ['Bike', 'Bus', 'Train', 'Tour', 'Auto'];
+let conveyanceSelectedMonth = '';
+let conveyanceActiveTripId = null; // trip currently open in the Start/End modal
+// Same Pending/Paid split as Incentive (JS-Incentive.html) — Paid trips
+// move out of the working queue into their own tab (Ramvir, Oct 2026).
+let conveyanceActiveTab = 'pending';
+
+function defaultConveyanceMonth() {
+  return new Date().toISOString().slice(0, 7);
+}
+
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function getActiveConveyanceRate(asOfDateStr) {
+  const { data, error } = await sb.from('rewire_conveyance_rate')
+    .select('*').lte('effective_from', asOfDateStr).order('effective_from', { ascending: false }).limit(1).maybeSingle();
+  if (error) { console.error(error); return null; }
+  return data;
+}
+
+// Same issue/fix as incentiveProfileNameCache in JS-Incentive.html —
+// allActiveUsers excludes anyone who has left, which showed their raw
+// UUID instead of a name for past trips. lookupProfileNames() (defined in
+// JS-Payments.html) queries rewire_user_profiles with no `active` filter.
+let conveyanceProfileNameCache = {};
+async function ensureConveyanceNamesLoaded(ids) {
+  const missing = Array.from(new Set((ids || []).filter(id => id && !conveyanceProfileNameCache[id])));
+  if (!missing.length) return;
+  const byId = await lookupProfileNames(missing);
+  Object.assign(conveyanceProfileNameCache, byId);
+}
+function conveyanceNameFor(personId) {
+  if (conveyanceProfileNameCache[personId]) return conveyanceProfileNameCache[personId];
+  const u = (allActiveUsers || []).find(u => u.id === personId);
+  return u ? u.name : personId;
+}
+
+async function renderConveyanceSection() {
+  if (!conveyanceSelectedMonth) conveyanceSelectedMonth = defaultConveyanceMonth();
+  const monthInput = document.getElementById('conveyanceMonthInput');
+  if (monthInput) monthInput.value = conveyanceSelectedMonth;
+
+  const rateBtn = document.getElementById('conveyanceRateBtn');
+  if (rateBtn) rateBtn.style.display = (currentProfile && currentProfile.role === 'Admin') ? '' : 'none';
+
+  // PE sees their own "today" trip card to Start/End. Admin also sees it
+  // (so Admin can try the Start/End flow directly without needing a
+  // separate PE login) — everyone else just sees the list/table.
+  const canUseTodayCard = currentProfile && (currentProfile.role === 'PE' || currentProfile.role === 'Admin');
+  const todayCardWrap = document.getElementById('conveyanceTodayCardWrap');
+  if (todayCardWrap) todayCardWrap.style.display = canUseTodayCard ? '' : 'none';
+  if (canUseTodayCard) await onConveyanceTypeChange(conveyanceTodayType);
+
+  await loadConveyanceTripsForMonth();
+}
+
+// Conveyance Type picker (Ramvir, Oct 2026): Bike = the existing Start/End trip (KM + odometer photo)
+// process; Bus / Train / Tour / Auto = a simple expense claim (From, To, Amount, Bill).
+async function onConveyanceTypeChange(type) {
+  conveyanceTodayType = CONVEYANCE_TYPES.includes(type) ? type : 'Bike';
+  const sel = document.getElementById('convTypeSelect'); if (sel) sel.value = conveyanceTodayType;
+  const card = document.getElementById('conveyanceTodayCard');
+  if (conveyanceTodayType === 'Bike') { await renderConveyanceTodayCard(); return; }
+  if (!card) return;
+  const today = todayStr();
+  const { data } = await sb.from('rewire_conveyance_expenses').select('*').eq('pe_id', currentProfile.id).eq('expense_date', today).eq('conveyance_type', conveyanceTodayType).order('created_at', { ascending: false });
+  const list = (data || []).map(e => `<div style="font-size:12px;margin-top:4px;">${e.from_location} &rarr; ${e.to_location} &middot; <b>&#8377;${Number(e.amount).toLocaleString('en-IN')}</b> &middot; ${e.status}</div>`).join('');
+  card.innerHTML = `<div class="info-banner" style="margin:0;"><i class="ti ti-receipt" aria-hidden="true"></i><span>${conveyanceTodayType}: enter From, To, Amount and upload the bill. (No KM / odometer needed.)</span></div>
+    <button class="btn btn-primary" style="margin:0;" onclick="openConveyanceExpenseModal()"><i class="ti ti-plus" style="font-size:13px;" aria-hidden="true"></i> Add ${conveyanceTodayType} Expense</button>${list ? '<div style="flex-basis:100%;"><div style="font-weight:600;font-size:12px;">Added today</div>' + list + '</div>' : ''}`;
+}
+function openConveyanceExpenseModal() {
+  document.getElementById('convExpType').textContent = conveyanceTodayType;
+  ['convExpFrom', 'convExpTo', 'convExpAmount'].forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('convExpDate').value = todayStr();
+  document.getElementById('convExpBill').value = '';
+  document.getElementById('convExpenseModal').style.display = 'flex';
+}
+async function submitConveyanceExpense() {
+  const from = document.getElementById('convExpFrom').value.trim();
+  const to = document.getElementById('convExpTo').value.trim();
+  const amount = parseFloat(document.getElementById('convExpAmount').value);
+  const date = document.getElementById('convExpDate').value || todayStr();
+  const fileInput = document.getElementById('convExpBill');
+  if (!from) { notify('Enter the From location.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!to) { notify('Enter the To location.', { icon: 'error', title: 'Missing field' }); return; }
+  if (isNaN(amount) || amount <= 0) { notify('Enter a valid amount.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!fileInput.files || !fileInput.files.length) { notify('Upload the bill / ticket.', { icon: 'error', title: 'Missing bill' }); return; }
+  const folderName = 'Conveyance_' + (currentProfile.user_id || currentProfile.id);
+  const url = await uploadFile(fileInput.files[0], folderName, 'Conveyance_Bill_' + conveyanceTodayType);
+  if (!url) { notify('Bill upload failed - please try again.', { icon: 'error' }); return; }
+  const { error } = await sb.from('rewire_conveyance_expenses').insert({
+    pe_id: currentProfile.id, expense_date: date, conveyance_type: conveyanceTodayType,
+    from_location: from, to_location: to, amount, bill_url: url, status: 'Pending Verification',
+  });
+  if (error) { notify('Error saving expense: ' + error.message, { icon: 'error' }); return; }
+  notify(conveyanceTodayType + ' expense added.');
+  closeModal('convExpenseModal');
+  await onConveyanceTypeChange(conveyanceTodayType);
+  await loadConveyanceTripsForMonth();
+}
+
+// Bill / odometer images open in a popup on this page (not a new tab).
+function showConveyanceImage(url, title) {
+  if (!url) return;
+  // Photos live on Google Drive: a plain <img src=drive-view-url> shows blank, so reuse the Drive-aware viewer.
+  if (typeof viewAccessoryPhoto === 'function') { viewAccessoryPhoto(url, title || 'Preview'); return; }
+  Swal.fire({ title: title || 'Preview', html: `<a href="${url}" target="_blank" rel="noopener">Open file</a>`, showConfirmButton: false, showCloseButton: true });
+}
+
+async function renderConveyanceTodayCard() {
+  const today = todayStr();
+  const { data, error } = await sb.from('rewire_conveyance_trips').select('*')
+    .eq('pe_id', currentProfile.id).eq('trip_date', today).maybeSingle();
+  if (error) { console.error(error); return; }
+  const card = document.getElementById('conveyanceTodayCard');
+  if (!card) return;
+  if (!data) {
+    card.innerHTML = `<div class="info-banner" style="margin:0;"><i class="ti ti-route" aria-hidden="true"></i><span>No trip started today yet.</span></div>
+      <button class="btn btn-primary" style="margin:0;" onclick="openConveyanceStartModal()"><i class="ti ti-player-play" style="font-size:13px;" aria-hidden="true"></i> Start Trip</button>`;
+    return;
+  }
+  conveyanceActiveTripId = data.id;
+  const startedAt = data.start_time ? new Date(data.start_time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : '—';
+  if (data.status === 'In Progress') {
+    card.innerHTML = `<div class="info-banner" style="margin:0;"><i class="ti ti-route" aria-hidden="true"></i><span>Trip started at ${startedAt} · Starting KM: ${data.start_km}</span></div>
+      <button class="btn btn-primary" style="margin:0;background:#d97706;border-color:#d97706;" onclick="openConveyanceEndModal()"><i class="ti ti-player-stop" style="font-size:13px;" aria-hidden="true"></i> End Trip</button>`;
+  } else {
+    const endedAt = data.end_time ? new Date(data.end_time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : '—';
+    card.innerHTML = `<div class="info-banner" style="background:#f0fdf4;border-color:#bbf7d0;"><i class="ti ti-circle-check" aria-hidden="true"></i>
+      <span>Today's trip complete — ${data.distance_km} km @ ₹${data.rate_per_km}/km = ₹${Number(data.amount).toLocaleString('en-IN')} (ended ${endedAt}). Status: <b>${data.status}</b></span></div>`;
+  }
+}
+
+function openConveyanceStartModal() {
+  document.getElementById('convStartKm').value = '';
+  document.getElementById('convStartPhoto').value = '';
+  document.getElementById('convStartModal').style.display = 'flex';
+}
+
+async function submitConveyanceStart() {
+  const startKm = parseFloat(document.getElementById('convStartKm').value);
+  const fileInput = document.getElementById('convStartPhoto');
+  if (isNaN(startKm) || startKm < 0) { notify('Enter a valid starting KM reading.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!fileInput.files || !fileInput.files.length) { notify('Upload a photo of the odometer / meter reading.', { icon: 'error', title: 'Missing photo' }); return; }
+
+  const folderName = 'Conveyance_' + (currentProfile.user_id || currentProfile.id);
+  const photoUrl = await uploadFile(fileInput.files[0], folderName, 'Conveyance_StartKM');
+  if (!photoUrl) { notify('Photo upload failed — trip not started. Please try again.', { icon: 'error' }); return; }
+
+  const today = todayStr();
+  const { error } = await sb.from('rewire_conveyance_trips').upsert({
+    pe_id: currentProfile.id, trip_date: today,
+    start_time: new Date().toISOString(), start_km: startKm, start_photo_url: photoUrl,
+    status: 'In Progress', updated_at: new Date().toISOString(),
+  }, { onConflict: 'pe_id,trip_date' });
+  if (error) { notify('Error starting trip: ' + error.message, { icon: 'error' }); return; }
+  notify('Trip started. Have a safe day!');
+  closeModal('convStartModal');
+  await renderConveyanceTodayCard();
+  await loadConveyanceTripsForMonth();
+}
+
+function openConveyanceEndModal() {
+  document.getElementById('convEndKm').value = '';
+  document.getElementById('convEndPhoto').value = '';
+  document.getElementById('convWorkDescription').value = '';
+  document.getElementById('convEndModal').style.display = 'flex';
+}
+
+// Admin closing/correcting a trip that was left "In Progress" from a
+// previous day (PE can only end same-day — see submitConveyanceEnd()).
+// Opened from the Trip Detail modal's "End Trip (Admin)" button.
+function openConveyanceEndModalForAdmin() {
+  if (!conveyanceDetailTripId) return;
+  conveyanceActiveTripId = conveyanceDetailTripId;
+  closeModal('conveyanceDetailModal');
+  openConveyanceEndModal();
+}
+
+// A real work description needs more than a token entry like "." or two
+// random words — require at least 3 words and 10 real characters so
+// "office work" or "." can't be used to rush through the form (Ramvir,
+// Oct 2026).
+function isValidConveyanceWorkDescription(text) {
+  const trimmed = (text || '').trim();
+  if (trimmed.length < 10) return false;
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  return words.length >= 3;
+}
+
+async function submitConveyanceEnd() {
+  if (!conveyanceActiveTripId) { notify('No trip in progress.', { icon: 'error' }); return; }
+  const endKm = parseFloat(document.getElementById('convEndKm').value);
+  const fileInput = document.getElementById('convEndPhoto');
+  const workDesc = document.getElementById('convWorkDescription').value.trim();
+  if (isNaN(endKm) || endKm < 0) { notify('Enter a valid ending KM reading.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!fileInput.files || !fileInput.files.length) { notify('Upload a photo of the odometer / meter reading.', { icon: 'error', title: 'Missing photo' }); return; }
+  if (!isValidConveyanceWorkDescription(workDesc)) { notify('Describe where you went / what work you did today — at least a few words, not just "." or 2-3 words.', { icon: 'error', title: 'Places Visited / Work required' }); return; }
+
+  const { data: trip, error: fetchErr } = await sb.from('rewire_conveyance_trips').select('*').eq('id', conveyanceActiveTripId).single();
+  if (fetchErr || !trip) { notify('Could not find the open trip.', { icon: 'error' }); return; }
+  // PE can only end a trip the same day it was started — a trip left open
+  // overnight can't be closed the next morning with stale numbers. Admin
+  // can still close/correct any day's trip (e.g. a PE missed closing it
+  // and left for the day).
+  if (currentProfile.role !== 'Admin' && trip.trip_date !== todayStr()) {
+    notify(`This trip was started on ${trip.trip_date}, not today — it can only be ended the same day. Ask an Admin to close/correct it.`, { icon: 'error', title: 'Trip expired' });
+    return;
+  }
+  if (endKm < trip.start_km) { notify(`Ending KM (${endKm}) can't be less than starting KM (${trip.start_km}).`, { icon: 'error', title: 'Invalid reading' }); return; }
+
+  const folderName = 'Conveyance_' + (currentProfile.user_id || currentProfile.id);
+  const photoUrl = await uploadFile(fileInput.files[0], folderName, 'Conveyance_EndKM');
+  if (!photoUrl) { notify('Photo upload failed — trip not ended. Please try again.', { icon: 'error' }); return; }
+
+  const rateRow = await getActiveConveyanceRate(trip.trip_date);
+  const rate = rateRow ? rateRow.rate_per_km : 0;
+  const distance = Math.max(0, endKm - trip.start_km);
+  const amount = Math.round(distance * rate);
+
+  const { error } = await sb.from('rewire_conveyance_trips').update({
+    end_time: new Date().toISOString(), end_km: endKm, end_photo_url: photoUrl,
+    work_description: workDesc || null, distance_km: distance, rate_per_km: rate, amount,
+    status: 'Pending Verification', updated_at: new Date().toISOString(),
+  }).eq('id', conveyanceActiveTripId);
+  if (error) { notify('Error ending trip: ' + error.message, { icon: 'error' }); return; }
+  notify(`Trip ended — ${distance} km, ₹${amount.toLocaleString('en-IN')}.`);
+  closeModal('convEndModal');
+  await renderConveyanceTodayCard();
+  await loadConveyanceTripsForMonth();
+}
+
+async function loadConveyanceTripsForMonth() {
+  const monthStart = conveyanceSelectedMonth + '-01';
+  const monthEndDate = new Date(monthStart + 'T00:00:00Z');
+  monthEndDate.setUTCMonth(monthEndDate.getUTCMonth() + 1);
+  const monthEnd = monthEndDate.toISOString().slice(0, 10);
+
+  let teamIds = null;
+  if (currentProfile.role === 'Manager') teamIds = (allActiveUsers || []).filter(u => u.manager_id === currentProfile.id).map(u => u.id);
+  const scope = q => {
+    if (currentProfile.role === 'PE') return q.eq('pe_id', currentProfile.id);
+    if (teamIds) return q.in('pe_id', teamIds);
+    return q; // Admin/Accounts: everyone.
+  };
+
+  const [tripsRes, expRes] = await Promise.all([
+    scope(sb.from('rewire_conveyance_trips').select('*').gte('trip_date', monthStart).lt('trip_date', monthEnd)).order('trip_date', { ascending: false }),
+    scope(sb.from('rewire_conveyance_expenses').select('*').gte('expense_date', monthStart).lt('expense_date', monthEnd)).order('expense_date', { ascending: false }),
+  ]);
+  if (tripsRes.error) { console.error(tripsRes.error); notify('Error loading trips: ' + tripsRes.error.message, { icon: 'error' }); return; }
+  if (expRes.error) { console.error(expRes.error); notify('Error loading expenses: ' + expRes.error.message, { icon: 'error' }); }
+  const data = tripsRes.data || [], exps = expRes.data || [];
+
+  const idsNeeded = [];
+  data.forEach(t => { idsNeeded.push(t.pe_id); if (t.verified_by) idsNeeded.push(t.verified_by); if (t.paid_by) idsNeeded.push(t.paid_by); });
+  exps.forEach(t => { idsNeeded.push(t.pe_id); if (t.verified_by) idsNeeded.push(t.verified_by); if (t.paid_by) idsNeeded.push(t.paid_by); });
+  (allActiveUsers || []).forEach(u => { if (u.manager_id) idsNeeded.push(u.manager_id); });
+  await ensureConveyanceNamesLoaded(idsNeeded);
+
+  conveyanceTripsCache = data;
+  conveyanceExpensesCache = exps;
+  renderConveyanceTable();
+}
+
+function onConveyanceMonthChange(v) {
+  conveyanceSelectedMonth = v;
+  loadConveyanceTripsForMonth();
+}
+
+function showConveyanceTab(tab) {
+  conveyanceActiveTab = tab;
+  const pendingBtn = document.getElementById('conveyancetabnav-pending');
+  const paidBtn = document.getElementById('conveyancetabnav-paid');
+  if (pendingBtn) pendingBtn.className = 'btn ' + (tab === 'pending' ? 'btn-primary' : 'btn-outline');
+  if (paidBtn) paidBtn.className = 'btn ' + (tab === 'paid' ? 'btn-primary' : 'btn-outline');
+  renderConveyanceTable();
+}
+
+// Unified entry list: Bike trips + Bus/Train/Tour/Auto expenses, filtered by the Pending/Paid tab.
+function conveyanceEntries() {
+  const wantPaid = conveyanceActiveTab === 'paid';
+  const trips = conveyanceTripsCache.map(t => ({ kind: 'trip', type: 'Bike', pe_id: t.pe_id, date: t.trip_date, amount: Number(t.amount) || 0, status: t.status, raw: t }));
+  const exps = conveyanceExpensesCache.map(e => ({ kind: 'exp', type: e.conveyance_type, pe_id: e.pe_id, date: e.expense_date, amount: Number(e.amount) || 0, status: e.status, raw: e }));
+  return trips.concat(exps).filter(x => wantPaid ? x.status === 'Paid' : x.status !== 'Paid');
+}
+function conveyanceManagerNameOfPe(peId) {
+  const u = (allActiveUsers || []).find(x => x.id === peId);
+  return u && u.manager_id ? conveyanceNameFor(u.manager_id) : '—';
+}
+const convInr = n => '₹' + Number(n || 0).toLocaleString('en-IN');
+
+// Manager > PE > Type > Entry tree, same expand-in-place look as the Purchase dashboard (Ramvir, Oct 2026):
+// click a row's chevron / name and its children open directly below it.
+let convExpanded = new Set();
+function toggleConveyanceNode(key) {
+  if (convExpanded.has(key)) convExpanded.delete(key); else convExpanded.add(key);
+  renderConveyanceTable();
+}
+function renderConveyanceTable() {
+  const tbody = document.getElementById('tbodyConveyance');
+  if (!tbody) return;
+  const entries = conveyanceEntries();
+  const sum = list => list.reduce((t, e) => t + e.amount, 0);
+  const cnt = document.getElementById('countConveyance');
+  if (cnt) cnt.textContent = entries.length + ' entries · ' + convInr(sum(entries));
+  if (!entries.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">${conveyanceActiveTab === 'paid' ? 'No paid entries yet for this month.' : 'Nothing logged for this month yet.'}</td></tr>`;
+    return;
+  }
+  const statusColor = st => st === 'Paid' ? '#16a34a' : st === 'Manager Verified' ? '#1d4ed8' : st === 'Pending Verification' ? '#d97706' : st === 'Rejected' ? '#dc2626' : '#6b7280';
+  const node = (key, depth, label, list) => {
+    const open = convExpanded.has(key);
+    const pad = 12 + depth * 22;
+    return `<tr style="cursor:pointer;${depth === 0 ? 'background:#f8fafc;' : ''}" onclick="toggleConveyanceNode('${key}')">
+      <td style="padding-left:${pad}px;font-weight:${depth <= 1 ? 700 : 600};"><span style="display:inline-block;width:14px;color:#64748b;transform:rotate(${open ? 90 : 0}deg);transition:transform .15s;">&#8250;</span>${label}</td>
+      <td></td><td></td><td>${list.length}</td><td style="font-weight:700;">${convInr(sum(list))}</td><td></td><td></td></tr>`;
+  };
+  const byManager = {};
+  entries.forEach(e => { const m = conveyanceManagerNameOfPe(e.pe_id); (byManager[m] = byManager[m] || []).push(e); });
+  let html = '';
+  Object.keys(byManager).sort().forEach(mName => {
+    const mList = byManager[mName]; const mKey = 'm:' + mName;
+    html += node(mKey, 0, mName, mList);
+    if (!convExpanded.has(mKey)) return;
+    const byPe = {}; mList.forEach(e => { (byPe[e.pe_id] = byPe[e.pe_id] || []).push(e); });
+    Object.keys(byPe).sort((x, y) => conveyanceNameFor(x).localeCompare(conveyanceNameFor(y))).forEach(peId => {
+      const pList = byPe[peId]; const pKey = 'p:' + peId;
+      html += node(pKey, 1, conveyanceNameFor(peId), pList);
+      if (!convExpanded.has(pKey)) return;
+      CONVEYANCE_TYPES.forEach(type => {
+        const tList = pList.filter(e => e.type === type); if (!tList.length) return;
+        const tKey = 't:' + peId + ':' + type;
+        html += node(tKey, 2, type, tList);
+        if (!convExpanded.has(tKey)) return;
+        tList.sort((x, y) => String(x.date).localeCompare(String(y.date))).forEach(e => {
+          const r = e.raw;
+          const route = e.kind === 'trip' ? (r.start_km != null ? r.start_km : '—') + ' → ' + (r.end_km != null ? r.end_km : '—') + (r.distance_km != null ? ' (' + r.distance_km + ' km)' : '') : r.from_location + ' → ' + r.to_location;
+          const act = e.kind === 'trip' ? `openConveyanceDetail('${r.id}')` : `openConveyanceExpenseDetail('${r.id}')`;
+          html += `<tr><td style="padding-left:${12 + 3 * 22}px;color:#475569;">${e.date}</td><td></td><td>${route}</td><td>1</td><td style="font-weight:700;">${e.amount ? convInr(e.amount) : '—'}</td>
+            <td><span style="font-weight:700;color:${statusColor(e.status)};">${e.status}</span></td>
+            <td><button class="ab ab-form" onclick="${act}"><i class="ti ti-eye" style="font-size:11px;" aria-hidden="true"></i> View</button></td></tr>`;
+        });
+      });
+    });
+  });
+  tbody.innerHTML = html;
+}
+
+function openConveyancePeModal(peId) {
+  conveyancePeOpenId = peId;
+  document.getElementById('conveyancePeModal').style.display = 'flex';
+  renderConveyancePeBody();
+}
+function closeConveyancePeModal() {
+  conveyancePeOpenId = null;
+  document.getElementById('conveyancePeModal').style.display = 'none';
+}
+function renderConveyancePeBody() {
+  const peId = conveyancePeOpenId; if (!peId) return;
+  const body = document.getElementById('convPeBody'); if (!body) return;
+  const entries = conveyanceEntries().filter(e => e.pe_id === peId).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  document.getElementById('convPeTitle').textContent = conveyanceNameFor(peId) + ' — ' + conveyanceSelectedMonth;
+  document.getElementById('convPeSub').textContent = 'Manager: ' + conveyanceManagerNameOfPe(peId) + ' · ' + (conveyanceActiveTab === 'paid' ? 'Paid' : 'Pending') + ' · Total ' + convInr(entries.reduce((s, e) => s + e.amount, 0));
+  if (!entries.length) { body.innerHTML = '<div style="padding:18px;color:var(--color-text-tertiary);text-align:center;">No entries.</div>'; return; }
+  const statusColor = st => st === 'Paid' ? '#16a34a' : st === 'Manager Verified' ? '#1d4ed8' : st === 'Pending Verification' ? '#d97706' : st === 'Rejected' ? '#dc2626' : '#6b7280';
+  body.innerHTML = CONVEYANCE_TYPES.map(type => {
+    const list = entries.filter(e => e.type === type);
+    if (!list.length) return '';
+    const sum = list.reduce((s, e) => s + e.amount, 0);
+    const rows = list.map(e => {
+      const r = e.raw;
+      const route = e.kind === 'trip' ? (r.start_km != null ? r.start_km : '—') + ' → ' + (r.end_km != null ? r.end_km : '—') + (r.distance_km != null ? ' (' + r.distance_km + ' km)' : '') : r.from_location + ' → ' + r.to_location;
+      const act = e.kind === 'trip' ? `openConveyanceDetail('${r.id}')` : `openConveyanceExpenseDetail('${r.id}')`;
+      return `<tr><td></td><td>${route}</td><td style="font-weight:700;">${e.amount ? convInr(e.amount) : '—'}</td><td><span style="font-weight:700;color:${statusColor(e.status)};">${e.status}</span></td>
+        <td><button class="ab ab-form" onclick="${act}"><i class="ti ti-eye" style="font-size:11px;" aria-hidden="true"></i> View</button></td></tr>`;
+    }).join('');
+    return `<div style="margin-bottom:14px;"><div style="display:flex;justify-content:space-between;background:#eff6ff;padding:6px 10px;border-radius:6px;font-weight:700;font-size:12.5px;"><span>${type} (${list.length})</span><span>${convInr(sum)}</span></div>
+      <table class="crm-table" data-no-enhance="1" style="margin:6px 0 0;"><thead><tr><th>Date</th><th>${type === 'Bike' ? 'Start → End KM' : 'From → To'}</th><th>Amount</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }).join('');
+}
+
+// Expense (Bus / Train / Tour / Auto) detail + Manager verify + Accounts pay.
+function openConveyanceExpenseDetail(id) {
+  const e = conveyanceExpensesCache.find(x => x.id === id); if (!e) return;
+  conveyanceExpenseDetailId = id;
+  document.getElementById('convExpDetailSub').textContent = conveyanceNameFor(e.pe_id) + ' — ' + e.expense_date;
+  document.getElementById('convExpDetailType').textContent = e.conveyance_type;
+  document.getElementById('convExpDetailRoute').textContent = e.from_location + ' → ' + e.to_location;
+  document.getElementById('convExpDetailAmount').textContent = convInr(e.amount);
+  const billBtn = document.getElementById('convExpDetailBill');
+  billBtn.style.display = e.bill_url ? '' : 'none';
+  billBtn.onclick = () => showConveyanceImage(e.bill_url, e.conveyance_type + ' bill');
+  const rem = document.getElementById('convExpDetailRemarks'); rem.value = e.manager_remarks || '';
+  rem.disabled = !(e.status === 'Pending Verification' && ['Manager', 'Admin'].includes(currentProfile.role));
+  const v = document.getElementById('convExpVerifyBtn'), p = document.getElementById('convExpPayBtn'), pw = document.getElementById('convExpPayRefWrap');
+  v.style.display = (e.status === 'Pending Verification' && ['Manager', 'Admin'].includes(currentProfile.role)) ? '' : 'none';
+  const rj = document.getElementById('convExpRejectBtn'); if (rj) rj.style.display = v.style.display;
+  p.style.display = (e.status === 'Manager Verified' && ['Accounts', 'Admin'].includes(currentProfile.role)) ? '' : 'none';
+  pw.style.display = p.style.display;
+  document.getElementById('convExpPayRef').value = e.payment_reference || '';
+  document.getElementById('convExpStatusLine').textContent = e.status + (e.verified_by ? ' · Verified by ' + conveyanceNameFor(e.verified_by) : '') + (e.paid_by ? ' · Paid by ' + conveyanceNameFor(e.paid_by) : '');
+  document.getElementById('conveyanceExpenseDetailModal').style.display = 'flex';
+}
+async function submitConveyanceExpenseVerify() {
+  if (!conveyanceExpenseDetailId) return;
+  const { error } = await sb.from('rewire_conveyance_expenses').update({
+    manager_remarks: document.getElementById('convExpDetailRemarks').value.trim() || null, status: 'Manager Verified',
+    verified_by: currentProfile.id, verified_on: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }).eq('id', conveyanceExpenseDetailId);
+  if (error) { notify('Error verifying: ' + error.message, { icon: 'error' }); return; }
+  notify('Verified. Visible to Accounts for payment now.');
+  closeModal('conveyanceExpenseDetailModal');
+  await loadConveyanceTripsForMonth();
+}
+async function submitConveyanceExpensePay() {
+  if (!conveyanceExpenseDetailId) return;
+  const ref = document.getElementById('convExpPayRef').value.trim();
+  if (!ref) { notify('Enter a payment reference / UTR number.', { icon: 'error', title: 'Missing field' }); return; }
+  const { error } = await sb.from('rewire_conveyance_expenses').update({
+    status: 'Paid', paid_by: currentProfile.id, paid_on: new Date().toISOString(), payment_reference: ref, updated_at: new Date().toISOString(),
+  }).eq('id', conveyanceExpenseDetailId);
+  if (error) { notify('Error marking paid: ' + error.message, { icon: 'error' }); return; }
+  notify('Marked Paid.');
+  closeModal('conveyanceExpenseDetailModal');
+  await loadConveyanceTripsForMonth();
+}
+
+let conveyanceDetailTripId = null;
+function openConveyanceDetail(tripId) {
+  const t = conveyanceTripsCache.find(x => x.id === tripId);
+  if (!t) return;
+  conveyanceDetailTripId = tripId;
+  document.getElementById('conveyanceDetailSub').textContent = `${conveyanceNameFor(t.pe_id)} — ${t.trip_date}`;
+  document.getElementById('convDetailStartKm').textContent = t.start_km !== null ? t.start_km : '—';
+  document.getElementById('convDetailEndKm').textContent = t.end_km !== null ? t.end_km : '—';
+  document.getElementById('convDetailDistance').textContent = t.distance_km !== null ? t.distance_km + ' km' : '—';
+  document.getElementById('convDetailRate').textContent = t.rate_per_km !== null ? '₹' + t.rate_per_km + '/km' : '—';
+  document.getElementById('convDetailAmount').textContent = t.amount !== null ? '₹' + Number(t.amount).toLocaleString('en-IN') : '—';
+  document.getElementById('convDetailWork').textContent = t.work_description || '—';
+
+  const startPhotoLink = document.getElementById('convDetailStartPhoto');
+  const endPhotoLink = document.getElementById('convDetailEndPhoto');
+  startPhotoLink.removeAttribute('target'); endPhotoLink.removeAttribute('target');
+  startPhotoLink.href = 'javascript:void(0)'; endPhotoLink.href = 'javascript:void(0)';
+  startPhotoLink.onclick = (ev) => { ev.preventDefault(); showConveyanceImage(t.start_photo_url, 'Start odometer photo'); };
+  endPhotoLink.onclick = (ev) => { ev.preventDefault(); showConveyanceImage(t.end_photo_url, 'End odometer photo'); };
+  startPhotoLink.style.display = t.start_photo_url ? '' : 'none';
+  endPhotoLink.style.display = t.end_photo_url ? '' : 'none';
+
+  const remarksInput = document.getElementById('convDetailRemarks');
+  remarksInput.value = t.manager_remarks || '';
+  const canEditRemarks = t.status === 'Pending Verification' && (currentProfile.role === 'Manager' || currentProfile.role === 'Admin');
+  remarksInput.disabled = !canEditRemarks;
+
+  const verifyBtn = document.getElementById('conveyanceVerifyBtn');
+  const payBtn = document.getElementById('conveyancePayBtn');
+  const payRefWrap = document.getElementById('conveyancePayRefWrap');
+  const adminEndBtn = document.getElementById('conveyanceAdminEndBtn');
+  verifyBtn.style.display = (t.status === 'Pending Verification' && (currentProfile.role === 'Manager' || currentProfile.role === 'Admin')) ? '' : 'none';
+  const rjBtn = document.getElementById('conveyanceRejectBtn'); if (rjBtn) rjBtn.style.display = verifyBtn.style.display;
+  payBtn.style.display = (t.status === 'Manager Verified' && (currentProfile.role === 'Accounts' || currentProfile.role === 'Admin')) ? '' : 'none';
+  payRefWrap.style.display = payBtn.style.display;
+  // A PE can only End Trip same-day — if they left one "In Progress" from a
+  // previous day, Admin can still close/correct it here on any day.
+  if (adminEndBtn) adminEndBtn.style.display = (t.status === 'In Progress' && currentProfile.role === 'Admin') ? '' : 'none';
+  document.getElementById('convPayRef').value = t.payment_reference || '';
+
+  const statusLine = document.getElementById('conveyanceStatusLine');
+  statusLine.textContent = t.status + (t.verified_by ? ` · Verified by ${conveyanceNameFor(t.verified_by)}` : '') + (t.paid_by ? ` · Paid by ${conveyanceNameFor(t.paid_by)}` : '');
+
+  document.getElementById('conveyanceDetailModal').style.display = 'flex';
+}
+
+async function submitConveyanceVerify() {
+  if (!conveyanceDetailTripId) return;
+  const remarks = document.getElementById('convDetailRemarks').value.trim();
+  const { error } = await sb.from('rewire_conveyance_trips').update({
+    manager_remarks: remarks || null, status: 'Manager Verified',
+    verified_by: currentProfile.id, verified_on: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }).eq('id', conveyanceDetailTripId);
+  if (error) { notify('Error verifying: ' + error.message, { icon: 'error' }); return; }
+  notify('Verified. Visible to Accounts for payment now.');
+  closeModal('conveyanceDetailModal');
+  await loadConveyanceTripsForMonth();
+}
+
+
+// Manager / Admin can reject a Pending Verification entry; a reason in Manager Remarks is mandatory.
+async function _rejectConveyance(table, id, remarksId, modalId) {
+  const remarks = document.getElementById(remarksId).value.trim();
+  if (!remarks) { notify('Enter the reason for rejection in Manager Remarks.', { icon: 'error', title: 'Remarks required' }); return; }
+  const { error } = await sb.from(table).update({
+    manager_remarks: remarks, status: 'Rejected',
+    verified_by: currentProfile.id, verified_on: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }).eq('id', id);
+  if (error) { notify('Error rejecting: ' + error.message, { icon: 'error' }); return; }
+  notify('Entry rejected.');
+  closeModal(modalId);
+  await loadConveyanceTripsForMonth();
+}
+async function submitConveyanceReject() { if (conveyanceDetailTripId) await _rejectConveyance('rewire_conveyance_trips', conveyanceDetailTripId, 'convDetailRemarks', 'conveyanceDetailModal'); }
+async function submitConveyanceExpenseReject() { if (conveyanceExpenseDetailId) await _rejectConveyance('rewire_conveyance_expenses', conveyanceExpenseDetailId, 'convExpDetailRemarks', 'conveyanceExpenseDetailModal'); }
+
+async function submitConveyancePay() {
+  if (!conveyanceDetailTripId) return;
+  const ref = document.getElementById('convPayRef').value.trim();
+  if (!ref) { notify('Enter a payment reference / UTR number.', { icon: 'error', title: 'Missing field' }); return; }
+  const { error } = await sb.from('rewire_conveyance_trips').update({
+    status: 'Paid', paid_by: currentProfile.id, paid_on: new Date().toISOString(),
+    payment_reference: ref, updated_at: new Date().toISOString(),
+  }).eq('id', conveyanceDetailTripId);
+  if (error) { notify('Error marking paid: ' + error.message, { icon: 'error' }); return; }
+  notify('Marked Paid.');
+  closeModal('conveyanceDetailModal');
+  await loadConveyanceTripsForMonth();
+}
+
+// Same export rule as Incentive — only Manager-Verified / Paid trips
+// (within the current Pending/Paid tab + Month filter) are exportable.
+function exportConveyanceExcel() {
+  const exportable = conveyanceEntries().filter(e => e.status === 'Manager Verified' || e.status === 'Paid');
+  if (!exportable.length) { notify('No Manager-Verified or Paid entries to export in this view.', { icon: 'info' }); return; }
+  const rows = exportable.sort((a, b) => conveyanceNameFor(a.pe_id).localeCompare(conveyanceNameFor(b.pe_id)) || String(a.date).localeCompare(String(b.date))).map(e => { const r = e.raw; return {
+    'Manager': conveyanceManagerNameOfPe(e.pe_id), 'PE': conveyanceNameFor(e.pe_id), 'Date': e.date, 'Conveyance Type': e.type,
+    'From': e.kind === 'exp' ? r.from_location : '', 'To': e.kind === 'exp' ? r.to_location : '',
+    'Start KM': e.kind === 'trip' ? r.start_km : '', 'End KM': e.kind === 'trip' ? r.end_km : '', 'Distance (km)': e.kind === 'trip' ? r.distance_km : '',
+    'Rate (₹/km)': e.kind === 'trip' ? r.rate_per_km : '', 'Amount': e.amount,
+    'Places Visited / Work': e.kind === 'trip' ? (r.work_description || '') : '', 'Bill': e.kind === 'exp' ? (r.bill_url || '') : '',
+    'Status': e.status, 'Payment Reference': r.payment_reference || '' }; });
+  downloadXlsx(`Conveyance_${conveyanceSelectedMonth}_${conveyanceActiveTab}.xlsx`, rows, 'Conveyance');
+}
+
+// ------------------------------------------------------------
+// RATE EDITOR (Admin only)
+// ------------------------------------------------------------
+async function openConveyanceRateModal() {
+  const rate = await getActiveConveyanceRate(todayStr());
+  document.getElementById('convRateCurrentDisplay').textContent = rate ? `₹${rate.rate_per_km}/km (effective from ${rate.effective_from})` : 'Not set';
+  document.getElementById('convRateNewValue').value = rate ? rate.rate_per_km : '';
+  document.getElementById('convRateEffectiveFrom').value = todayStr();
+  document.getElementById('conveyanceRateModal').style.display = 'flex';
+}
+
+async function submitConveyanceRate() {
+  const rate = parseFloat(document.getElementById('convRateNewValue').value);
+  const effectiveFrom = document.getElementById('convRateEffectiveFrom').value;
+  if (isNaN(rate) || rate <= 0) { notify('Enter a valid rate.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!effectiveFrom) { notify('Set an effective-from date.', { icon: 'error', title: 'Missing field' }); return; }
+  const { error } = await sb.from('rewire_conveyance_rate').insert({
+    rate_per_km: rate, effective_from: effectiveFrom, created_by: currentProfile.id,
+  });
+  if (error) { notify('Error saving rate: ' + error.message, { icon: 'error' }); return; }
+  notify(`New rate ₹${rate}/km saved, effective from ${effectiveFrom}. Already-logged trips are unaffected.`);
+  closeModal('conveyanceRateModal');
+}
+</script>

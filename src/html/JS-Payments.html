@@ -1,0 +1,2851 @@
+<script>
+// PAYMENTS: Payments section, Reports tab CSV/Excel exports, and the Commission tab (Pay Number of Person feature).
+// ------------------------------------------------------------
+// PAYMENTS SECTION — Customer + Broker rows per vehicle, Accounts workflow
+// ------------------------------------------------------------
+// PAYMENTS SOP (Payment Module SOP v1.0, 7 Sept 2026 — 5 tabs, each its
+// own status bucket):
+//   Pending             — status 'Pending' only. Actions: Hold, or Send
+//                         for Payment (-> status 'To be Sent for Payment',
+//                         moves to that tab — does NOT dispatch anything
+//                         by itself, just queues it).
+//   Hold                — status 'Hold'. Actions: back to Pending, Send
+//                         for Payment (-> 'To be Sent for Payment'), or
+//                         Rejected (dummy UTR, straight to Archive — see
+//                         rejectPayment()).
+//   To be Sent for       status 'To be Sent for Payment'. Checkbox
+//   Payment              multi-select tab — the actual CSV+email dispatch
+//                         to Cashier/Procurement Managers only happens
+//                         here, on selected rows (see
+//                         sendForPaymentAndNotify()), moving them to
+//                         Pending UTR. Rejected/Mark Hold are also bulk
+//                         actions here (bulkRejectToBeSent()/
+//                         bulkHoldToBeSent()).
+//   Pending UTR         — status 'Pending UTR' (reached ONLY via a
+//                         successful dispatch from "To be Sent for
+//                         Payment" above), PLUS every Instant Payment row
+//                         regardless of its raw status (Instant Payments
+//                         skip Pending/Hold/To be Sent for Payment
+//                         entirely). UTR entry + Complete only.
+//   Archive             — status 'Completed' or 'Rejected'. Terminal,
+//                         read-only.
+let paymentsCache = [];
+let paymentsHoldCache = [];
+let toBeSentCache = [];
+let pendingUtrCache = [];
+let toBeSentSelectedIds = new Set();
+
+// Shared raw fetch — the regular Payments list, Hold, To be Sent for
+// Payment, Pending UTR AND the "Send for Payment" eligibility check all
+// read off the same rewire_payments table (a DB trigger auto-generates a
+// Customer + Broker row per lead once it qualifies, regardless of payment
+// type), they just apply a different status/pn_payment_type filter on
+// top. One query, five views, instead of hitting the DB separately for
+// each.
+//
+// PERFORMANCE: this used to run a completely fresh, unpaginated-but-
+// paginated-internally fetch of the WHOLE rewire_payments table (4700+
+// rows, ~5 sequential page requests, plus the embedded lead/pe/manager/
+// partner join on every one of those rows) EVERY single time any of the
+// 5 callers above ran — and refreshPaymentsSections() calls 4 of them
+// back-to-back after every single status change/reject/send, meaning one
+// click could trigger ~20 network round-trips against the same data. This
+// was very likely the single biggest contributor to "DMS load is slow".
+// Fixed with a short-lived shared cache: the FIRST call in a burst does
+// the real fetch, every other call within the next few seconds (i.e. the
+// other 3-4 render calls that immediately follow it) reuses that same
+// result instead of re-fetching. invalidatePaymentsRawCache() (called at
+// the top of refreshPaymentsSections()) forces the next call to do a real
+// fetch again, so nothing goes stale after an actual write.
+let paymentsRawCache = null;
+let paymentsRawCacheAt = 0;
+const PAYMENTS_RAW_CACHE_TTL_MS = 8000;
+function invalidatePaymentsRawCache() { paymentsRawCache = null; }
+async function fetchPaymentsRaw() {
+  if (paymentsRawCache && (Date.now() - paymentsRawCacheAt) < PAYMENTS_RAW_CACHE_TTL_MS) return paymentsRawCache;
+  // Goes through fetchAllRows() (JS-Core.html) — this had the exact same
+  // gap as the Health Check / "Find Missing Payment Rows" bugs: a plain
+  // .select() with no .range() silently caps at Supabase's default 1000
+  // rows, and rewire_payments has 4700+. Sorted newest-first, so any
+  // OLDER row past the first 1000 (like L7101673's, created back on
+  // Sept 1) never reached the client at all — it wasn't being filtered
+  // out by any of the eligibility checks, it just never arrived to be
+  // checked in the first place. Every eligibility check downstream of
+  // this (paymentsCache, paymentsHoldCache, toBeSentCache, pendingUtrCache)
+  // was otherwise correct.
+  const data = await fetchAllRows((from, to) => sb.from('rewire_payments')
+    .select(`*, lead:rewire_master_data!rewire_payments_lead_id_fkey(lead_no, customer_name, phone, email, ud_vehicle_parking, ud_vehicle_sub_parking,
+      val_vehicle_type, val_vehicle_number, val_make, val_model_variant, pn_deal_type, pn_payment_type, pn_partner_name,
+      pn_customer_payment, pn_broker_payment, pn_omni_pay_to, ha_status, payment_release_status,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name,manager_email),
+      kyc_account_holder_name, kyc_bank_name, kyc_account_number, kyc_ifsc_code, kyc_branch_name, rewire_partners(partner_name))`)
+    .order('created_at', { ascending: false })
+    .range(from, to)).catch(err => { console.error(err); return []; });
+  paymentsRawCache = data || [];
+  paymentsRawCacheAt = Date.now();
+  return paymentsRawCache;
+}
+
+async function renderPaymentsSection() {
+  initTableFilterBar('payments', () => renderPaymentsTable(getPaymentsFilteredRows(), 'tbodyPayments', 'pending'));
+  const data = await fetchPaymentsRaw();
+
+  // A lead auto-generates both a Customer and a Broker row here regardless
+  // of whether either side actually owes anything, and Omini Pay / Instant
+  // Payment deals land here too even though each has its own separate tab
+  // now. Filter those out — Payments should only ever show a row that's a
+  // real, ordinary (non-Omini-Pay, non-Instant-Payment) amount someone
+  // needs to act on. Also: these rows are created back at Verification &
+  // Zoho (stage 5), well before Manager/Accessories/Head Approval —
+  // surfacing them that early meant Accounts could see (and be tempted to
+  // act on) a payment before the deal was actually fully approved. Now
+  // held back until Head Approval is done, same gate as the Purchased tab
+  // uses.
+  //
+  // PENDING tab specifically = status 'Pending' ONLY now — "Send for
+  // Payment" moves a row straight into the new "To be Sent for Payment"
+  // tab (see updatePaymentStatus()) instead of staying here with a
+  // different status value, per the new SOP's 5-tab structure. Hold/To be
+  // Sent for Payment/Pending UTR/Rejected/Completed all have their own
+  // tabs now.
+  paymentsCache = data.filter(p => {
+    // If the embedded lead is missing, it's almost always an RLS gap
+    // hiding rewire_master_data from this role (see
+    // supabase-batch40-master-data-accounts-read-fix.sql) rather than a
+    // genuinely orphaned row — exclude it instead of showing it
+    // ungated, since there's no way to check ha_status/
+    // payment_release_status without it.
+    if (!p.lead) return false;
+    if (p.status !== 'Pending') return false;
+    // "Omini/InstantPay To" (pn_omni_pay_to: Customer/Broker/Both) decides
+    // which side actually gets routed through the Omini Pay tab instead of
+    // here — only THAT party's row is excluded, the other party (if any)
+    // is a normal bank-transfer payment and belongs in this tab like any
+    // other lead's row. Older leads saved before this field existed have
+    // pn_omni_pay_to blank — treated as 'Customer' (the original/only
+    // behavior before Broker/Both existed), so Broker still shows normally
+    // for those instead of vanishing with no way to pay it.
+    if (p.lead.pn_payment_type === 'Omini Pay') {
+      const omniTo = p.lead.pn_omni_pay_to || 'Customer';
+      if (omniTo === 'Both' || omniTo === p.payment_type) return false;
+    }
+    if (p.lead.pn_payment_type === 'Instant Payments') return false; // bypasses Pending/Hold entirely — see renderPendingUtrSection
+    // Credit (Ramvir, Sept 2026) — follows Post Delivery's stage order but
+    // never enters the normal Pending/Hold/To be Sent/Pending UTR queue at
+    // all; it goes straight to its own "Credit Payment" tab once approved
+    // and is marked Complete directly from there (no UTR step) — see
+    // renderCreditPaymentSection() below.
+    if (p.lead.pn_payment_type === 'Credit') return false;
+    // Post Delivery: gated on the (single) final Head Approval, as before.
+    // Advance Payment: gated on the EARLY Payment Release approval — the
+    // whole point of that step is the deal shows here well before Delivery/
+    // Accessories Check/the final Head Approval are done.
+    const gate = p.lead.pn_payment_type === 'Advance Payment' ? p.lead.payment_release_status === 'Approved' : p.lead.ha_status === 'Approved';
+    if (!gate) return false;
+    // A row with its own amount > 0 is real money to pay even if the PN field for that side is blank/mismatched
+    // (e.g. L7103534, L7102515) - otherwise Accounts never sees it. Rows with amount 0 stay hidden.
+    if (Number(p.amount) > 0) return true;
+    if (p.payment_type === 'Customer') return (p.lead.pn_customer_payment || 0) > 0;
+    if (p.payment_type === 'Broker') return (p.lead.pn_broker_payment || 0) > 0;
+    return true;
+  });
+
+  document.getElementById('badgePayments').textContent = paymentsCache.length;
+  const filtered = getPaymentsFilteredRows();
+  document.getElementById('countPayments').textContent = filtered.length + ' pending payments';
+  renderPaymentsTable(filtered, 'tbodyPayments', 'pending');
+}
+
+function getPaymentsFilteredRows() {
+  return filterRowsByTableFilter(paymentsCache, 'payments',
+    p => (p.lead && p.lead.pe) ? p.lead.pe.id : null,
+    p => (p.lead && p.lead.manager) ? p.lead.manager.id : null,
+    p => p.created_at ? p.created_at.slice(0, 10) : null);
+}
+
+// HOLD tab — payments Accounts has put on hold. From here: back to
+// Pending, straight to "To be Sent for Payment" (new — SOP now allows
+// Hold to queue for dispatch directly, without bouncing back through
+// Pending first), or Rejected (auto-fills a dummy UTR and moves straight
+// to Archive — see rejectPayment()).
+async function renderPaymentsHoldSection() {
+  initTableFilterBar('paymentshold', () => renderPaymentsTable(getPaymentsHoldFilteredRows(), 'tbodyPaymentsHold', 'hold'));
+  const data = await fetchPaymentsRaw();
+  paymentsHoldCache = data.filter(p => {
+    if (!p.lead) return false;
+    if (p.status !== 'Hold') return false;
+    // "Omini/InstantPay To" (pn_omni_pay_to: Customer/Broker/Both) decides
+    // which side actually gets routed through the Omini Pay tab instead of
+    // here — only THAT party's row is excluded, the other party (if any)
+    // is a normal bank-transfer payment and belongs in this tab like any
+    // other lead's row. Older leads saved before this field existed have
+    // pn_omni_pay_to blank — treated as 'Customer' (the original/only
+    // behavior before Broker/Both existed), so Broker still shows normally
+    // for those instead of vanishing with no way to pay it.
+    if (p.lead.pn_payment_type === 'Omini Pay') {
+      const omniTo = p.lead.pn_omni_pay_to || 'Customer';
+      if (omniTo === 'Both' || omniTo === p.payment_type) return false;
+    }
+    if (p.lead.pn_payment_type === 'Instant Payments') return false;
+    if (p.lead.pn_payment_type === 'Credit') return false; // own tab — see renderCreditPaymentSection()
+    return true;
+  });
+  const filtered = getPaymentsHoldFilteredRows();
+  document.getElementById('countPaymentsHold').textContent = filtered.length + ' on hold';
+  renderPaymentsTable(filtered, 'tbodyPaymentsHold', 'hold');
+}
+
+function getPaymentsHoldFilteredRows() {
+  return filterRowsByTableFilter(paymentsHoldCache, 'paymentshold',
+    p => (p.lead && p.lead.pe) ? p.lead.pe.id : null,
+    p => (p.lead && p.lead.manager) ? p.lead.manager.id : null,
+    p => p.created_at ? p.created_at.slice(0, 10) : null);
+}
+
+// TO BE SENT FOR PAYMENT tab (new — SOP v1.0) — status 'To be Sent for
+// Payment'. This is the actual dispatch queue: rows sit here (reviewable,
+// checkbox-selectable) until "Send for Payment" is clicked on selected
+// row(s), which is the ONLY point the CSV+email actually goes out (see
+// sendForPaymentAndNotify()). Bulk Reject/Mark Hold are also available
+// here from the header buttons.
+async function renderToBeSentSection() {
+  initTableFilterBar('tobesent', () => renderPaymentsTable(getToBeSentFilteredRows(), 'tbodyToBeSent', 'tobesent'));
+  const data = await fetchPaymentsRaw();
+  toBeSentCache = data.filter(p => {
+    if (!p.lead) return false;
+    if (p.status !== 'To be Sent for Payment') return false;
+    // "Omini/InstantPay To" (pn_omni_pay_to: Customer/Broker/Both) decides
+    // which side actually gets routed through the Omini Pay tab instead of
+    // here — only THAT party's row is excluded, the other party (if any)
+    // is a normal bank-transfer payment and belongs in this tab like any
+    // other lead's row. Older leads saved before this field existed have
+    // pn_omni_pay_to blank — treated as 'Customer' (the original/only
+    // behavior before Broker/Both existed), so Broker still shows normally
+    // for those instead of vanishing with no way to pay it.
+    if (p.lead.pn_payment_type === 'Omini Pay') {
+      const omniTo = p.lead.pn_omni_pay_to || 'Customer';
+      if (omniTo === 'Both' || omniTo === p.payment_type) return false;
+    }
+    if (p.lead.pn_payment_type === 'Instant Payments') return false;
+    if (p.lead.pn_payment_type === 'Credit') return false; // own tab — see renderCreditPaymentSection()
+    return true;
+  });
+  // A row can vanish from this tab (Sent/Rejected/Held elsewhere) between
+  // renders — drop any selected id that's no longer actually here so the
+  // bulk-action buttons don't silently try to act on a stale id.
+  const stillHere = new Set(toBeSentCache.map(p => p.id));
+  toBeSentSelectedIds.forEach(id => { if (!stillHere.has(id)) toBeSentSelectedIds.delete(id); });
+  const filtered = getToBeSentFilteredRows();
+  document.getElementById('countToBeSent').textContent = filtered.length + ' queued for dispatch';
+  renderPaymentsTable(filtered, 'tbodyToBeSent', 'tobesent');
+  updateToBeSentActionButtons();
+}
+
+function getToBeSentFilteredRows() {
+  return filterRowsByTableFilter(toBeSentCache, 'tobesent',
+    p => (p.lead && p.lead.pe) ? p.lead.pe.id : null,
+    p => (p.lead && p.lead.manager) ? p.lead.manager.id : null,
+    p => p.created_at ? p.created_at.slice(0, 10) : null);
+}
+
+function toggleToBeSentRow(id, checked) {
+  if (checked) toBeSentSelectedIds.add(id); else toBeSentSelectedIds.delete(id);
+  updateToBeSentActionButtons();
+}
+function toggleToBeSentSelectAll(checkboxEl) {
+  document.querySelectorAll('.chkToBeSentRow').forEach(el => {
+    const _tr = el.closest('tr');
+    if (_tr && (_tr.dataset.twColFiltered === '1' || _tr.dataset.twFiltered === '1')) { el.checked = false; toBeSentSelectedIds.delete(el.value); return; } // hidden by a filter — Excel-style: only visible rows
+    el.checked = checkboxEl.checked;
+    if (checkboxEl.checked) toBeSentSelectedIds.add(el.value); else toBeSentSelectedIds.delete(el.value);
+  });
+  updateToBeSentActionButtons();
+}
+function updateToBeSentActionButtons() {
+  const n = toBeSentSelectedIds.size;
+  ['btnToBeSentSend', 'btnToBeSentHold', 'btnToBeSentReject'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = n === 0;
+  });
+  const countEl = document.getElementById('toBeSentSelectedCount');
+  if (countEl) countEl.textContent = n;
+}
+
+// A payment only ever lives in exactly ONE of Pending/Hold/To be Sent for
+// Payment/Pending UTR/Archive at a time (unlike a lead, which can
+// genuinely sit in several operational tabs at once — see
+// getOperationalLocations(), JS-Core.html). So when a local "Search by
+// lead no / customer" box on any one of these 5 tabs comes up empty, the
+// payment is almost certainly just sitting in a DIFFERENT one of the 5 —
+// this checks the other 4 and auto-redirects there instead of leaving the
+// person staring at "No payments here right now" for a payment that's
+// actually just one click away. Recurses at most once: it calls the
+// target tab's own filter function directly, which will find results
+// there and stop (or, if truly nowhere, also come up empty and do
+// nothing further since currentTab === targetTab).
+const PAYMENT_TAB_META = {
+  pending: { section: 'payments', searchId: 'searchPayments', label: 'Pending' },
+  hold: { section: 'payments-hold', searchId: 'searchPaymentsHold', label: 'Hold' },
+  tobesent: { section: 'payments-tobesent', searchId: 'searchToBeSent', label: 'To be Sent for Payment' },
+  utr: { section: 'pending-utr', searchId: 'searchPendingUtr', label: 'Pending UTR' },
+  credit: { section: 'credit-payment', searchId: 'searchCreditPayment', label: 'Credit Payment' },
+  archive: { section: 'payments-archive', searchId: 'searchPaymentsArchive', label: 'Archive' },
+};
+async function searchAcrossPaymentTabs(query, currentTab) {
+  const q = (query || '').trim();
+  if (q.length < 2) return;
+  const esc = q.replace(/'/g, "''");
+  const { data: leads, error: leadsErr } = await sb.from('rewire_master_data')
+    .select('id')
+    .or(`lead_no.ilike.%${esc}%,customer_name.ilike.%${esc}%,val_vehicle_number.ilike.%${esc}%`)
+    .limit(5);
+  if (leadsErr) { console.error('searchAcrossPaymentTabs: lead lookup failed', leadsErr); return; }
+  if (!leads || !leads.length) return; // no such lead at all — genuinely nothing to find
+  const leadIds = leads.map(l => l.id);
+  // pn_payment_type pulled in too now (Ramvir, Sept 2026 Credit addition) —
+  // a Credit row's raw `status` is still whatever create_payment_rows()
+  // inserted ('Pending'), even though renderPaymentsSection() now excludes
+  // it from that tab entirely. Without checking payment_type FIRST, a
+  // Credit row would get misrouted to the (empty-for-it) Pending tab
+  // instead of its own Credit Payment tab.
+  const [{ data: liveRows, error: liveErr }, { data: archRows, error: archErr }] = await Promise.all([
+    sb.from('rewire_payments').select('status, lead:rewire_master_data!rewire_payments_lead_id_fkey(pn_payment_type)').in('lead_id', leadIds),
+    sb.from('rewire_payments_archive').select('lead_id').in('lead_id', leadIds),
+  ]);
+  if (liveErr) console.error('searchAcrossPaymentTabs: live lookup failed', liveErr);
+  if (archErr) console.error('searchAcrossPaymentTabs: archive lookup failed', archErr);
+  let targetTab = null;
+  if (archRows && archRows.length) targetTab = 'archive';
+  else if (liveRows && liveRows.length) {
+    if (liveRows.some(r => r.lead && r.lead.pn_payment_type === 'Credit' && r.status !== 'Completed' && r.status !== 'Rejected')) targetTab = 'credit';
+    else if (liveRows.some(r => r.status === 'Hold')) targetTab = 'hold';
+    else if (liveRows.some(r => r.status === 'Pending UTR')) targetTab = 'utr';
+    else if (liveRows.some(r => r.status === 'To be Sent for Payment')) targetTab = 'tobesent';
+    else if (liveRows.some(r => r.status === 'Pending')) targetTab = 'pending';
+    else if (liveRows.some(r => r.status === 'Rejected')) targetTab = 'archive'; // safety net if the archive-move trigger hasn't fired for Rejected yet — see supabase-batch90
+  }
+  if (!targetTab || targetTab === currentTab) return; // not a payments-eligible lead, or genuinely not here either
+  const meta = PAYMENT_TAB_META[targetTab];
+  // Clear any stale PE/Manager/date filter sitting on the destination tab —
+  // a specific lead search should never come back empty just because that
+  // tab happened to have an unrelated filter active from earlier browsing.
+  // (filterFns below for pending/hold/tobesent/utr/credit run through
+  // getXFilteredRows(), which applies tableFilterState; archive's own
+  // filter reads the raw cache directly and isn't affected, but resetting
+  // it too keeps behavior consistent.)
+  const filterPrefix = { pending: 'payments', hold: 'paymentshold', tobesent: 'tobesent', utr: 'pendingutr', credit: 'creditpayment', archive: 'paymentsarchive' }[targetTab];
+  if (filterPrefix && tableFilterState[filterPrefix]) tableFilterState[filterPrefix] = { pe: '', manager: '', from: '', to: '' };
+  notify(`Found in ${meta.label} — redirecting…`);
+  // skipRender:true — otherwise showSection() ALSO fires this same tab's
+  // render function internally (unawaited), racing against the awaited
+  // renderFns[targetTab]() call right below against the same table. Whichever
+  // finished last used to win and silently re-render the FULL unfiltered
+  // table, undoing the search filter set further down — this was the actual
+  // cause of "lead search doesn't match even though it's in Archive": the
+  // search briefly succeeded, then got wiped out by the redundant render.
+  showSection(meta.section, { skipRender: true });
+  const renderFns = { pending: renderPaymentsSection, hold: renderPaymentsHoldSection, tobesent: renderToBeSentSection, utr: renderPendingUtrSection, credit: renderCreditPaymentSection, archive: renderPaymentsArchiveSection };
+  await renderFns[targetTab]();
+  const filterFns = { pending: filterPaymentsTable, hold: filterPaymentsHoldTable, tobesent: filterToBeSentTable, utr: filterPendingUtrTable, credit: filterCreditPaymentTable, archive: filterPaymentsArchiveTable };
+  const el = document.getElementById(meta.searchId);
+  if (el) el.value = q;
+  filterFns[targetTab](q);
+}
+
+function filterPaymentsHoldTable(v) {
+  const q = v.toLowerCase();
+  const results = getPaymentsHoldFilteredRows().filter(p =>
+    (p.lead && p.lead.lead_no.toLowerCase().includes(q)) || (p.lead && p.lead.customer_name.toLowerCase().includes(q))
+    || (p.lead && (p.lead.val_vehicle_number || '').toLowerCase().includes(q)));
+  renderPaymentsTable(results, 'tbodyPaymentsHold', 'hold');
+  if (!results.length) searchAcrossPaymentTabs(v, 'hold');
+}
+
+function filterToBeSentTable(v) {
+  const q = v.toLowerCase();
+  const results = getToBeSentFilteredRows().filter(p =>
+    (p.lead && p.lead.lead_no.toLowerCase().includes(q)) || (p.lead && p.lead.customer_name.toLowerCase().includes(q))
+    || (p.lead && (p.lead.val_vehicle_number || '').toLowerCase().includes(q)));
+  renderPaymentsTable(results, 'tbodyToBeSent', 'tobesent');
+  if (!results.length) searchAcrossPaymentTabs(v, 'tobesent');
+}
+
+// Admin-only recovery tool ("Find Missing Payment Rows" button, Payments
+// page header) — this is what L7102349 needed manual SQL for
+// (supabase-batch63-force-L7102349-into-payments.sql): a lead that's
+// genuinely approved (Head Approval, or Payment Release for Advance
+// Payment/Omini Pay) can end up with NO rewire_payments row at all if
+// it went through a manual SQL correction that never re-fired whatever
+// creates that row normally. Rather than writing a fresh one-off SQL
+// script for every future occurrence of this, this scans for the gap
+// and lets Admin fix it from the app itself.
+//
+// "Should exist" = approved per the same gate JS-Payments.html's own
+// sections use; "amount" = Delivery's number if entered, else Price
+// Negotiation's (same rule used on the Purchased tab and in batch63).
+async function scanMissingPayments() {
+  // Both fetches go through fetchAllRows() (JS-Core.html) — a plain
+  // .select() with no .range() silently caps at 1000 rows, and
+  // rewire_payments alone has 4700+, so most existing rows were
+  // invisible here and got flagged as "missing" (same bug hit the
+  // Health Check's identical logic — see there for the full note).
+  // NOT scoping the rewire_payments fetch by .in('lead_id', eligibleIds)
+  // — eligible can run into the thousands, and cramming that many UUIDs
+  // into one query's URL blew past the URL length limit ("TypeError:
+  // Failed to fetch", the request never even reaching the server).
+  // Paginating the whole table instead is bounded either way (~5
+  // requests for 4700 rows).
+  // Also checking rewire_payments_archive, not just the live table — a
+  // payment already marked Completed moves there (see
+  // updatePaymentStatus/completePayment above), so a lead whose Broker
+  // or Customer side was already fully paid had NO row left in the live
+  // table at all. Without this, "already paid and archived" looked
+  // identical to "genuinely never created" and this inserted a brand new
+  // duplicate row on top of the archived one.
+  let eligible, existing, existingArchived;
+  try {
+    eligible = await fetchAllRows((from, to) => sb.from('rewire_master_data')
+      .select('id, lead_no, customer_name, pn_customer_payment, pn_broker_payment, ud_customer_payment, ud_broker_payment')
+      .neq('overall_status', 'Closed Lost')
+      .or('ha_status.eq.Approved,payment_release_status.eq.Approved')
+      .range(from, to));
+    existing = await fetchAllRows((from, to) => sb.from('rewire_payments').select('lead_id, payment_type').range(from, to));
+    existingArchived = await fetchAllRows((from, to) => sb.from('rewire_payments_archive').select('lead_id, payment_type').range(from, to));
+  } catch (e) {
+    notify('Scan failed: ' + e.message, { icon: 'error' });
+    return;
+  }
+  const haveCustomer = new Set(), haveBroker = new Set();
+  [...(existing || []), ...(existingArchived || [])].forEach(r => {
+    if (r.payment_type === 'Customer') haveCustomer.add(r.lead_id);
+    if (r.payment_type === 'Broker') haveBroker.add(r.lead_id);
+  });
+
+  const gaps = [];
+  (eligible || []).forEach(l => {
+    const custAmt = l.ud_customer_payment || l.pn_customer_payment || 0;
+    const brokAmt = l.ud_broker_payment || l.pn_broker_payment || 0;
+    if (custAmt > 0 && !haveCustomer.has(l.id)) gaps.push({ leadId: l.id, leadNo: l.lead_no, customerName: l.customer_name, type: 'Customer', amount: custAmt });
+    if (brokAmt > 0 && !haveBroker.has(l.id)) gaps.push({ leadId: l.id, leadNo: l.lead_no, customerName: l.customer_name, type: 'Broker', amount: brokAmt });
+  });
+
+  if (!gaps.length) {
+    notify('No missing payment rows found — every approved lead already has its Customer/Broker row.');
+    return;
+  }
+
+  const listHtml = gaps.map(g =>
+    `<div style="text-align:left;font-size:13px;padding:5px 0;border-bottom:1px solid var(--color-border-tertiary);">${g.leadNo} — ${g.customerName} — ${g.type} — ₹${g.amount}</div>`
+  ).join('');
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: `${gaps.length} missing payment row(s) found`,
+    html: `<div style="max-height:280px;overflow-y:auto;">${listHtml}</div>`,
+    showCancelButton: true,
+    confirmButtonText: 'Create All',
+    confirmButtonColor: '#1d4ed8',
+    cancelButtonColor: '#94a3b8',
+  });
+  if (!result.isConfirmed) return;
+
+  const rows = gaps.map(g => ({ lead_id: g.leadId, payment_type: g.type, amount: g.amount, status: 'Pending' }));
+  const { error: insErr } = await sb.from('rewire_payments').insert(rows);
+  if (insErr) { notify('Failed to create rows: ' + insErr.message, { icon: 'error' }); return; }
+  notify(`Created ${rows.length} payment row(s).`);
+  await refreshPaymentsSections();
+}
+
+// ------------------------------------------------------------
+// PENDING UTR SECTION — two sources feed this tab at the same time:
+//   1. Regular payments that went through "Send for Payment & Notify" on
+//      the Pending tab (status = 'Pending UTR' — see
+//      sendForPaymentAndNotify() below). Marking a row "Send for Payment"
+//      alone does NOT land it here — only a successful notification does.
+//   2. Every Instant Payment row that isn't Completed yet, regardless of
+//      its raw status column — Instant Payments bypass Pending/Hold
+//      entirely per the SOP (Instant Payment -> Pending UTR -> UTR Entry
+//      -> Completed -> Archive). These already got a notification email
+//      sent out at Price Negotiation time (see submitPriceNegotiation() in
+//      JS-Pipeline.html) — this is where the actual transfer gets recorded
+//      once it's genuinely been made.
+// No status dropdown here (see renderPaymentsTable's 'utr' mode) — just
+// UTR entry + Complete, which moves the row to Payments Archive.
+// ------------------------------------------------------------
+async function renderPendingUtrSection() {
+  initTableFilterBar('pendingutr', () => renderPaymentsTable(getPendingUtrFilteredRows(), 'tbodyPendingUtr', 'utr'));
+  const data = await fetchPaymentsRaw();
+  pendingUtrCache = data.filter(p => {
+    if (!p.lead) return false;
+    // Same gap as the Pending tab — see the note there. A row marked
+    // Completed/Rejected should have moved to Archive; filter it out here
+    // too in case the archive-move trigger didn't actually delete it.
+    if (p.status === 'Completed' || p.status === 'Rejected') return false;
+    if (p.lead.pn_payment_type === 'Credit') return false; // own tab — see renderCreditPaymentSection()
+    if (p.lead.pn_payment_type === 'Instant Payments') {
+      // Instant Payments auto-releases (payment_release_status='Approved')
+      // right when PN is saved — that, not the final Head Approval (which
+      // only happens later after Delivery/Accessories Check), is what
+      // should surface it here, regardless of its own status column.
+      if (p.lead.payment_release_status !== 'Approved') return false;
+    } else {
+      if (p.status !== 'Pending UTR') return false;
+      // "Omini/InstantPay To" (pn_omni_pay_to: Customer/Broker/Both) decides
+      // which side actually gets routed through the Omini Pay tab instead
+      // of here — see the identical note on the Pending tab above.
+      if (p.lead.pn_payment_type === 'Omini Pay') {
+        const omniTo = p.lead.pn_omni_pay_to || 'Customer';
+        if (omniTo === 'Both' || omniTo === p.payment_type) return false;
+      }
+    }
+    // A row with its own amount > 0 is real money to pay even if the PN field for that side is blank/mismatched
+    // (e.g. L7103534, L7102515) - otherwise Accounts never sees it. Rows with amount 0 stay hidden.
+    if (Number(p.amount) > 0) return true;
+    if (p.payment_type === 'Customer') return (p.lead.pn_customer_payment || 0) > 0;
+    if (p.payment_type === 'Broker') return (p.lead.pn_broker_payment || 0) > 0;
+    return true;
+  });
+  const filtered = getPendingUtrFilteredRows();
+  document.getElementById('countPendingUtr').textContent = filtered.length + ' awaiting UTR';
+  renderPaymentsTable(filtered, 'tbodyPendingUtr', 'utr');
+}
+
+function getPendingUtrFilteredRows() {
+  return filterRowsByTableFilter(pendingUtrCache, 'pendingutr',
+    p => (p.lead && p.lead.pe) ? p.lead.pe.id : null,
+    p => (p.lead && p.lead.manager) ? p.lead.manager.id : null,
+    p => p.created_at ? p.created_at.slice(0, 10) : null);
+}
+
+function filterPendingUtrTable(v) {
+  const q = v.toLowerCase();
+  const results = getPendingUtrFilteredRows().filter(p =>
+    (p.lead && p.lead.lead_no.toLowerCase().includes(q)) || (p.lead && p.lead.customer_name.toLowerCase().includes(q))
+    || (p.lead && (p.lead.val_vehicle_number || '').toLowerCase().includes(q)));
+  renderPaymentsTable(results, 'tbodyPendingUtr', 'utr');
+  if (!results.length) searchAcrossPaymentTabs(v, 'utr');
+}
+
+// CREDIT PAYMENT tab (new — Ramvir, Sept 2026). Credit follows the exact
+// same stage progression as Post Delivery (isAltFlowPaymentType(), JS-Core.
+// html, treats it identically all the way through Head Approval) — it only
+// diverges here, at Payments: instead of landing in the normal Pending
+// queue, a Credit lead's Customer/Broker row(s) sit in this tab (gated on
+// the same final ha_status='Approved' Post Delivery already uses) until
+// whoever's tracking the credit arrangement marks it Complete directly —
+// no UTR step, since nothing's actually being wired out at this point, the
+// amount just gets settled/adjusted with the party later. Marking it
+// Complete moves it into the same Payments Archive every other payment
+// type uses (trg_archive_payment fires on any status='Completed' write,
+// regardless of payment type or whether utr_no is set).
+let creditPaymentCache = [];
+async function renderCreditPaymentSection() {
+  initTableFilterBar('creditpayment', () => renderPaymentsTable(getCreditPaymentFilteredRows(), 'tbodyCreditPayment', 'credit'));
+  const data = await fetchPaymentsRaw();
+  creditPaymentCache = data.filter(p => {
+    if (!p.lead) return false;
+    if (p.lead.pn_payment_type !== 'Credit') return false;
+    if (p.status === 'Completed' || p.status === 'Rejected') return false;
+    // Same final-approval gate Post Delivery uses on the main Pending tab —
+    // Credit goes through the exact same stage order, so it shouldn't
+    // surface here any earlier than a normal Post Delivery lead would.
+    if (p.lead.ha_status !== 'Approved') return false;
+    // A row with its own amount > 0 is real money to pay even if the PN field for that side is blank/mismatched
+    // (e.g. L7103534, L7102515) - otherwise Accounts never sees it. Rows with amount 0 stay hidden.
+    if (Number(p.amount) > 0) return true;
+    if (p.payment_type === 'Customer') return (p.lead.pn_customer_payment || 0) > 0;
+    if (p.payment_type === 'Broker') return (p.lead.pn_broker_payment || 0) > 0;
+    return true;
+  });
+  const filtered = getCreditPaymentFilteredRows();
+  document.getElementById('countCreditPayment').textContent = filtered.length + ' credit payment(s)';
+  renderPaymentsTable(filtered, 'tbodyCreditPayment', 'credit');
+}
+
+function getCreditPaymentFilteredRows() {
+  return filterRowsByTableFilter(creditPaymentCache, 'creditpayment',
+    p => (p.lead && p.lead.pe) ? p.lead.pe.id : null,
+    p => (p.lead && p.lead.manager) ? p.lead.manager.id : null,
+    p => p.created_at ? p.created_at.slice(0, 10) : null);
+}
+
+function filterCreditPaymentTable(v) {
+  const q = v.toLowerCase();
+  const results = getCreditPaymentFilteredRows().filter(p =>
+    (p.lead && p.lead.lead_no.toLowerCase().includes(q)) || (p.lead && p.lead.customer_name.toLowerCase().includes(q))
+    || (p.lead && (p.lead.val_vehicle_number || '').toLowerCase().includes(q)));
+  renderPaymentsTable(results, 'tbodyCreditPayment', 'credit');
+  if (!results.length) searchAcrossPaymentTabs(v, 'credit');
+}
+
+// Direct Complete — deliberately no UTR requirement (unlike completePayment
+// above), since a Credit row isn't a bank transfer being made right now;
+// per Ramvir, it's completed directly from this tab once the credit
+// arrangement is actually settled with the party.
+async function completeCreditPayment(id) {
+  const ok = await confirmDialog('Mark this credit payment Completed and move it to Archive?');
+  if (!ok) return;
+  const { error } = await sb.from('rewire_payments').update({ status: 'Completed', completed_on: new Date().toISOString(), updated_by: currentProfile.id }).eq('id', id);
+  if (error) { notify('Error completing payment: ' + error.message, { icon: 'error' }); return; }
+  notify('Credit payment marked Completed and moved to Archive.');
+  refreshPaymentsSections();
+}
+
+// Exports exactly what's sitting in the "Sent for Payment" bucket right
+// now on the main Payments list — the moment Accounts has pushed a batch
+// out for processing but before it's Completed, which is the point
+// someone typically wants a snapshot to hand off/print.
+// Shared by both the local .xlsx download and the "Send to Google Sheet"
+// button below — same filter, same row shape, two different destinations.
+// A lead can have both a Customer payment and a Broker payment row
+// (p.payment_type tells which). Customer rows show the customer's own
+// Bank KYC details; Broker rows need the BROKER's bank details instead —
+// looked up by matching pn_partner_name (the broker picked in Price
+// Negotiation) against the Partners directory already cached client-side.
+// (Moved above the two export functions below, which now call it too.)
+function getPaymentBankDetails(p) {
+  if (!p.lead) return null;
+  if (p.payment_type === 'Broker') {
+    const brokerName = (p.lead.pn_partner_name || '').trim().toLowerCase();
+    if (!brokerName) return null;
+    const partner = allPartners.find(x => x.partner_name.trim().toLowerCase() === brokerName);
+    if (!partner) return null;
+    return { holder: partner.account_holder_name, bank: partner.bank_name, branch: partner.branch_name, acct: partner.account_number, ifsc: partner.ifsc_code, email: partner.email };
+  }
+  if (!p.lead.kyc_bank_name) return null;
+  return { holder: p.lead.kyc_account_holder_name, bank: p.lead.kyc_bank_name, branch: p.lead.kyc_branch_name, acct: p.lead.kyc_account_number, ifsc: p.lead.kyc_ifsc_code };
+}
+
+// Does its OWN fresh fetch rather than reading the paymentsCache global —
+// the earlier version read paymentsCache directly and reported "no rows"
+// even with rows visibly sitting on screen, because at the moment the
+// button was clicked, this ran against whatever paymentsCache happened to
+// hold right then (stale, or momentarily reset by an in-flight re-render)
+// instead of the table's actual current contents. Re-fetching here every
+// time removes that dependency entirely — it always reflects what's
+// really in the database at click time.
+//
+// Only status === 'Send for Payment' rows belong in this export — that's
+// the intended queue (rows Accounts has already screened and flagged
+// ready), not every Pending row on the Payments tab. The REAL bug behind
+// "pura data hi nahi aa raha" was the approval gate below: it required
+// ha_status === 'Approved' unconditionally, but Advance Payment leads are
+// released early via payment_release_status instead (ha_status stays
+// unset for them until much later) — so every genuinely-eligible Advance
+// Payment "Send for Payment" row was being silently dropped from the
+// export while still showing correctly in the on-screen table (which
+// already branches this gate correctly in renderPaymentsSection). Fixed
+// to branch the same way here.
+// Raw (unmapped) rows — status === 'To be Sent for Payment', same
+// eligibility gate as the other tabs. Shared by the Excel/Sheet export
+// below AND by sendForPaymentAndNotify() (which needs the real .id per
+// row to move them to Pending UTR afterward, not just the flattened
+// export shape).
+async function fetchSentForPaymentEligible() {
+  const data = await fetchPaymentsRaw();
+  return data.filter(p => {
+    if (!p.lead) return false;
+    // "Omini/InstantPay To" (pn_omni_pay_to: Customer/Broker/Both) decides
+    // which side actually gets routed through the Omini Pay tab instead of
+    // here — only THAT party's row is excluded, the other party (if any)
+    // is a normal bank-transfer payment and belongs in this tab like any
+    // other lead's row. Older leads saved before this field existed have
+    // pn_omni_pay_to blank — treated as 'Customer' (the original/only
+    // behavior before Broker/Both existed), so Broker still shows normally
+    // for those instead of vanishing with no way to pay it.
+    if (p.lead.pn_payment_type === 'Omini Pay') {
+      const omniTo = p.lead.pn_omni_pay_to || 'Customer';
+      if (omniTo === 'Both' || omniTo === p.payment_type) return false;
+    }
+    if (p.lead.pn_payment_type === 'Instant Payments') return false;
+    if (p.lead.pn_payment_type === 'Credit') return false; // own tab — see renderCreditPaymentSection()
+    if (p.status !== 'To be Sent for Payment') return false;
+    const gate = p.lead.pn_payment_type === 'Advance Payment' ? p.lead.payment_release_status === 'Approved' : p.lead.ha_status === 'Approved';
+    if (!gate) return false;
+    // A row with its own amount > 0 is real money to pay even if the PN field for that side is blank/mismatched
+    // (e.g. L7103534, L7102515) - otherwise Accounts never sees it. Rows with amount 0 stay hidden.
+    if (Number(p.amount) > 0) return true;
+    if (p.payment_type === 'Customer') return (p.lead.pn_customer_payment || 0) > 0;
+    if (p.payment_type === 'Broker') return (p.lead.pn_broker_payment || 0) > 0;
+    return true;
+  });
+}
+
+async function fetchSentForPaymentRows() {
+  const eligible = await fetchSentForPaymentEligible();
+  // Same PE/Manager/date filter the Payments table itself is currently
+  // showing (tableFilterState.payments, set via the Filter/Clear buttons)
+  // — so "Download Excel" always exports exactly what's on screen.
+  const filtered = filterRowsByTableFilter(eligible, 'payments',
+    p => (p.lead && p.lead.pe) ? p.lead.pe.id : null,
+    p => (p.lead && p.lead.manager) ? p.lead.manager.id : null,
+    p => p.created_at ? p.created_at.slice(0, 10) : null);
+  return filtered.map(p => {
+    const bd = getPaymentBankDetails(p);
+    return {
+      lead_no: p.lead ? p.lead.lead_no : '',
+      customer_name: p.lead ? p.lead.customer_name : '',
+      phone: p.lead ? p.lead.phone : '',
+      location: p.lead ? p.lead.ud_vehicle_parking : '',
+      vehicle_no: p.lead ? p.lead.val_vehicle_number : '',
+      make: p.lead ? p.lead.val_make : '',
+      model: p.lead ? p.lead.val_model_variant : '',
+      partner: p.lead && p.lead.rewire_partners ? p.lead.rewire_partners.partner_name : '',
+      pe: p.lead && p.lead.pe ? p.lead.pe.name : '',
+      manager: p.lead && p.lead.manager ? p.lead.manager.name : '',
+      type: p.payment_type,
+      bank_holder: bd ? bd.holder || '' : '',
+      bank_name: bd ? bd.bank || '' : '',
+      bank_branch: bd ? bd.branch || '' : '',
+      bank_account_no: bd ? bd.acct || '' : '',
+      bank_ifsc: bd ? bd.ifsc || '' : '',
+      amount: p.amount,
+      status: p.status,
+      utr_no: p.utr_no,
+      created_at: p.created_at,
+    };
+  });
+}
+
+async function exportPaymentsSentForPaymentExcel() {
+  const rows = await fetchSentForPaymentRows();
+  // bank_account_no (and phone, same digit-string shape) must stay TEXT —
+  // see downloadXlsx's comment for why a plain numeric export mangles them.
+  downloadXlsx('rewire-dms-payments-sent-for-payment.xlsx', rows, 'Sent for Payment', ['bank_account_no', 'phone']);
+}
+
+// Overwrites the "Send for Payment" tab in the user's own Google Sheet
+// (see Sheets.gs — writeSentForPaymentToSheet) with the exact same data
+// the Excel download above builds, just pushed into that Sheet instead of
+// downloaded locally.
+async function sendSentForPaymentToSheet() {
+  const rows = await fetchSentForPaymentRows();
+  if (!rows.length) { notify('No "Send for Payment" rows to send right now.', { icon: 'info' }); return; }
+  google.script.run
+    .withSuccessHandler((count) => notify(`Sent ${count} row(s) to the Google Sheet.`))
+    .withFailureHandler((err) => notify('Failed to send to Google Sheet: ' + err.message, { icon: 'error' }))
+    .writeSentForPaymentToSheet(rows);
+}
+
+// Builds the CSV attachment in the bank's own NEFT/RTGS bulk-upload
+// column layout (see "RBI File Format - NEFT RTGS new.xlsx", the template
+// Ramvir shared) — one row per payment, in the exact 28-column order/
+// header text the bank expects (including its own "Bracnh"/"Emai Id"
+// spelling — kept exactly as the template has it, not "corrected", since
+// this is presumably validated by the bank on the literal header text).
+// CSV instead of .xlsx now (Payment Module SOP v1.0 explicitly calls for
+// a CSV attachment) — the ONE thing that has to survive that switch
+// correctly is the Beneficiary Account Number: a .csv has no per-cell
+// type/format the way .xlsx did (there's no cell.z='@' equivalent), so a
+// plain digit string in a CSV is only ever as safe as whatever opens it
+// afterward. If a bank account number starts with 0 (e.g. "00123456") or
+// runs past ~15 digits, Excel's own CSV importer auto-detects it as a
+// NUMBER on open and will (a) silently drop the leading zero(s), and (b)
+// for anything past 15 significant digits, round it into scientific
+// notation — permanently, if the file then gets re-saved. Guarded here
+// with the same ="..." formula-text trick already used elsewhere in this
+// file (see downloadCsv's comment above) — Excel evaluates that as a
+// formula whose result is the literal text, so it never gets reinterpreted
+// as a number regardless of length or leading zeros. The raw .csv file on
+// disk always has the correct exact digits either way; this only protects
+// against what happens the moment someone double-clicks it open in Excel.
+// If the bank's own system parses this CSV programmatically instead
+// (rather than a human opening it in Excel), confirm with them whether
+// the ="..." wrapping is fine to leave in or needs to be a plain
+// unwrapped value — that's an open item from the SOP either way (exact
+// HDFC/bank column schema still needs sign-off from the Cashier team).
+// One field is still a placeholder:
+//   - Transaction Type ('N') / Beneficiary Code ('01') — hardcoded to
+//     match the template's own example row.
+// Bene Emai Id (AB) — was the lead's Manager's email
+// (rewire_user_profiles.manager_email, batch97) but per Ramvir (Sept
+// 2026) the Manager has nothing to do with WHO is being paid: it's now
+// the actual beneficiary's own email — the customer's (rewire_master_data
+// .email, also editable at Bank KYC as of this same change) for a
+// Customer payment row, the broker's (rewire_partners.email, via
+// getPaymentBankDetails' Broker branch) for a Broker payment row.
+//
+// Column-specific rules per Ramvir (Sept 2026):
+//   - Beneficiary Name (E) — the customer's name for a Customer payment,
+//     the broker's/partner's name (pn_partner_name) for a Broker payment.
+//     NOT the bank KYC/partner "account holder name" — that's a bank-side
+//     field and can legitimately differ from the actual payee's name.
+//   - Beneficiary Name (E) and Payment details 3 (Q) — bank field length
+//     cap, truncated to under 30 characters.
+//   - Cheque Date (W) — today's date, formatted dd/mm/yyyy (this is a
+//     NEFT/RTGS file, so there's no real cheque; the bank's template
+//     still wants something here, so it's the date the file was
+//     generated, zero-padded since the bank format is strict about it).
+//   - Bene Bank Bracnh (AA) — commas stripped; a branch name with a
+//     comma in it (e.g. "Kota, Rajasthan") risks being misread as two
+//     fields by whatever un-quotes this CSV on the bank's end.
+const CSV_FIELD_MAX = 29; // strictly under 30 chars
+const capFieldLen = (v) => (v || '').toString().slice(0, CSV_FIELD_MAX);
+// dd/mm/yyyy, zero-padded — toLocaleDateString('en-IN') does NOT
+// reliably zero-pad (e.g. "9/7/2026" instead of "09/07/2026"), which is
+// what the bank template's Cheque Date column (W) needs.
+const formatDDMMYYYY = (d) => {
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}/${mm}/${d.getFullYear()}`;
+};
+function buildNeftRtgsCsv(rows) {
+  const header = [
+    'Transaction  Type', 'Beneficiary Code', 'Beneficiary \nAccount Number', 'Instrument\n Amount',
+    'Beneficiary\n Name', 'Drawee\n Location', 'Print \nLocation', 'Bene \nAddress 1', 'Bene \nAddress 2',
+    'Bene \nAddress 3', 'Bene \nAddress 4', 'Bene \nAddress 5', 'Instruction\n Reference Number',
+    'Customer \nReference Number', 'Payment \ndetails 1', 'Payment \ndetails 2', 'Payment \ndetails 3',
+    'Payment \ndetails 4', 'Payment \ndetails 5', 'Payment \ndetails 6', 'Payment \ndetails 7',
+    'Cheque \nNumber', 'Cheque \nDate', 'MICR NO', 'IFSC COD', 'BENE BANK', 'Bene Bank Bracnh', 'Bene Emai Id',
+  ];
+  const ACCOUNT_NO_COL = 2; // Beneficiary Account Number — the one column that must never be number-parsed
+  const escapeCsvCell = (v, forceText) => {
+    const s = (v === null || v === undefined) ? '' : String(v);
+    const quoted = '"' + s.replace(/"/g, '""') + '"';
+    return (forceText && s !== '') ? '="' + s.replace(/"/g, '""') + '"' : quoted;
+  };
+  const rowsToLines = (cols) => cols.map((v, i) => escapeCsvCell(v, i === ACCOUNT_NO_COL)).join(',');
+  const todayStr = formatDDMMYYYY(new Date());
+  const lines = [header.map(h => escapeCsvCell(h)).join(',')];
+  rows.forEach(p => {
+    const bd = getPaymentBankDetails(p);
+    // AB — Bene Emai Id: the actual beneficiary's own email, not the
+    // Manager's — Customer's (lead.email) for a Customer row, Broker's
+    // (bd.email, from the Partners directory) for a Broker row.
+    const beneEmail = p.payment_type === 'Broker' ? (bd ? bd.email || '' : '') : (p.lead ? p.lead.email || '' : '');
+    // E — Beneficiary Name: the actual payee's name, NOT the bank's
+    // registered account-holder name (bd.holder) — those can legitimately
+    // differ (e.g. a broker's account held in a family member's name), and
+    // the bank notification should show who is actually being paid.
+    const beneficiaryName = p.payment_type === 'Broker'
+      ? (p.lead ? p.lead.pn_partner_name || '' : '')
+      : (p.lead ? p.lead.customer_name || '' : '');
+    lines.push(rowsToLines([
+      'N', '01',
+      bd ? bd.acct || '' : '',
+      p.amount || 0,
+      capFieldLen(beneficiaryName), // E — Beneficiary Name, <30 chars
+      '', '', '', '', '', '', '',
+      p.lead ? p.lead.lead_no : '', // M — Instruction Reference Number, now Lead No.
+      p.lead ? p.lead.val_vehicle_number || '' : '', // N — Customer Reference Number, now Vehicle No.
+      p.lead ? p.lead.val_vehicle_number || '' : '',
+      p.lead ? p.lead.customer_name || '' : '',
+      capFieldLen(p.lead ? p.lead.pn_partner_name : ''), // Q — Payment details 3, <30 chars
+      p.lead && p.lead.pe ? p.lead.pe.name : '',
+      p.payment_type,
+      '', '',
+      '', todayStr, // W — Cheque Date, today
+      '',
+      bd ? bd.ifsc || '' : '',
+      bd ? bd.bank || '' : '',
+      (bd && bd.branch ? bd.branch.replace(/,/g, '') : ''), // AA — Bene Bank Bracnh, commas stripped
+      beneEmail, // AB — Bene Emai Id, the actual beneficiary (Customer or Broker)
+    ]));
+  });
+  // \r\n — standard CSV/Windows line ending, matches what a bank's own
+  // bulk-upload portal typically expects from this kind of file.
+  return lines.join('\r\n');
+}
+
+// "Send for Payment" (To be Sent for Payment tab, checkbox-selected rows
+// only — SOP v1.0 makes bulk selection mandatory on this specific tab).
+// Nothing is emailed or moved until this button is actually clicked on at
+// least one selected row. On click: ONE email goes to Bank/Cashier with
+// every SELECTED row in the bank's own NEFT/RTGS CSV format attached, and
+// only once that email genuinely sends do those rows move to the Pending
+// UTR tab (status -> 'Pending UTR'). If the email fails, nothing moves —
+// rows stay in "To be Sent for Payment" exactly as they were, so this is
+// safe to retry.
+async function sendForPaymentAndNotify() {
+  // Manager has view-only access to Payments (see applyRoleBasedUI/
+  // window.isViewOnlyRole, JS-Core.html) — this mutates payment status and
+  // sends a real email, not just an export, so it's blocked here too even
+  // though the button itself isn't separately role-gated in the header.
+  if (window.isViewOnlyRole) { notify('View-only access — cannot send payment notifications.', { icon: 'error' }); return; }
+  if (!toBeSentSelectedIds.size) { notify('Select at least one payment to send.', { icon: 'info' }); return; }
+  const filtered = toBeSentCache.filter(p => toBeSentSelectedIds.has(p.id));
+  if (!filtered.length) { notify('Selected payment(s) are no longer in this tab — refresh and try again.', { icon: 'info' }); return; }
+  const ok = await confirmDialog(`Send bank/cashier notification for ${filtered.length} selected payment(s) and move them to Pending UTR?`);
+  if (!ok) return;
+
+  const csvContent = buildNeftRtgsCsv(filtered);
+  const ids = filtered.map(p => p.id);
+
+  google.script.run
+    .withSuccessHandler(async () => {
+      const { error } = await sb.from('rewire_payments').update({ status: 'Pending UTR', updated_by: currentProfile.id }).in('id', ids);
+      if (error) { notify('Email sent, but failed to move rows to Pending UTR: ' + error.message, { icon: 'error' }); return; }
+      notify(`Notified Bank/Cashier and moved ${ids.length} payment(s) to Pending UTR.`);
+      toBeSentSelectedIds.clear();
+      refreshPaymentsSections();
+    })
+    .withFailureHandler((err) => notify('Failed to send notification email: ' + err.message, { icon: 'error' }))
+    .sendPaymentNotificationEmail({ csvContent, count: filtered.length, senderName: currentProfile ? currentProfile.name : '' });
+}
+
+// Bulk Mark Hold — "To be Sent for Payment" tab, selected rows only.
+async function bulkHoldToBeSent() {
+  if (window.isViewOnlyRole) { notify('View-only access.', { icon: 'error' }); return; }
+  if (!toBeSentSelectedIds.size) { notify('Select at least one payment first.', { icon: 'info' }); return; }
+  const ids = Array.from(toBeSentSelectedIds);
+  const ok = await confirmDialog(`Move ${ids.length} selected payment(s) to Hold?`);
+  if (!ok) return;
+  const { error } = await sb.from('rewire_payments').update({ status: 'Hold', updated_by: currentProfile.id }).in('id', ids);
+  if (error) { notify('Error moving to Hold: ' + error.message, { icon: 'error' }); return; }
+  notify(`${ids.length} payment(s) moved to Hold.`);
+  toBeSentSelectedIds.clear();
+  refreshPaymentsSections();
+}
+
+// Bulk Rejected — "To be Sent for Payment" tab, selected rows only. Each
+// row gets its OWN sequential Dummy UTR (see getNextDummyUtr()), fetched
+// one at a time in sequence (not in parallel) specifically so two rows in
+// the same batch can't race each other for the same number.
+async function bulkRejectToBeSent() {
+  if (window.isViewOnlyRole) { notify('View-only access.', { icon: 'error' }); return; }
+  if (!toBeSentSelectedIds.size) { notify('Select at least one payment first.', { icon: 'info' }); return; }
+  const ids = Array.from(toBeSentSelectedIds);
+  const ok = await confirmDialog(`Reject ${ids.length} selected payment(s)? A dummy UTR will be filled in for each and they'll move to Archive.`);
+  if (!ok) return;
+  let failed = 0;
+  for (const id of ids) {
+    const dummyUtr = await getNextDummyUtr();
+    const { error } = await sb.from('rewire_payments').update({
+      status: 'Rejected', utr_no: dummyUtr, completed_on: new Date().toISOString(), updated_by: currentProfile.id,
+    }).eq('id', id);
+    if (error) failed++;
+  }
+  notify(failed ? `${ids.length - failed} rejected, ${failed} failed — see console.` : `${ids.length} payment(s) rejected and moved to Archive.`, failed ? { icon: 'error' } : undefined);
+  toBeSentSelectedIds.clear();
+  refreshPaymentsSections();
+}
+
+// mode controls which Status options / UTR+Complete controls actually
+// render — matches the SOP's per-tab action sets:
+//   'pending'  — Status select offers Pending/Hold/Send for Payment
+//                (value 'To be Sent for Payment' under the hood). No UTR
+//                column, no Complete button (nothing to complete yet).
+//   'hold'     — Status select offers Hold/Pending/Send for Payment/
+//                Rejected. Same — no UTR/Complete here either.
+//   'tobesent' — NO per-row Status dropdown — SOP makes this tab
+//                checkbox-multi-select + bulk actions only (leading
+//                checkbox column; Send for Payment/Mark Hold/Reject all
+//                live as header buttons acting on whatever's checked, see
+//                Sections.html).
+//   'utr'      — No Status dropdown at all. UTR entry + Complete button
+//                only (Complete moves the row to Archive).
+//   'credit'   — Credit Payment tab (new). No Status dropdown, no UTR
+//                column at all — just a plain Complete button that moves
+//                the row straight to Archive, no UTR required (see
+//                completeCreditPayment() — this tab never handles a real
+//                bank transfer, the amount is settled/adjusted with the
+//                party separately).
+function renderPaymentsTable(rows, tbodyId, mode) {
+  mode = mode || 'pending';
+  const tbody = document.getElementById(tbodyId || 'tbodyPayments');
+  if (!tbody) return;
+  // Manager has view-only access to this tab — swap the editable
+  // amount/status/UTR controls and the Complete button for plain text.
+  const viewOnly = !!window.isViewOnlyRole;
+
+  const statusCell = (p) => {
+    if (viewOnly) return `<span class="badge badge-na">${p.status || '—'}</span>`;
+    if (mode === 'utr' || mode === 'tobesent' || mode === 'credit') return '';
+    const opts = mode === 'hold'
+      ? [['Hold', 'Hold'], ['Pending', 'Pending'], ['To be Sent for Payment', 'Send for Payment'], ['Rejected', 'Rejected']]
+      : [['Pending', 'Pending'], ['Hold', 'Hold'], ['To be Sent for Payment', 'Send for Payment']];
+    return `<select onchange="updatePaymentStatus('${p.id}', this.value)" style="border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 7px;font-size:12px;">
+      ${opts.map(([v, label]) => `<option value="${v}" ${p.status === v ? 'selected' : ''}>${label}</option>`).join('')}
+    </select>`;
+  };
+  const utrCell = (p) => {
+    if (mode === 'credit') return '<span class="sub">Settled later</span>'; // no UTR column for Credit — see the header note above
+    if (mode !== 'utr') return '';
+    return viewOnly ? (p.utr_no || '—') : `<input type="text" value="${p.utr_no || ''}" placeholder="UTR No." style="width:120px;border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 7px;font-size:12px;" onchange="updatePaymentUtr('${p.id}', this.value)" />`;
+  };
+  const actionCell = (p) => {
+    if (viewOnly) return '';
+    if (mode === 'credit') {
+      return `<button class="ab ab-form" style="background:#059669;color:#fff;" onclick="completeCreditPayment('${p.id}')"><i class="ti ti-check" style="font-size:11px;" aria-hidden="true"></i> Complete</button>`;
+    }
+    if (mode !== 'utr') return '';
+    return `<button class="ab ab-form" style="background:#059669;color:#fff;" onclick="completePayment('${p.id}')"><i class="ti ti-check" style="font-size:11px;" aria-hidden="true"></i> Complete</button>${
+      (currentProfile && currentProfile.role === 'Admin' && p.lead && p.lead.pn_payment_type === 'Instant Payments')
+        ? ` <button class="ab ab-edit" style="margin-left:4px;" onclick="resendInstantPaymentEmail('${p.lead_id}')" title="Resend the Instant Payment email"><i class="ti ti-mail" style="font-size:11px;" aria-hidden="true"></i> Resend Email</button>`
+        : ''
+    }`;
+  };
+  const checkboxCell = (p) => mode !== 'tobesent' ? '' :
+    `<td><input type="checkbox" class="chkToBeSentRow" value="${p.id}" ${(!viewOnly && toBeSentSelectedIds.has(p.id)) ? 'checked' : ''} ${viewOnly ? 'disabled' : ''} onchange="toggleToBeSentRow('${p.id}',this.checked)" /></td>`;
+  const colCount = (mode === 'tobesent' ? 21 : 20) + 1; // +1 for Sub Location (Ramvir, Sept 2026)
+
+  tbody.innerHTML = (rows && rows.length) ? rows.map(p => { const bd = getPaymentBankDetails(p); return `<tr>
+    ${checkboxCell(p)}
+    <td><span class="lid">${p.lead ? p.lead.lead_no : '—'}</span></td>
+    <td style="font-weight:500;">${p.lead ? p.lead.customer_name : '—'}</td>
+    <td>${p.lead ? p.lead.phone : '—'}</td>
+    <td>${p.lead ? p.lead.ud_vehicle_parking || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.ud_vehicle_sub_parking || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_vehicle_type || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_vehicle_number || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_make || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_model_variant || '—' : '—'}</td>
+    <td>${p.lead && p.lead.rewire_partners ? p.lead.rewire_partners.partner_name : '—'}</td>
+    <td>${p.lead && p.lead.pe ? p.lead.pe.name : '—'}</td>
+    <td>${p.lead && p.lead.manager ? p.lead.manager.name : '—'}</td>
+    <td>${p.lead ? p.lead.pn_deal_type || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.pn_payment_type || '—' : '—'}</td>
+    <td><span class="badge ${p.payment_type === 'Customer' ? 'badge-q' : 'badge-na'}">${p.payment_type}</span></td>
+    <td style="font-size:11px;">${bd ? `${bd.holder ? bd.holder + '<br>' : ''}${bd.bank || ''}<br>${bd.acct || ''} · ${bd.ifsc || ''}` : (p.payment_type === 'Broker' ? '<span class="sub">Broker not found in Partners</span>' : '—')}</td>
+    <td>${viewOnly ? (p.amount ? '₹' + p.amount : '—') : `<input type="number" min="0" onwheel="this.blur()" value="${p.amount || ''}" style="width:110px;border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 7px;font-size:12px;" onchange="updatePaymentAmount('${p.id}', this.value)" />`}</td>
+    <td>${statusCell(p)}</td>
+    <td>${utrCell(p)}</td>
+    <td>${p.created_at ? new Date(p.created_at).toLocaleDateString() : '—'}</td>
+    <td>${actionCell(p)}</td>
+  </tr>`; }).join('') : `<tr><td colspan="${colCount}" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No payments here right now.</td></tr>`;
+}
+
+function filterPaymentsTable(v) {
+  const q = v.toLowerCase();
+  const results = getPaymentsFilteredRows().filter(p =>
+    (p.lead && p.lead.lead_no.toLowerCase().includes(q)) || (p.lead && p.lead.customer_name.toLowerCase().includes(q))
+    || (p.lead && (p.lead.val_vehicle_number || '').toLowerCase().includes(q)));
+  renderPaymentsTable(results, 'tbodyPayments', 'pending');
+  if (!results.length) searchAcrossPaymentTabs(v, 'pending');
+}
+
+async function updatePaymentAmount(id, value) {
+  await sb.from('rewire_payments').update({ amount: value || null, updated_by: currentProfile.id }).eq('id', id);
+  invalidatePaymentsRawCache(); // no re-render happens here, but keep the next natural refresh accurate
+}
+// A row's id doesn't say which of the 4 live tabs it came from, so every
+// action below just refreshes all 4 — only the one that's actually
+// visible re-renders anything a person notices, and re-fetching the
+// others is cheap at this app's scale. (Archive isn't refreshed here —
+// nothing above ever writes there directly; it only ever gains rows via
+// the Completed/Rejected DB-side archive-move.)
+async function refreshPaymentsSections() {
+  invalidatePaymentsRawCache(); // force ONE fresh fetch, shared by all 5 renders below — see fetchPaymentsRaw()
+  await renderPaymentsSection();
+  await renderPaymentsHoldSection();
+  await renderToBeSentSection();
+  await renderPendingUtrSection();
+  await renderCreditPaymentSection();
+}
+
+async function updatePaymentStatus(id, value) {
+  // HOLD -> Rejected is its own flow (dummy UTR + confirmation) — see
+  // rejectPayment() below, not a plain status write.
+  if (value === 'Rejected') { await rejectPayment(id); return; }
+  // The "Complete" button already blocks completing a payment without a
+  // UTR (see completePayment below) — but this Status dropdown used to be
+  // a second way to reach "Completed" that bypassed that check entirely.
+  // Kept here for safety even though the dropdown no longer offers
+  // "Completed" as an option in any mode (see renderPaymentsTable) —
+  // Completed is only reachable via the Complete button now.
+  if (value === 'Completed') {
+    const row = paymentsCache.find(p => p.id === id) || paymentsHoldCache.find(p => p.id === id) || toBeSentCache.find(p => p.id === id) || pendingUtrCache.find(p => p.id === id);
+    if (!row || !row.utr_no) {
+      notify('Enter a UTR number before marking this payment Completed.', { icon: 'error', title: 'UTR required' });
+      refreshPaymentsSections(); // reset the dropdown back to its actual saved status
+      return;
+    }
+  }
+  const payload = { status: value, updated_by: currentProfile.id };
+  if (value === 'Completed') payload.completed_on = new Date().toISOString();
+  const { error } = await sb.from('rewire_payments').update(payload).eq('id', id);
+  if (error) { notify('Error updating status: ' + error.message, { icon: 'error' }); return; }
+  if (value === 'Completed') notify('Payment marked Completed and moved to Archive.');
+  refreshPaymentsSections(); // Pending<->Hold<->To be Sent for Payment all move the row to a different tab
+}
+async function updatePaymentUtr(id, value) {
+  value = (value || '').trim();
+  await sb.from('rewire_payments').update({ utr_no: value, updated_by: currentProfile.id }).eq('id', id);
+  // keep whichever local cache has this row in sync so the Status-dropdown UTR check sees it immediately
+  const row = paymentsCache.find(p => p.id === id) || paymentsHoldCache.find(p => p.id === id) || pendingUtrCache.find(p => p.id === id);
+  if (row) row.utr_no = value;
+}
+async function completePayment(id) {
+  const { data: row } = await sb.from('rewire_payments').select('utr_no').eq('id', id).single();
+  if (!row || !row.utr_no) { notify('Enter a UTR number before marking this payment Completed.', { icon: 'error', title: 'UTR required' }); return; }
+  const { error } = await sb.from('rewire_payments').update({ status: 'Completed', completed_on: new Date().toISOString(), updated_by: currentProfile.id }).eq('id', id);
+  if (error) { notify('Error completing payment: ' + error.message, { icon: 'error' }); return; }
+  notify('Payment marked Completed and moved to Archive.');
+  refreshPaymentsSections();
+}
+
+// Sequential Dummy UTR — "DUM-00001" style, per Payment Module SOP v1.0
+// ("prefix DUM- followed by a system-generated sequential number").
+// Computed client-side as (highest existing DUM-nnnnn in the Archive) + 1
+// rather than via a DB sequence/RPC — this whole app has no precedent
+// anywhere of a custom Postgres function (everything else is plain table
+// reads/writes via sb.from()), so a sequence+RPC would be genuinely new
+// infrastructure I have no way to test from here. This has a narrow
+// theoretical race condition if two Rejects somehow land in the exact
+// same instant, but Reject is a rare, manual, one-row-or-one-batch-at-a-
+// time action in practice, not a high-frequency automated one — an
+// acceptable trade-off to stay consistent with how the rest of this app
+// is built. Zero-padded to 5 digits, so plain string ordering
+// (.order('utr_no', {ascending:false})) already sorts correctly. Existing
+// older archive rows using the previous "REJECTED-<LeadNo>-<Type>" format
+// are left as-is — only new rejections from now on use this format.
+async function getNextDummyUtr() {
+  const { data } = await sb.from('rewire_payments_archive')
+    .select('utr_no').like('utr_no', 'DUM-%').order('utr_no', { ascending: false }).limit(1);
+  let next = 1;
+  if (data && data.length && data[0].utr_no) {
+    const m = data[0].utr_no.match(/^DUM-(\d+)$/);
+    if (m) next = parseInt(m[1], 10) + 1;
+  }
+  return 'DUM-' + String(next).padStart(5, '0');
+}
+
+// HOLD -> Rejected: a real UTR never existed here (nothing was actually
+// paid), so a dummy value is auto-filled and the row is marked Rejected.
+// Written the exact same way completePayment() marks a row Completed
+// (plain status+utr_no update, no explicit archive insert) — trusting the
+// same DB-side trigger that already moves Completed rows into
+// rewire_payments_archive to do the same for Rejected. If that trigger
+// turns out to be keyed specifically to status = 'Completed' only, a
+// Rejected row will still be correctly marked here but won't actually
+// move to the Archive tab — worth confirming once against the DB (see
+// the diagnostic SQL shared alongside this).
+async function rejectPayment(id) {
+  const row = paymentsHoldCache.find(p => p.id === id);
+  const label = row && row.lead ? `${row.lead.lead_no} — ${row.payment_type}` : 'this payment';
+  const ok = await confirmDialog(`Reject ${label}? A dummy UTR will be filled in and it will move to Archive.`);
+  if (!ok) { refreshPaymentsSections(); return; } // reset the dropdown back to Hold
+  const dummyUtr = await getNextDummyUtr();
+  const { error } = await sb.from('rewire_payments').update({
+    status: 'Rejected', utr_no: dummyUtr, completed_on: new Date().toISOString(), updated_by: currentProfile.id,
+  }).eq('id', id);
+  if (error) { notify('Error rejecting payment: ' + error.message, { icon: 'error' }); return; }
+  notify('Payment marked Rejected and moved to Archive.');
+  refreshPaymentsSections();
+}
+
+let paymentsArchiveCache = [];
+
+async function renderPaymentsArchiveSection() {
+  // Same unpaginated-fetch gap as fetchPaymentsRaw() above — Archive
+  // only grows over time (every Completed payment lands here), so this
+  // would eventually start silently dropping older rows past 1000 too.
+  initTableFilterBar('paymentsarchive', renderPaymentsArchiveSection);
+  let data;
+  try {
+    data = await fetchAllRows((from, to) => sb.from('rewire_payments_archive')
+      .select(`*, lead:rewire_master_data!rewire_payments_archive_lead_id_fkey(lead_no, customer_name, phone, ud_vehicle_parking, ud_vehicle_sub_parking,
+        val_vehicle_type, val_vehicle_number, val_make, val_model_variant, rewire_partners(partner_name),
+        pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+        manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name))`)
+      .order('archived_on', { ascending: false })
+      .range(from, to));
+  } catch (error) { console.error(error); return; }
+  paymentsArchiveCache = data || [];
+  const filteredPa = filterRowsByTableFilter(paymentsArchiveCache, 'paymentsarchive',
+    p => (p.lead && p.lead.pe) ? p.lead.pe.id : null,
+    p => (p.lead && p.lead.manager) ? p.lead.manager.id : null,
+    p => p.completed_on ? p.completed_on.slice(0, 10) : null);
+  // Deliberately just "N completed", not "N completed payments" — the
+  // extra word was long enough to push the search bar / tab buttons in
+  // this row onto a second line on the Archive tab specifically (its
+  // count tends to run into the thousands, e.g. "4733 completed
+  // payments", well before the other tabs' counts do).
+  document.getElementById('countPaymentsArchive').textContent = filteredPa.length + ' completed';
+  renderPaymentsArchiveTable(filteredPa);
+}
+
+function renderPaymentsArchiveTable(rows) {
+  const tbody = document.getElementById('tbodyPaymentsArchive');
+  tbody.innerHTML = (rows && rows.length) ? rows.map(p => `<tr>
+    <td><span class="lid">${p.lead ? p.lead.lead_no : '—'}</span></td>
+    <td style="font-weight:500;">${p.lead ? p.lead.customer_name : '—'}</td>
+    <td>${p.lead ? p.lead.phone : '—'}</td>
+    <td>${p.lead ? p.lead.ud_vehicle_parking || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.ud_vehicle_sub_parking || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_vehicle_type || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_vehicle_number || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_make || '—' : '—'}</td>
+    <td>${p.lead ? p.lead.val_model_variant || '—' : '—'}</td>
+    <td>${p.lead && p.lead.rewire_partners ? p.lead.rewire_partners.partner_name : '—'}</td>
+    <td><span class="badge ${p.payment_type === 'Customer' ? 'badge-q' : 'badge-na'}">${p.payment_type}</span></td>
+    <td>${p.amount ? '₹' + p.amount : '—'}</td>
+    <td><span class="badge ${p.status === 'Rejected' ? 'badge-l' : 'badge-q'}">${p.status || 'Completed'}</span></td>
+    <td>${p.utr_no || '—'}</td>
+    <td>${p.completed_on ? new Date(p.completed_on).toLocaleDateString() : '—'}</td>
+  </tr>`).join('') : '<tr><td colspan="15" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No completed payments yet.</td></tr>';
+}
+
+function filterPaymentsArchiveTable(v) {
+  const q = v.toLowerCase();
+  const results = paymentsArchiveCache.filter(p =>
+    (p.lead && p.lead.lead_no.toLowerCase().includes(q)) || (p.lead && p.lead.customer_name.toLowerCase().includes(q)) || (p.utr_no || '').toLowerCase().includes(q)
+    || (p.lead && (p.lead.val_vehicle_number || '').toLowerCase().includes(q)));
+  renderPaymentsArchiveTable(results);
+  if (!results.length) searchAcrossPaymentTabs(v, 'archive');
+}
+
+
+// ------------------------------------------------------------
+// REPORTS — CSV export (client-side, no server round-trip needed)
+// ------------------------------------------------------------
+// textColumns (optional): field names that must round-trip through Excel
+// as TEXT, not a number — the CSV file itself already stores these
+// correctly as plain quoted strings, but Excel auto-detects any
+// numeric-looking quoted value when OPENING a .csv (same as typing it
+// into a cell) and silently re-parses it as a floating-point Number.
+// Doubles only carry ~15-17 significant digits reliably, so a 16-digit
+// bank account number ending in a different last digit than another
+// (e.g. ...4650 vs ...4656) can come out LOOKING IDENTICAL once Excel's
+// rounded them both — which is exactly what made 2 different partners'
+// account numbers appear to match when this file was opened, even though
+// the underlying data was never actually duplicated (see batch87/88).
+// Fixed the standard way for a value Excel must not reinterpret: wrap it
+// as ="value" — Excel evaluates that as a formula whose result is the
+// literal text, so it never gets coerced to a number.
+function downloadCsv(filename, rows, textColumns) {
+  if (!rows || !rows.length) { notify('No data to export.', { icon: 'info' }); return; }
+  const headers = Object.keys(rows[0]);
+  const escape = (v, forceText) => {
+    if (v === null || v === undefined) return '';
+    const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+    const quoted = '"' + s.replace(/"/g, '""') + '"';
+    return forceText && s !== '' ? '="' + s.replace(/"/g, '""') + '"' : quoted;
+  };
+  const textSet = new Set(textColumns || []);
+  const csv = [headers.join(',')].concat(rows.map(r => headers.map(h => escape(r[h], textSet.has(h))).join(','))).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+// Genuine .xlsx export (SheetJS) — used by the Commission date-range
+// export. downloadCsv() above stays CSV for the existing Reports tab.
+// textColumns (optional): field names that must stay TEXT in the sheet —
+// SheetJS's json_to_sheet auto-detects any numeric-looking string as a
+// number, which silently strips leading zeros (e.g. "0012345678" becomes
+// 12345678) and, for anything past ~15 digits, loses precision/renders in
+// scientific notation (a bank account number is exactly this shape). Force
+// those columns' cells back to type 's' with a text number format so the
+// original digits survive untouched.
+// A shared save step — builds the actual Blob and clicks a temporary
+// <a download> link, same mechanism downloadCsv() above already uses.
+// downloadXlsx/downloadXlsxMulti used to hand off to XLSX.writeFile()
+// instead, which picks its own save strategy per-browser (on some setups
+// that includes the newer File System Access "Save As" picker) — inside
+// the Apps Script web app's sandboxed googleusercontent.com iframe that
+// picker call can get intercepted by Google's own permission-dialog
+// plumbing (console shows it as a failed request to
+// "userCodeAppPanel?createOAuthDialog=true" + a 500), which silently
+// aborted the export with nothing shown in the app itself. Building the
+// Blob ourselves and clicking a plain download link avoids that path
+// entirely, and the try/catch means a failure now at least shows a
+// notify() instead of only a console error.
+function saveWorkbook(wb, filename) {
+  try {
+    const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([wbout], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+  } catch (e) {
+    notify('Export failed while saving the file: ' + e.message, { icon: 'error' });
+  }
+}
+
+function downloadXlsx(filename, rows, sheetName, textColumns) {
+  if (!rows || !rows.length) { notify('No data to export.', { icon: 'info' }); return; }
+  const ws = XLSX.utils.json_to_sheet(rows);
+  if (textColumns && textColumns.length) {
+    const headers = Object.keys(rows[0]);
+    textColumns.forEach(col => {
+      const colIdx = headers.indexOf(col);
+      if (colIdx === -1) return;
+      for (let r = 0; r < rows.length; r++) {
+        const cellRef = XLSX.utils.encode_cell({ r: r + 1, c: colIdx }); // +1 skips the header row
+        const cell = ws[cellRef];
+        if (cell && cell.v !== '' && cell.v !== null && cell.v !== undefined) {
+          cell.t = 's';
+          cell.v = String(cell.v);
+          cell.z = '@';
+        }
+      }
+    });
+  }
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName || 'Sheet1');
+  saveWorkbook(wb, filename);
+}
+
+// Multi-sheet .xlsx export — sheets = [{ name: 'Details', rows: [...] }, ...]
+function downloadXlsxMulti(filename, sheets) {
+  const usable = (sheets || []).filter(s => s.rows && s.rows.length);
+  if (!usable.length) { notify('No data to export.', { icon: 'info' }); return; }
+  const wb = XLSX.utils.book_new();
+  usable.forEach(s => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(s.rows), s.name.slice(0, 31)));
+  saveWorkbook(wb, filename);
+}
+
+// Shared "Download Excel" helper for a *_COLUMNS definition array
+// ({key,label,get}) run against a tab's already-rendered page cache.
+// (Ramvir, Oct 2026) — this was called from Logistics/Location Tracking/
+// Vehicle Disposal (Pending)/Received at Plant and a number of other tabs'
+// Download Excel buttons, but was never actually defined anywhere in the
+// app — every one of those buttons was throwing "exportTableColumnsToExcel
+// is not defined" in the browser console. Added here as the real fix, next
+// to the other shared xlsx helpers, rather than as a one-off per tab.
+function exportTableColumnsToExcel(tabKey, rowsCache, columnsDef, filename, sheetName) {
+  if (!rowsCache || !rowsCache.length) { notify('No data to export.', { icon: 'info' }); return; }
+  // "Download Excel exports what's on screen" (Ramvir, Oct 2026): rows are
+  // already narrowed by the date range at render time; here we also drop rows
+  // hidden by the column-header filters / search box. Rows map 1:1 to the
+  // table's data <tr>s, so we only apply this when the counts match.
+  const tbl = document.querySelector('table.crm-table[data-filter-prefix="' + tabKey + '"]');
+  if (tbl && tbl.tBodies[0]) {
+    const trs = Array.from(tbl.tBodies[0].children).filter(r => r.tagName === 'TR' && !r.querySelector('td[colspan]'));
+    if (trs.length === rowsCache.length) {
+      rowsCache = rowsCache.filter((_, i) => trs[i].dataset.twColFiltered !== '1' && trs[i].dataset.twFiltered !== '1');
+      if (!rowsCache.length) { notify('No rows match the current filters.', { icon: 'info' }); return; }
+    }
+  }
+  const rows = rowsCache.map(r => {
+    const obj = {};
+    columnsDef.forEach(c => { obj[c.label] = c.get(r); });
+    return obj;
+  });
+  downloadXlsxMulti(filename, [{ name: sheetName, rows }]);
+}
+
+// ------------------------------------------------------------
+// COMMISSION — Cash Commission payouts captured per-person in Price
+// Negotiation. Pending rows live in rewire_commission (status =
+// 'Pending'); generating the Excel for a date range flips those exact
+// rows to 'Paid' so re-picking the same range naturally returns
+// nothing (no separate "range lock" table needed).
+// ------------------------------------------------------------
+const COMM_LEAD_SELECT = `id, lead_no, customer_name, val_vehicle_number, company_dealership_name, pn_partner_name, pn_cash_commission, pn_filled_on, created_at, overall_status,
+      partner:rewire_partners!rewire_master_data_partner_id_fkey(partner_name),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(id,name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(id,name)`;
+// Extra lead columns the commission Excel needs (Entry Date, Purchase Date,
+// PE / Manager / Broker name, Total Deal) on top of COMM_LEAD_SELECT.
+const COMM_XL_SELECT = COMM_LEAD_SELECT + ', phone, city, val_vehicle_type, val_make, val_model_variant, ud_filled_on, ud_total_offer_price, pn_total_offer_price';
+function commExcelRow(c, l) {
+  l = l || {};
+  const noPayeeRow = !c || !c.person_name;
+  const entry = (noPayeeRow ? (l.pn_filled_on || l.created_at) : (c && c.created_at)) || '';
+  const fmt = v => v ? new Date(v).toLocaleDateString('en-GB') : '';
+  return {
+    'Lead No.': l.lead_no || '', 'Customer': l.customer_name || '', 'Phone': l.phone || '', 'City': l.city || '',
+    'Vehicle Type': l.val_vehicle_type || '', 'Vehicle No.': l.val_vehicle_number || '',
+    'Make': l.val_make || '', 'Model': l.val_model_variant || '',
+    'Entry Date': fmt(entry), 'Purchase Date': fmt(l.ud_filled_on),
+    'PE Name': l.pe ? l.pe.name : '', 'Manager Name': l.manager ? l.manager.name : '',
+    'Broker Name': (l.partner && l.partner.partner_name) || l.pn_partner_name || '',
+    'Total Deal': l.ud_total_offer_price || l.pn_total_offer_price || '',
+    'Person Name': c && c.person_name ? c.person_name : '',
+    'Amount': c ? c.amount : (l.pn_cash_commission || ''),
+  };
+}
+async function exportCommissionPaidExcel() {
+  const from = (document.getElementById('commissionarchiveFilterFrom') || {}).value || '';
+  const to = (document.getElementById('commissionarchiveFilterTo') || {}).value || '';
+  const data = await fetchAllRows((rf, rt) => {
+    let q = sb.from('rewire_commission').select(`*, lead:rewire_master_data!rewire_commission_lead_id_fkey(${COMM_XL_SELECT})`).eq('status', 'Paid');
+    if (from) q = q.gte('paid_on', istDayStart(from));
+    if (to) q = q.lte('paid_on', istDayEnd(to));
+    return q.order('paid_on', { ascending: false }).range(rf, rt);
+  }).catch(err => { notify('Export failed: ' + err.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  if (!data.length) { notify('No paid commission entries to export.', { icon: 'info' }); return; }
+  const rows = data.map(c => ({ ...commExcelRow(c, c.lead), 'Paid On': c.paid_on ? new Date(c.paid_on).toLocaleDateString('en-GB') : '' }));
+  downloadXlsx('commission-paid' + (from || to ? '-' + (from || 'start') + '-to-' + (to || 'today') : '') + '.xlsx', rows, 'Commission Paid');
+}
+function commBrokerName(l) { return l ? ((l.partner && l.partner.partner_name) || l.pn_partner_name || '—') : '—'; }
+function commLeadCells(l) {
+  return `<td>${l ? `<span class="lid" style="cursor:pointer;text-decoration:underline;" onclick="viewLeadDetails('${l.id}')">${l.lead_no}</span>` : '—'}</td>
+    <td style="font-weight:500;">${l ? l.customer_name : '—'}</td>
+    <td>${l ? l.val_vehicle_number || '—' : '—'}</td>
+    <td>${commBrokerName(l)}</td>
+    <td>${l && l.company_dealership_name ? l.company_dealership_name : '—'}</td>
+    <td>${l && l.pe ? l.pe.name : '—'}</td>
+    <td>${l && l.manager ? l.manager.name : '—'}</td>`;
+}
+async function renderCommissionSection() {
+  initTableFilterBar('commission', renderCommissionSection);
+  // Pending queue, paginated defensively — same class of bug fixed
+  // elsewhere this session.
+  const data = await fetchAllRows((from, to) => sb.from('rewire_commission')
+    .select(`*, lead:rewire_master_data!rewire_commission_lead_id_fkey(${COMM_LEAD_SELECT})`)
+    .eq('status', 'Pending').order('created_at', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  // (Ramvir, Oct 2026) Every lead that HAS a commission must show here, even when no
+  // Commission Payee was entered (no rewire_commission row). Those appear as "No Payee".
+  const allRows = await fetchAllRows((from, to) => sb.from('rewire_commission').select('lead_id').range(from, to)).catch(() => []);
+  const haveRow = new Set((allRows || []).map(r => r.lead_id));
+  const noPayeeLeads = (await fetchAllRows((from, to) => sb.from('rewire_master_data')
+    .select(COMM_LEAD_SELECT).gt('pn_cash_commission', 0).neq('overall_status', 'Closed Lost').range(from, to))
+    .catch(err => { console.error(err); return []; })).filter(l => !haveRow.has(l.id));
+  const rows = (data || []).map(c => ({ kind: 'row', c, lead: c.lead, when: c.created_at }))
+    .concat(noPayeeLeads.map(l => ({ kind: 'nopayee', c: null, lead: l, when: l.pn_filled_on || l.created_at })));
+  rows.sort((a, b) => String(b.when || '').localeCompare(String(a.when || '')));
+  const filteredComm = filterRowsByTableFilter(rows, 'commission',
+    r => (r.lead && r.lead.pe) ? r.lead.pe.id : null,
+    r => (r.lead && r.lead.manager) ? r.lead.manager.id : null,
+    r => r.when ? r.when.slice(0, 10) : null);
+  document.getElementById('countCommission').textContent = filteredComm.length + ' pending';
+  document.getElementById('badgeCommission').textContent = rows.length;
+  document.getElementById('tbodyCommission').innerHTML = filteredComm.length ? filteredComm.map(r => `<tr>
+    ${commLeadCells(r.lead)}
+    <td>${r.kind === 'row' ? (r.c.person_name || '—') : '<span style="color:var(--color-text-tertiary);">No payee entered</span>'}</td>
+    <td>${r.kind === 'row' ? (r.c.amount ? '₹' + r.c.amount : '—') : '₹' + Number(r.lead.pn_cash_commission)}</td>
+    <td><span class="badge badge-na">${r.kind === 'row' ? r.c.status : 'No Payee'}</span></td>
+    <td>${r.when ? new Date(r.when).toLocaleDateString() : '—'}</td>
+  </tr>`).join('') : '<tr><td colspan="11" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No pending commission entries.</td></tr>';
+}
+
+async function renderCommissionArchiveSection() {
+  initTableFilterBar('commissionarchive', renderCommissionArchiveSection);
+  // Paid commission only ever accumulates — same silent-1000-row-cap
+  // pattern as every other archive table, fixed the same way.
+  const rawData = await fetchAllRows((from, to) => sb.from('rewire_commission')
+    .select(`*, lead:rewire_master_data!rewire_commission_lead_id_fkey(${COMM_LEAD_SELECT})`)
+    .eq('status', 'Paid').order('paid_on', { ascending: false }).range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const data = filterRowsByTableFilter(rawData || [], 'commissionarchive',
+    c => (c.lead && c.lead.pe) ? c.lead.pe.id : null,
+    c => (c.lead && c.lead.manager) ? c.lead.manager.id : null,
+    c => c.paid_on ? c.paid_on.slice(0, 10) : null);
+  document.getElementById('countCommissionArchive').textContent = (data || []).length + ' paid';
+  document.getElementById('tbodyCommissionArchive').innerHTML = (data && data.length) ? data.map(c => `<tr>
+    ${commLeadCells(c.lead)}
+    <td>${c.person_name || '—'}</td>
+    <td>${c.amount ? '₹' + c.amount : '—'}</td>
+    <td>${c.paid_on ? new Date(c.paid_on).toLocaleDateString() : '—'}</td>
+  </tr>`).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No paid commission entries yet.</td></tr>';
+}
+
+async function generateCommissionExcel() {
+  const from = document.getElementById('commissionFromDate').value;
+  const to = document.getElementById('commissionToDate').value;
+  if (!from || !to) { notify('Please select both From and To dates.', { icon: 'error', title: 'Missing dates' }); return; }
+
+  // Paginated — a busy date range could plausibly exceed 1000 pending
+  // commission rows, which would otherwise silently under-export AND
+  // under-mark-as-Paid with no error (same class of bug fixed everywhere
+  // else this session).
+  const data = await fetchAllRows((rangeFrom, rangeTo) => sb.from('rewire_commission')
+    .select(`*, lead:rewire_master_data!rewire_commission_lead_id_fkey(${COMM_XL_SELECT})`)
+    .eq('status', 'Pending')
+    .gte('created_at', istDayStart(from))
+    .lte('created_at', istDayEnd(to))
+    .range(rangeFrom, rangeTo))
+    .catch(err => { notify('Export failed: ' + err.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+
+  // Leads with a commission but NO payee entered (no rewire_commission row)
+  // are listed on screen as "No Payee" — include them in the Excel too, with
+  // a blank Person Name (Ramvir, Oct 2026: they were silently left out).
+  // They have no commission row, so a Paid row is inserted for them after
+  // the download (see below).
+  const haveRowIds = new Set((await fetchAllRows((rf, rt) => sb.from('rewire_commission').select('lead_id').range(rf, rt)).catch(() => [])).map(r => r.lead_id));
+  const noPayeeAll = await fetchAllRows((rf, rt) => sb.from('rewire_master_data')
+    .select(COMM_XL_SELECT)
+    .gt('pn_cash_commission', 0).neq('overall_status', 'Closed Lost').range(rf, rt)).catch(() => []);
+  const noPayee = (noPayeeAll || []).filter(l => {
+    if (haveRowIds.has(l.id)) return false;
+    const d = (l.pn_filled_on || l.created_at || '').slice(0, 10);
+    return d && d >= from && d <= to;
+  });
+
+  if ((!data || !data.length) && !noPayee.length) {
+    notify('No pending commission records in this date range (already exported, or none exist).', { icon: 'info' });
+    return;
+  }
+
+  const rows = (data || []).map(c => commExcelRow(c, c.lead)).concat(noPayee.map(l => commExcelRow(null, l)));
+  downloadXlsx(`commission-${from}-to-${to}.xlsx`, rows, 'Commission');
+
+  // Lock these exact records — flip to Paid so this range can't be
+  // exported (as pending) a second time.
+  const ids = (data || []).map(c => c.id);
+  const paidOn = new Date().toISOString();
+  if (ids.length) {
+    const { error: updErr } = await sb.from('rewire_commission').update({
+      status: 'Paid', paid_by: currentProfile.id, paid_on: paidOn,
+    }).in('id', ids);
+    if (updErr) { notify('Excel generated, but marking records as Paid failed: ' + updErr.message, { icon: 'error' }); return; }
+  }
+  // No-payee leads also move to Paid (Ramvir, Oct 2026): they have no
+  // commission row, so insert one already marked Paid (blank person name,
+  // amount = the lead's PN cash commission) — this is what takes them off
+  // the Pending list and puts them in View Paid.
+  if (noPayee.length) {
+    const newRows = noPayee.map(l => ({
+      lead_id: l.id, person_name: '', amount: l.pn_cash_commission, status: 'Paid',
+      created_by: currentProfile.id, paid_by: currentProfile.id, paid_on: paidOn,
+    }));
+    for (let i = 0; i < newRows.length; i += 200) {
+      const { error: insErr } = await sb.from('rewire_commission').insert(newRows.slice(i, i + 200));
+      if (insErr) { notify('Excel generated, but moving no-payee leads to Paid failed: ' + insErr.message, { icon: 'error' }); return; }
+    }
+  }
+
+  notify('Excel generated and ' + (ids.length + noPayee.length) + ' commission record(s) moved to Paid.');
+  await renderCommissionSection();
+}
+
+// Guards every Reports tab Download button against double-click (which
+// previously could fire the same export twice in parallel — harmless for
+// a read-only export, but confusing: two file-save prompts / two
+// downloads with no indication anything was happening in between).
+// Disables the button and swaps its label to "Downloading..." for the
+// duration of the export, restoring it in a finally so a thrown error
+// still leaves the button clickable again instead of stuck disabled.
+async function runReportExport(btn, fn) {
+  if (!btn || btn.disabled) return;
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = 'Downloading...';
+  try {
+    await fn();
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = original;
+  }
+}
+
+// Applies the Reports tab's From/To date fields to a query, if set
+function applyReportDateFilter(query, dateCol) {
+  const from = document.getElementById('reportFromDate').value;
+  const to = document.getElementById('reportToDate').value;
+  if (from) query = query.gte(dateCol, istDayStart(from));
+  if (to) query = query.lte(dateCol, istDayEnd(to));
+  return query;
+}
+
+// Status line under the From/To Date fields + "Apply Filter" button
+// (Ramvir, Sept 2026) — purely informational, since every export already
+// reads the two date inputs live at download time regardless of whether
+// this was ever clicked. Exists only to remove the ambiguity that was
+// reported as "date range select karte hain but pura data hi aata hai" —
+// notify=true also pops a toast so clicking Apply gives visible feedback.
+function renderReportDateFilterStatus(notifyToo) {
+  const from = document.getElementById('reportFromDate').value;
+  const to = document.getElementById('reportToDate').value;
+  const el = document.getElementById('reportDateFilterStatus');
+  let text;
+  if (!from && !to) {
+    text = 'No date filter — every download below returns full data.';
+  } else {
+    const fmt = (d) => d ? new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : null;
+    if (from && to) text = `Filtering ${fmt(from)} to ${fmt(to)} — downloads below will only include this range.`;
+    else if (from) text = `Filtering from ${fmt(from)} onward — downloads below will only include this range.`;
+    else text = `Filtering up to ${fmt(to)} — downloads below will only include this range.`;
+  }
+  if (el) { el.textContent = text; el.style.color = (from || to) ? '#0891b2' : 'var(--color-text-tertiary)'; }
+  if (notifyToo) notify(text);
+}
+
+// Every export below goes through fetchAllRows() (JS-Core.html) instead
+// of a plain `await query` — the same unpaginated-fetch gap found in
+// fetchPaymentsRaw()/renderPaymentsArchiveSection() above applies to
+// every one of these too (a plain .select() silently caps at Supabase's
+// default 1000 rows), and applyReportDateFilter's From/To fields are
+// OPTIONAL — leaving them blank (the common case: "just give me
+// everything") would have silently exported an incomplete file with no
+// error, no warning, nothing to show data was missing.
+// Excel (.xlsx), not CSV — this report includes kyc_account_number, and
+// downloadXlsx's textColumns can force a cell's actual TYPE to stay text
+// (SheetJS-level), which a CSV can only ever approximate with the ="..."
+// formula trick (still at the mercy of whatever program opens it). Any
+// report below that carries an account number uses .xlsx for this reason;
+// ones that don't (Payments, Payments Archive, RC/COD-CVS/Location/
+// Company-Dealership — none of those select bank fields) stay as they were.
+// ------------------------------------------------------------
+// REPORT ID -> NAME RESOLUTION (Ramvir, Sept 2026) — "All Leads" and
+// "Purchased Vehicles" export every rewire_master_data column via
+// SELECT '*', which means every *_by / *_id column comes back as a raw
+// uuid (partner_id, pe_id, manager_id, created_by, last_updated_by,
+// val_filled_by, pn_filled_by, kyc_filled_by, ud_filled_by,
+// accessories_check_by, crane_charge_filled_by, logistics_sent_by,
+// logistics_payment_paid_by, payment_release_by) — unreadable, no way to
+// tell who actually did what. This resolves every one of those columns
+// to the person's/partner's name IN PLACE, so the sheet keeps its exact
+// existing column layout/order (same column letters as before) — just
+// human-readable values instead of uuids. Also appends 'Payment Status'
+// (combining live rewire_payments + archived rewire_payments_archive
+// per lead) and a clearly-labelled 'Vehicle Park Location' column.
+//
+// Fetches fresh (not the client-side allActiveUsers/allPartners caches)
+// because those are filtered to active-only / may not be loaded yet —
+// a report has to resolve EVERY historical id, including deactivated
+// users, correctly.
+// Raw rewire_master_data column list (Ramvir, Sept 2026) — the "Columns"
+// picker on the All Leads report covers literally every field on the
+// table, generated from the actual schema rather than hand-maintaining
+// ~190 labels that could drift out of sync as columns are added. Labels
+// are auto-title-cased from the column name.
+const ALL_LEADS_RAW_COLUMNS = [
+  'id','lead_no','customer_name','phone','email','address','city','lead_source','lead_type','partner_id','lead_status','sub_status',
+  'pe_id','manager_id','current_stage','overall_status','locked','created_by','created_at','last_update','last_updated_by',
+  'val_vehicle_type','val_vehicle_number','val_make','val_model_variant','val_registration_year','val_kerb_weight_kg','val_engine_no',
+  'val_chassis_no','val_rc_type','val_rc_copy_url','val_fuel_type','val_spare_wheel','val_stereo','val_speakers','val_tool_kit',
+  'val_battery','val_vehicle_operational','val_vehicle_accidental','val_alloy_wheel','val_remarks','val_filled_by','val_filled_on','val_status',
+  'pn_deal_type','pn_payment_type','pn_partner_name','pn_trader_name','pn_total_offer_price','pn_customer_payment','pn_broker_payment',
+  'pn_trader_payment','pn_cash_commission','pn_omni_payments_by_name','pn_qr_code_url','pn_filled_by','pn_filled_on','pn_status',
+  'kyc_aadhar_number','kyc_aadhar_url','kyc_aadhar_linked_phone','kyc_pan_number','kyc_pan_url','kyc_gst_number','kyc_gst_url',
+  'kyc_bank_name','kyc_branch_name','kyc_account_number','kyc_ifsc_code','kyc_filled_by','kyc_filled_on','kyc_status','vz_status',
+  'ud_fuel_type','ud_spare_wheel','ud_spare_wheel_photo_url','ud_stereo','ud_stereo_photo_url','ud_speakers','ud_speakers_photo_url',
+  'ud_tool_kit','ud_jack','ud_rod','ud_pana','ud_tool_kit_photo_url','ud_battery','ud_battery_photo_url','ud_cylinder_type',
+  'ud_cylinder_photo_url','ud_vehicle_operational','ud_vehicle_accidental','ud_alloy_wheel','ud_alloy_wheel_photo_url',
+  'ud_inventory_slip_url','ud_delivery_photo_url','ud_total_offer_price','ud_customer_payment','ud_broker_payment','ud_trader_payment',
+  'ud_cash_commission','ud_instapay_done_by_name','ud_upi_number','ud_upi_amount','ud_upi_screenshot_url','ud_other_screenshot_url',
+  'ud_delivery_remark','ud_filled_by','ud_filled_on','ud_status','ma_status','ha_status','rc_image_url','rc_dispatch_date',
+  'rc_dispatch_remarks','rc_dispatched_by','rc_dispatched_on','rc_status','rc_pe_status','rc_courier_name','rc_pod_no','rc_pod_image_url',
+  'pn_cod_payment','lost_at_stage','lost_reason','accessories_check_status','accessories_check_by','accessories_check_on',
+  'accessories_check_remarks','ud_vehicle_parking','transportation_type','crane_charge_amount','crane_charge_filled_by',
+  'crane_charge_filled_on','updated_at','accessories_deduction_amount','accessories_deduction_reason','kyc_cheque_url',
+  'pn_gst_amount','ud_gst_amount','pn_omni_pay_to','crane_from_location','crane_to_location','crane_vendor_name',
+  'company_dealership_name','ud_rc_received_type','kyc_account_holder_name','logistics_status','logistics_transporter_name',
+  'logistics_transporter_vehicle_no','logistics_dispatch_date','logistics_remarks','logistics_sent_by','logistics_sent_on',
+  'logistics_freight_amount','logistics_payment_status','logistics_payment_paid_by','logistics_payment_paid_on','old_lead_ref',
+  'ha_deduction_amount','ha_final_amount','payment_release_status','payment_release_by','payment_release_at',
+  'logistics_vehicle_send_to','scrap_dismantle_photos_urls','scrap_dismantle_videos_urls','scrap_marked_by','scrap_marked_on',
+  'pn_gst_pay_to','pn_vehicle_weight_kg','pn_vehicle_amount','pn_cod_amount','ud_vehicle_weight_kg','ud_vehicle_amount',
+  'ud_cod_amount','logistics_bill_no','logistics_bill_url','logistics_final_amount','rc_dispatch_mode','rc_carried_by',
+  'ud_vehicle_sub_parking','entry_source','bulk_purchase_date','accessories_deduct_customer','accessories_deduct_broker',
+  'accessories_deduct_cod','accessories_deduct_cash','pn_vehicle_parking','pn_vehicle_sub_parking','pn_instant_email_status',
+  'pn_instant_email_sent_at','pn_instant_email_error',
+];
+function labelFromColumnKey(key) {
+  return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+const ALL_LEADS_COLUMNS = [
+  ...ALL_LEADS_RAW_COLUMNS.map(key => ({ key, label: labelFromColumnKey(key), get: row => row[key] ?? '' })),
+  { key: 'Payment Status', label: 'Payment Status', get: row => row['Payment Status'] ?? '' },
+  { key: 'Vehicle Park Location', label: 'Vehicle Park Location', get: row => row['Vehicle Park Location'] ?? '' },
+];
+
+const REPORT_USER_ID_COLS = [
+  'pe_id', 'manager_id', 'created_by', 'last_updated_by', 'val_filled_by', 'pn_filled_by',
+  'kyc_filled_by', 'ud_filled_by', 'accessories_check_by', 'crane_charge_filled_by',
+  'logistics_sent_by', 'logistics_payment_paid_by', 'payment_release_by',
+];
+// Supabase's .in() puts every id straight into the URL querystring — with
+// 2,000+ leads that would blow past a normal URL length limit. Chunking
+// avoids that (same reasoning as this project's other chunked imports).
+async function fetchInChunks(table, selectCols, idCol, ids, chunkSize = 150) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    if (!chunk.length) continue;
+    const { data, error } = await sb.from(table).select(selectCols).in(idCol, chunk);
+    if (error) throw error;
+    out.push(...(data || []));
+  }
+  return out;
+}
+async function resolveReportRows(rows) {
+  if (!rows || !rows.length) return rows;
+  const [{ data: users, error: usersErr }, { data: partners, error: partnersErr }] = await Promise.all([
+    sb.from('rewire_user_profiles').select('id, name'),
+    sb.from('rewire_partners').select('id, partner_name'),
+  ]);
+  if (usersErr) console.error(usersErr);
+  if (partnersErr) console.error(partnersErr);
+  const userMap = {}; (users || []).forEach(u => userMap[u.id] = u.name);
+  const partnerMap = {}; (partners || []).forEach(p => partnerMap[p.id] = p.partner_name);
+
+  const leadIds = rows.map(r => r.id).filter(Boolean);
+  let payMap = {};
+  try {
+    const [liveP, archP] = await Promise.all([
+      fetchInChunks('rewire_payments', 'lead_id, payment_type, status', 'lead_id', leadIds),
+      fetchInChunks('rewire_payments_archive', 'lead_id, payment_type, status', 'lead_id', leadIds),
+    ]);
+    // Archive rows are the final state — applied second so they win over
+    // any stale live row a lead might still (incorrectly) also have.
+    [...liveP, ...archP].forEach(p => {
+      payMap[p.lead_id] = payMap[p.lead_id] || {};
+      payMap[p.lead_id][p.payment_type] = p.status;
+    });
+  } catch (e) { console.error('Payment status lookup failed: ', e); }
+
+  return rows.map(r => {
+    const out = { ...r };
+    REPORT_USER_ID_COLS.forEach(col => {
+      if (col in out) out[col] = out[col] ? (userMap[out[col]] || out[col]) : '';
+    });
+    if ('partner_id' in out) out.partner_id = out.partner_id ? (partnerMap[out.partner_id] || out.partner_id) : '';
+    // Distinguishes "genuinely pending" from "no payment was ever due" —
+    // Ramvir flagged that "Customer: Pending" alone was ambiguous (does it
+    // mean overdue, or does this lead just not have a customer payment at
+    // all?). pn_customer_payment/pn_broker_payment (>0 = a payment of that
+    // type is actually due, same signal the Payments tab itself uses to
+    // decide whether a payment row should exist — see the gap-detection
+    // logic in scanMissingPayments()/getPaymentBankDetails() above) now
+    // gate an explicit "N/A" instead of silently omitting the type, and
+    // the amount is shown alongside the status so scale is clear too.
+    const pay = payMap[r.id] || {};
+    const paymentStatusPart = (label, dueAmount, status) => {
+      const due = Number(dueAmount) || 0;
+      if (due <= 0) return `${label}: N/A`;
+      if (!status) return `${label}: Not Yet Initiated (₹${due})`;
+      return `${label}: ${status} (₹${due})`;
+    };
+    out['Payment Status'] = [
+      paymentStatusPart('Customer', r.pn_customer_payment, pay['Customer']),
+      paymentStatusPart('Broker', r.pn_broker_payment, pay['Broker']),
+    ].join(' | ');
+    out['Vehicle Park Location'] = r.ud_vehicle_parking || '';
+    return out;
+  });
+}
+
+// "Choose Columns" now lives on this card (Ramvir, Sept 2026) — the
+// Purchased Vehicles report was removed from here since the Purchased tab
+// itself now has its own Columns picker + Download Excel (JS-Tracking.html),
+// making this duplicate. All Leads keeps every raw DB column available to
+// pick from (ALL_LEADS_COLUMNS above), same shared mechanic as Purchased.
+async function exportLeadsReport() {
+  const data = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_master_data').select('*').order('created_at', { ascending: false }), 'created_at'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  const resolved = await resolveReportRows(data);
+  exportTableColumnsToExcel('allLeads', resolved, ALL_LEADS_COLUMNS, 'rewire-dms-leads.xlsx', 'Leads', ['phone', 'kyc_account_number']);
+}
+async function exportPaymentsReport() {
+  const data = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_payments').select('*, lead:rewire_master_data!rewire_payments_lead_id_fkey(lead_no, customer_name, val_vehicle_number)'), 'created_at'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  downloadCsv('rewire-dms-payments-pending.csv', (data || []).map(p => ({ lead_no: p.lead?.lead_no, customer_name: p.lead?.customer_name, vehicle_number: p.lead?.val_vehicle_number, payment_type: p.payment_type, amount: p.amount, status: p.status, utr_no: p.utr_no })));
+}
+async function exportPaymentsArchiveReport() {
+  const data = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_payments_archive').select('*, lead:rewire_master_data!rewire_payments_archive_lead_id_fkey(lead_no, customer_name, val_vehicle_number)'), 'completed_on'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  downloadCsv('rewire-dms-payments-archive.csv', (data || []).map(p => ({ lead_no: p.lead?.lead_no, customer_name: p.lead?.customer_name, vehicle_number: p.lead?.val_vehicle_number, payment_type: p.payment_type, amount: p.amount, utr_no: p.utr_no, completed_on: p.completed_on })));
+}
+async function exportPartnersReport() {
+  const data = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_partners').select('*'), 'created_at'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  downloadXlsx('rewire-dms-partners.xlsx', data, 'Partners', ['mobile', 'account_number']);
+}
+
+// ------------------------------------------------------------
+// RC TRACKING REPORT — every vehicle that's reached RC tracking
+// (post-delivery, Physical RC), with the latest tracking update and a
+// status-breakdown summary sheet.
+// ------------------------------------------------------------
+async function exportRcTrackingReport() {
+  const leads = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, phone, city, val_vehicle_type, val_vehicle_number, val_make, val_model_variant,
+        rc_status, created_at, rc_dispatch_mode, rc_carried_by, rc_courier_name, rc_pod_no, rc_dispatch_date,
+        rewire_partners(partner_name)`)
+      .eq('ud_status', 'Complete').eq('ud_rc_received_type', 'Physical RC').neq('overall_status', 'Closed Lost'), 'created_at'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (leads === null) return;
+  if (!leads.length) { notify('No RC Tracking data to export.', { icon: 'info' }); return; }
+
+  // rc_courier_details on rewire_rc_tracking is a dead field (nothing in
+  // the live form ever writes to it) — dispatch info actually lives on
+  // rewire_master_data itself (rc_dispatch_mode added this week for the
+  // Courier vs By Hand split).
+  const tracking = await fetchAllRows((from, to) => sb.from('rewire_rc_tracking').select('*').order('tracked_on', { ascending: false }).range(from, to));
+
+  const details = leads.map(l => {
+    const t = (tracking || []).find(tr => tr.lead_id === l.id);
+    return {
+      'Lead No.': l.lead_no, 'Customer': l.customer_name, 'Phone': l.phone, 'City': l.city,
+      'Vehicle Type': l.val_vehicle_type, 'Vehicle No.': l.val_vehicle_number, 'Make': l.val_make, 'Model': l.val_model_variant,
+      'Partner': l.rewire_partners ? l.rewire_partners.partner_name : '', 'RC Status': l.rc_status || 'Pending',
+      'Dispatch Mode': l.rc_dispatch_mode || '', 'Courier Name': (l.rc_dispatch_mode && l.rc_dispatch_mode !== 'Courier') ? '' : (l.rc_courier_name || ''),
+      'POD No.': (l.rc_dispatch_mode && l.rc_dispatch_mode !== 'Courier') ? '' : (l.rc_pod_no || ''), 'Carried By': (l.rc_dispatch_mode && l.rc_dispatch_mode !== 'Courier') ? (l.rc_carried_by || '') : '',
+      'Dispatch Date': l.rc_dispatch_date || '', 'Tracked On': t ? t.tracked_on : '', 'Created On': l.created_at,
+    };
+  });
+  const statusCounts = {};
+  leads.forEach(l => { const s = l.rc_status || 'Pending'; statusCounts[s] = (statusCounts[s] || 0) + 1; });
+  const summary = Object.entries(statusCounts).map(([status, count]) => ({ 'RC Status': status, 'Count': count }));
+
+  downloadXlsxMulti('rewire-dms-rc-tracking-report.xlsx', [{ name: 'Details', rows: details }, { name: 'Summary', rows: summary }]);
+}
+
+// ------------------------------------------------------------
+// ACCESSORIES REGISTER REPORT — one row per lead per checked item
+// (Valuation value vs Delivery value, at what stage each was recorded,
+// Match/Shortage/Excess), plus the deduction amount actually applied,
+// reusing the exact same computeAccessoryComparisons() logic Accessories
+// Check/Head Approval already show on screen.
+// ------------------------------------------------------------
+async function exportAccessoriesRegisterReport() {
+  const leads = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, val_vehicle_type, val_vehicle_number, val_make, val_model_variant,
+        val_spare_wheel, ud_spare_wheel, ud_spare_wheel_photo_url,
+        val_stereo, ud_stereo, ud_stereo_photo_url,
+        val_speakers, ud_speakers, ud_speakers_photo_url,
+        val_tool_kit, ud_tool_kit, ud_tool_kit_photo_url,
+        val_battery, ud_battery, ud_battery_photo_url,
+        val_alloy_wheel, ud_alloy_wheel, ud_alloy_wheel_photo_url,
+        val_fuel_type, ud_cylinder_type, ud_cylinder_photo_url,
+        val_vehicle_operational, ud_vehicle_operational, val_vehicle_accidental, ud_vehicle_accidental,
+        accessories_check_status, accessories_check_on, accessories_deduction_amount, accessories_deduction_reason`)
+      .eq('ud_status', 'Complete'), 'accessories_check_on'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (leads === null) return;
+  if (!leads.length) { notify('No delivered vehicles to export.', { icon: 'info' }); return; }
+
+  // Accessories are checked at 2 separate stages — this Manager-Approval-
+  // stage check (accessories_check_status, compared above via
+  // computeAccessoryComparisons) AND a second, independent check when the
+  // vehicle physically arrives at the plant (rewire_vehicle_receipt's
+  // plant_* columns, filled via openPlantAccessoriesCheck/
+  // PLANT_ACCESSORY_ITEMS — JS-Operations.html). This report previously
+  // only reflected the first — added the Received at Plant half so a
+  // single "Item" row shows both stages' findings side by side, not just
+  // Valuation vs Delivery. Paginating the whole receipts table (not
+  // .in('lead_id', leadIds)) for the same "URL too long" reason already
+  // documented on renderReceivedPlantSection.
+  const receipts = await fetchAllRows((from, to) => sb.from('rewire_vehicle_receipt').select('*').range(from, to))
+    .catch(err => { console.error(err); return []; });
+  const receiptByLead = {};
+  (receipts || []).forEach(r => { receiptByLead[r.lead_id] = r; });
+  const plantKeyByLabel = {};
+  PLANT_ACCESSORY_ITEMS.forEach(([label, , , plantKey]) => { plantKeyByLabel[label] = plantKey; });
+
+  const details = [];
+  leads.forEach(l => {
+    const receipt = receiptByLead[l.id];
+    const rows = computeAccessoryComparisons(l);
+    rows.forEach(r => {
+      const plantKey = plantKeyByLabel[r.label];
+      const plantVal = plantKey && receipt ? receipt[plantKey] : null;
+      details.push({
+        'Lead No.': l.lead_no, 'Customer': l.customer_name, 'Vehicle No.': l.val_vehicle_number,
+        'Make': l.val_make, 'Model': l.val_model_variant, 'Item': r.label,
+        'At Valuation': r.valVal || '—', 'At Delivery': r.udVal || '—', 'Result': r.kind,
+        'Accessories Check Status': l.accessories_check_status || 'Pending',
+        'Checked On': l.accessories_check_on || '', 'Debit Amount': l.accessories_deduction_amount || 0,
+        'Debit Reason': l.accessories_deduction_reason || '',
+        'At Plant': plantVal || (plantKey ? 'Pending' : '—'),
+        'Received at Plant Status': receipt && receipt.accessories_filled_on ? 'Done' : 'Pending',
+        'Plant Checked On': (receipt && receipt.accessories_filled_on) || '',
+        'Plant Debit Amount': (receipt && receipt.plant_debit_amount) || 0,
+        'Plant Debit Reason': (receipt && receipt.plant_debit_reason) || '',
+      });
+    });
+  });
+  const summary = leads.map(l => {
+    const mismatches = computeAccessoryComparisons(l).filter(r => r.kind !== 'match');
+    const receipt = receiptByLead[l.id];
+    return {
+      'Lead No.': l.lead_no, 'Vehicle No.': l.val_vehicle_number,
+      'Mismatches': mismatches.length, 'Shortages': mismatches.filter(m => m.kind === 'shortage').length,
+      'Excess': mismatches.filter(m => m.kind === 'excess').length,
+      'Debit Amount': l.accessories_deduction_amount || 0, 'Status': l.accessories_check_status || 'Pending',
+      'Received at Plant Status': receipt && receipt.accessories_filled_on ? 'Done' : 'Pending',
+      'Plant Debit Amount': (receipt && receipt.plant_debit_amount) || 0,
+    };
+  });
+
+  downloadXlsxMulti('rewire-dms-accessories-register.xlsx', [{ name: 'Summary by Lead', rows: summary }, { name: 'Details (All Items)', rows: details }]);
+}
+
+// ------------------------------------------------------------
+// DEBIT REGISTER (Ramvir, Sept 2026) — read-only summary of every debit
+// entered at the Accessories Check stage and, separately, at Received at
+// Plant. Own sidebar item ('debit-register' gate) with 2 sub-tabs, kept
+// deliberately independent of the Reports section and of the 'accessories'/
+// 'pipeline-accessories' gates that control the operational forms — see
+// showDebitRegisterTab()/routeToDebitRegister() (JS-Wiring.html). Both
+// tabs only list rows where a debit was actually entered (> 0), not every
+// lead — this is an audit list, not a general register. View-only: nothing
+// here writes anywhere, debits are still only ever entered from the real
+// Accessories Check / Received at Plant forms.
+//
+// Scoping (Ramvir's explicit instruction): PE sees only their own leads,
+// Manager sees only their own team, Admin/Head/other privileged roles see
+// everything. rewire_master_data's RLS already restricts PE's SELECT to
+// pe_id = self automatically, so no extra filter is needed for PE there —
+// but RLS lets EVERY Manager see EVERY row org-wide (see master_select
+// policy), so Manager needs an explicit .eq('manager_id', ...) filter here,
+// same pattern already used for Dashboard's managerFilter. For the plant
+// tab, rewire_vehicle_receipt has its own new PE-scoped read-only RLS
+// policy (vehicle_receipt_pe_select_own, added alongside this feature)
+// since PE previously had zero access to that table at all; Manager again
+// needs the explicit filter since that table's RLS doesn't scope Manager
+// by team either.
+function debitRegisterScope() {
+  const isPE = currentProfile && currentProfile.role === 'PE';
+  const isManager = currentProfile && currentProfile.role === 'Manager';
+  return { isPE, isManager, managerId: isManager ? currentProfile.id : null };
+}
+
+// Small shared helper — fetches just the id/name we need for a set of
+// "who did this" user IDs, rather than pulling the whole rewire_user_profiles
+// table. Works for any role (Admin/Back Office/etc. can perform these
+// checks too, not just PE/Manager), unlike reusing allPEs/allManagers which
+// only cover those 2 roles.
+async function lookupProfileNames(ids) {
+  const uniqueIds = Array.from(new Set((ids || []).filter(Boolean)));
+  if (!uniqueIds.length) return {};
+  const { data } = await sb.from('rewire_user_profiles').select('id, name').in('id', uniqueIds);
+  const byId = {};
+  (data || []).forEach(p => { byId[p.id] = p.name; });
+  return byId;
+}
+
+const fmtInr = (v) => v ? Number(v).toLocaleString('en-IN') : '0';
+const fmtDrDate = (v) => v ? new Date(v).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+
+// Debit Reason enrichment (Ramvir, Sept 2026 request) — the reason text is
+// free-typed at Accessories Check / Received at Plant time and, when the
+// deduction comes out of the broker's share, starts with "Broker Payment: …"
+// without naming which broker. Slots the actual broker name in right after
+// the label: "Broker Payment (Suresh Traders): -₹1000 — …". Broker name
+// comes from lead.pn_partner_name (the broker actually picked at Price
+// Negotiation — same field resendInstantPaymentEmail() etc. already use).
+// Customer Payment is deliberately left untouched (Ramvir, Sept 2026
+// follow-up correction) — the Customer column right next to Lead No. in
+// this same table already shows the customer's name, so repeating it
+// inside the reason text is redundant.
+function enrichDebitReason(reason, customerName, brokerName) {
+  if (!reason) return reason;
+  let out = reason;
+  if (brokerName) out = out.replace(/Broker Payment/i, `Broker Payment (${brokerName})`);
+  return out;
+}
+
+// Item-level columns needed to run computeAccessoryComparisons() (defined
+// in JS-Operations.html, reused here as-is — same source of truth as the
+// live Accessories Check screen and the Accessories Register export, so
+// this "Shortage" summary can never disagree with either of those) —
+// selected in addition to the debit columns themselves.
+const ACCESSORY_COMPARE_COLS = `val_spare_wheel, ud_spare_wheel, ud_spare_wheel_photo_url,
+  val_stereo, ud_stereo, ud_stereo_photo_url, val_speakers, ud_speakers, ud_speakers_photo_url,
+  val_tool_kit, ud_tool_kit, ud_tool_kit_photo_url, val_battery, ud_battery, ud_battery_photo_url,
+  val_alloy_wheel, ud_alloy_wheel, ud_alloy_wheel_photo_url, val_fuel_type, ud_cylinder_type, ud_cylinder_photo_url,
+  val_vehicle_operational, ud_vehicle_operational, val_vehicle_accidental, ud_vehicle_accidental`;
+
+// Cache of the last-rendered rows' full lead objects, keyed by lead id —
+// lets the Lead No. click popups (showDrAccessoriesItemPopup/
+// showDrPlantItemPopup below) re-run the same comparison without a second
+// round-trip, since we already have every column needed right here.
+window._drAccessoriesLeadsById = {};
+window._drPlantLeadsById = {};
+window._drPlantReceiptsById = {};
+
+async function renderDebitRegisterAccessoriesTab() {
+  const { isPE, isManager, managerId } = debitRegisterScope();
+  document.getElementById('countDrAccessories').textContent = 'Loading…';
+  let query = sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_number, pn_partner_name, accessories_deduction_amount, accessories_deduction_reason,
+      accessories_check_remarks, accessories_check_by, accessories_check_on, accessories_manager_remarks,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name), ${ACCESSORY_COMPARE_COLS}`)
+    .gt('accessories_deduction_amount', 0)
+    .order('accessories_check_on', { ascending: false });
+  if (isManager) query = query.eq('manager_id', managerId);
+  // isPE needs no explicit filter — rewire_master_data's RLS already
+  // restricts a PE's SELECT to pe_id = self.
+  const rows = await fetchAllRows((from, to) => query.range(from, to)).catch(err => { console.error(err); return []; });
+  window._drAccessoriesLeadsById = {};
+  (rows || []).forEach(r => { window._drAccessoriesLeadsById[r.id] = r; });
+  const nameById = await lookupProfileNames((rows || []).map(r => r.accessories_check_by));
+  document.getElementById('countDrAccessories').textContent = (rows || []).length + ' debit(s)';
+  const total = (rows || []).reduce((s, r) => s + (Number(r.accessories_deduction_amount) || 0), 0);
+  document.getElementById('tbodyDrAccessories').innerHTML = (rows && rows.length)
+    ? rows.map(r => {
+        const shortageLabels = computeAccessoryComparisons(r).filter(c => c.kind === 'shortage').map(c => c.label).join(', ') || '—';
+        return `<tr>
+        <td data-col="lead_no"><span class="lid" style="cursor:pointer;text-decoration:underline;" onclick="showDrAccessoriesItemPopup('${r.id}')" title="Click to see item-by-item comparison">${r.lead_no}</span></td>
+        <td data-col="customer">${r.customer_name || '—'}</td>
+        <td data-col="vehicle">${r.val_vehicle_number || '—'}</td>
+        <td data-col="pe">${(r.pe && r.pe.name) || '—'}</td>
+        <td data-col="amount" style="font-weight:700;color:#dc2626;">₹${fmtInr(r.accessories_deduction_amount)}</td>
+        <td data-col="reason">${enrichDebitReason(r.accessories_deduction_reason, r.customer_name, r.pn_partner_name) || '—'}</td>
+        <td data-col="shortage">${shortageLabels}</td>
+        <td data-col="remarks">${r.accessories_check_remarks || '—'}</td>
+        <td data-col="mgr_remarks">${r.accessories_manager_remarks || '—'}</td>
+        <td data-col="by">${nameById[r.accessories_check_by] || '—'}</td>
+        <td data-col="on">${fmtDrDate(r.accessories_check_on)}</td>
+      </tr>`;
+      }).join('')
+    : '<tr><td colspan="11" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No debits recorded.</td></tr>';
+  document.getElementById('tfootDrAccessories').innerHTML = (rows && rows.length)
+    ? `<tr style="background:#1d4ed8;color:#fff;"><td colspan="4" style="padding:10px 12px;font-weight:700;">Total</td><td style="padding:10px 12px;font-weight:700;">₹${fmtInr(total)}</td><td colspan="6"></td></tr>`
+    : '';
+}
+
+// TRANSPORTER tab (Ramvir, Oct 2026) — same shape as the Accessories Check
+// tab above, but filters on accessories_deduct_transporter instead of the
+// rolled-up accessories_deduction_amount, since this tab should ONLY list
+// debits that are specifically recoverable from the Transporter (a lead can
+// have a customer/broker/cod/cash deduction too without appearing here).
+window._drTransporterLeadsById = {};
+async function renderDebitRegisterTransporterTab() {
+  const { isPE, isManager, managerId } = debitRegisterScope();
+  document.getElementById('countDrTransporter').textContent = 'Loading…';
+  let query = sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_number, logistics_transporter_name, accessories_deduct_transporter, accessories_deduction_reason,
+      accessories_check_remarks, accessories_check_by, accessories_check_on, ${ACCESSORY_COMPARE_COLS}`)
+    .gt('accessories_deduct_transporter', 0)
+    .order('accessories_check_on', { ascending: false });
+  if (isManager) query = query.eq('manager_id', managerId);
+  const rows = await fetchAllRows((from, to) => query.range(from, to)).catch(err => { console.error(err); return []; });
+  window._drTransporterLeadsById = {};
+  (rows || []).forEach(r => { window._drTransporterLeadsById[r.id] = r; });
+  const nameById = await lookupProfileNames((rows || []).map(r => r.accessories_check_by));
+  document.getElementById('countDrTransporter').textContent = (rows || []).length + ' debit(s)';
+  const total = (rows || []).reduce((s, r) => s + (Number(r.accessories_deduct_transporter) || 0), 0);
+  document.getElementById('tbodyDrTransporter').innerHTML = (rows && rows.length)
+    ? rows.map(r => {
+        const shortageLabels = computeAccessoryComparisons(r).filter(c => c.kind === 'shortage').map(c => c.label).join(', ') || '—';
+        return `<tr>
+        <td data-col="lead_no"><span class="lid" style="cursor:pointer;text-decoration:underline;" onclick="showDrAccessoriesItemPopup('${r.id}', true)" title="Click to see item-by-item comparison">${r.lead_no}</span></td>
+        <td data-col="customer">${r.customer_name || '—'}</td>
+        <td data-col="vehicle">${r.val_vehicle_number || '—'}</td>
+        <td data-col="transporter">${r.logistics_transporter_name || '—'}</td>
+        <td data-col="amount" style="font-weight:700;color:#dc2626;">₹${fmtInr(r.accessories_deduct_transporter)}</td>
+        <td data-col="reason">${r.accessories_deduction_reason || '—'}</td>
+        <td data-col="shortage">${shortageLabels}</td>
+        <td data-col="remarks">${r.accessories_check_remarks || '—'}</td>
+        <td data-col="by">${nameById[r.accessories_check_by] || '—'}</td>
+        <td data-col="on">${fmtDrDate(r.accessories_check_on)}</td>
+      </tr>`;
+      }).join('')
+    : '<tr><td colspan="10" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No transporter debits recorded.</td></tr>';
+  document.getElementById('tfootDrTransporter').innerHTML = (rows && rows.length)
+    ? `<tr style="background:#1d4ed8;color:#fff;"><td colspan="4" style="padding:10px 12px;font-weight:700;">Total</td><td style="padding:10px 12px;font-weight:700;">₹${fmtInr(total)}</td><td colspan="5"></td></tr>`
+    : '';
+}
+
+// Lead No. click popup (Ramvir, Sept 2026 request) — same Item/At Valuation/
+// At Delivery/Result table as the standalone Accessories Check screen
+// (openAccessoriesCheck, JS-Operations.html), built from the same cached
+// lead row and the same computeAccessoryComparisons()/accessoryKindBadge()
+// helpers — so this can never show a different verdict than the actual
+// check screen did.
+function showDrAccessoriesItemPopup(leadId, fromTransporterTab) {
+  const lead = fromTransporterTab ? window._drTransporterLeadsById[leadId] : window._drAccessoriesLeadsById[leadId];
+  if (!lead) { notify('Lead data not loaded — refresh and try again.', { icon: 'error' }); return; }
+  const rows = computeAccessoryComparisons(lead);
+  const tableHtml = `<div style="max-height:400px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;text-align:left;">
+      <thead style="position:sticky;top:0;background:#f8fafc;">
+        <tr><th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Item</th>
+          <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">At Valuation</th>
+          <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">At Delivery</th>
+          <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Result</th></tr>
+      </thead>
+      <tbody>
+        ${rows.map(r => `<tr style="${r.kind !== 'match' ? 'background:#fef2f2;' : ''}">
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;font-weight:500;">${r.label}</td>
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.valVal || '—'}</td>
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;${r.kind !== 'match' ? 'color:#dc2626;font-weight:700;' : ''}">${r.udVal || '—'}</td>
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${accessoryKindBadge(r.kind)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>`;
+  Swal.fire({
+    title: `${lead.lead_no} — Accessories Comparison`,
+    html: `<div style="text-align:left;">${tableHtml}</div>`,
+    width: 620, confirmButtonText: 'Close', confirmButtonColor: '#1d4ed8',
+  });
+}
+
+// Delivery-vs-Plant comparison (Ramvir, Sept 2026 request) — a DIFFERENT
+// stage pair than computeAccessoryComparisons() (which is Valuation-vs-
+// Delivery): the Received at Plant debit is decided by whether an item
+// that was present at Delivery/Upload actually arrived at the plant, not
+// by the earlier Valuation-vs-Delivery check. Mirrors PLANT_ACCESSORY_ITEMS'
+// per-item value semantics (yesno/count/count15) exactly as
+// openPlantAccessoriesCheck() interprets them, so "Shortage" here always
+// matches what that live form would show.
+function computePlantVsDeliveryComparisons(lead, receipt) {
+  return PLANT_ACCESSORY_ITEMS.map(([label, valKey, udKey, plantKey, optType]) => {
+    const udVal = lead[udKey], plantVal = receipt ? receipt[plantKey] : null;
+    let udHas, plantHas;
+    if (optType === 'count' || optType === 'count15') {
+      const udCount = parseInt(udVal, 10), plantCount = parseInt(plantVal, 10);
+      udHas = !isNaN(udCount) && udCount > 0;
+      plantHas = !isNaN(plantCount) && plantCount > 0;
+    } else if (label === 'Cylinder Type') {
+      // ud_cylinder_type stores CNG/LPG (see computeAccessoryComparisons);
+      // plant_cylinder_type is a plain Yes/No field (its PLANT_ACCESSORY_ITEMS
+      // optType is 'yesno', so openPlantAccessoriesCheck renders a Yes/No
+      // dropdown for it, not a CNG/LPG one) — the two sides use different
+      // value vocabularies on purpose, so they need separate "has" checks.
+      udHas = udVal === 'CNG' || udVal === 'LPG';
+      plantHas = plantVal === 'Yes';
+    } else if (label === 'Vehicle Accidental') {
+      // Same inversion as computeAccessoryComparisons — "No" (not
+      // accidental) is the good state on both sides.
+      udHas = udVal === 'No';
+      plantHas = plantVal === 'No';
+    } else {
+      udHas = udVal === 'Yes';
+      plantHas = plantVal === 'Yes';
+    }
+    let kind = 'match';
+    if (udHas && !plantHas) kind = 'shortage';
+    else if (!udHas && plantHas) kind = 'excess';
+    return { label, valVal: lead[valKey], udVal, plantVal, kind };
+  });
+}
+
+async function renderDebitRegisterPlantTab() {
+  const { isPE, isManager, managerId } = debitRegisterScope();
+  document.getElementById('countDrPlant').textContent = 'Loading…';
+  // rewire_vehicle_receipt has no pe_id/manager_id of its own — scoping
+  // needs a join against rewire_master_data via lead_id. Fetched as 2
+  // separate paginated queries (not a single nested select) since the
+  // receipts table has no direct FK relationship usable for PostgREST's
+  // embedded-resource syntax here — same pattern renderReceivedPlantSection/
+  // exportAccessoriesRegisterReport already use for this same pair of tables.
+  const receiptRows = await fetchAllRows((from, to) => sb.from('rewire_vehicle_receipt')
+    .select(`lead_id, plant_debit_amount, plant_debit_reason, plant_accessories_remarks, accessories_filled_by, accessories_filled_on,
+      plant_spare_wheel, plant_stereo, plant_speakers, plant_tool_kit, plant_battery, plant_alloy_wheel,
+      plant_cylinder_type, plant_vehicle_operational, plant_vehicle_accidental`)
+    .gt('plant_debit_amount', 0)
+    .order('accessories_filled_on', { ascending: false })
+    .range(from, to)).catch(err => { console.error(err); return []; });
+  if (!receiptRows || !receiptRows.length) {
+    document.getElementById('countDrPlant').textContent = '0 debit(s)';
+    document.getElementById('tbodyDrPlant').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No debits recorded.</td></tr>';
+    document.getElementById('tfootDrPlant').innerHTML = '';
+    return;
+  }
+  const leadIds = receiptRows.map(r => r.lead_id);
+  let leadQuery = sb.from('rewire_master_data')
+    .select(`id, lead_no, customer_name, val_vehicle_number, manager_id, pn_partner_name,
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name), ${ACCESSORY_COMPARE_COLS}`)
+    .in('id', leadIds);
+  if (isManager) leadQuery = leadQuery.eq('manager_id', managerId);
+  // isPE needs no explicit filter here either — the new
+  // vehicle_receipt_pe_select_own RLS policy already limited receiptRows
+  // above to this PE's own leads, and rewire_master_data's own RLS limits
+  // this second query to the same PE's leads too.
+  const { data: leads } = await leadQuery;
+  const leadById = {};
+  (leads || []).forEach(l => { leadById[l.id] = l; });
+  const rows = receiptRows.filter(r => leadById[r.lead_id]);
+  window._drPlantLeadsById = leadById;
+  window._drPlantReceiptsById = {};
+  rows.forEach(r => { window._drPlantReceiptsById[r.lead_id] = r; });
+  const nameById = await lookupProfileNames(rows.map(r => r.accessories_filled_by));
+  document.getElementById('countDrPlant').textContent = rows.length + ' debit(s)';
+  const total = rows.reduce((s, r) => s + (Number(r.plant_debit_amount) || 0), 0);
+  document.getElementById('tbodyDrPlant').innerHTML = rows.length
+    ? rows.map(r => {
+        const l = leadById[r.lead_id];
+        const shortageLabels = computePlantVsDeliveryComparisons(l, r).filter(c => c.kind === 'shortage').map(c => c.label).join(', ') || '—';
+        return `<tr>
+        <td data-col="lead_no"><span class="lid" style="cursor:pointer;text-decoration:underline;" onclick="showDrPlantItemPopup('${r.lead_id}')" title="Click to see item-by-item comparison">${l.lead_no}</span></td>
+        <td data-col="customer">${l.customer_name || '—'}</td>
+        <td data-col="vehicle">${l.val_vehicle_number || '—'}</td>
+        <td data-col="pe">${(l.pe && l.pe.name) || '—'}</td>
+        <td data-col="amount" style="font-weight:700;color:#dc2626;">₹${fmtInr(r.plant_debit_amount)}</td>
+        <td data-col="reason">${enrichDebitReason(r.plant_debit_reason, l.customer_name, l.pn_partner_name) || '—'}</td>
+        <td data-col="shortage">${shortageLabels}</td>
+        <td data-col="remarks">${r.plant_accessories_remarks || '—'}</td>
+        <td data-col="by">${nameById[r.accessories_filled_by] || '—'}</td>
+        <td data-col="on">${fmtDrDate(r.accessories_filled_on)}</td>
+      </tr>`;
+      }).join('')
+    : '<tr><td colspan="10" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No debits recorded.</td></tr>';
+  document.getElementById('tfootDrPlant').innerHTML = rows.length
+    ? `<tr style="background:#1d4ed8;color:#fff;"><td colspan="4" style="padding:10px 12px;font-weight:700;">Total</td><td style="padding:10px 12px;font-weight:700;">₹${fmtInr(total)}</td><td colspan="5"></td></tr>`
+    : '';
+}
+
+// Lead No. click popup for the Plant tab — shows the full 3-stage chain
+// (Ramvir, Sept 2026: "Valuation ke time ye > Delivery ke time ye >
+// Received at Plant ke time ye") in one table: Valuation, Delivery, Plant,
+// plus a Result badge reflecting the Delivery→Plant hop (the one this
+// tab's debit is actually based on).
+function showDrPlantItemPopup(leadId) {
+  const lead = window._drPlantLeadsById[leadId];
+  const receipt = window._drPlantReceiptsById[leadId];
+  if (!lead) { notify('Lead data not loaded — refresh and try again.', { icon: 'error' }); return; }
+  const rows = computePlantVsDeliveryComparisons(lead, receipt);
+  const tableHtml = `<div style="max-height:400px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;text-align:left;">
+      <thead style="position:sticky;top:0;background:#f8fafc;">
+        <tr><th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Item</th>
+          <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">At Valuation</th>
+          <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">At Delivery</th>
+          <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">At Plant</th>
+          <th style="padding:7px 10px;border-bottom:1px solid #e2e8f0;">Result</th></tr>
+      </thead>
+      <tbody>
+        ${rows.map(r => `<tr style="${r.kind !== 'match' ? 'background:#fef2f2;' : ''}">
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;font-weight:500;">${r.label}</td>
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.valVal || '—'}</td>
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${r.udVal || '—'}</td>
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;${r.kind !== 'match' ? 'color:#dc2626;font-weight:700;' : ''}">${r.plantVal || '—'}</td>
+          <td style="padding:6px 10px;border-bottom:0.5px solid #f1f5f9;">${accessoryKindBadge(r.kind)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>`;
+  Swal.fire({
+    title: `${lead.lead_no} — Valuation / Delivery / Plant Comparison`,
+    html: `<div style="text-align:left;">${tableHtml}</div>`,
+    width: 700, confirmButtonText: 'Close', confirmButtonColor: '#1d4ed8',
+  });
+}
+
+// ------------------------------------------------------------
+// CVS vs COD REPORT — raw entries plus a comparison summary (CVS vs
+// COD counts, and pending vs completed within each). Was "COD vs CVS
+// Report" — renamed and column/type order swapped (CVS first, then COD)
+// per Ramvir's request (Sept 2026). Replaces the old plain "COD / CVS"
+// report card — that CSV export is now removed since this one already
+// covers the same data plus a summary breakdown.
+// ------------------------------------------------------------
+async function exportCvsVsCodReport() {
+  const data = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_cod_cvs').select('*'), 'filled_on'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  if (!data.length) { notify('No COD/CVS data to export.', { icon: 'info' }); return; }
+
+  // "Mon-YY" label, same style cvsVsCodFyBuckets() uses for its bucket
+  // labels — kept as its own column (not just the raw date) so the sheet
+  // can be grouped/filtered by month directly in Excel (Ramvir, Sept 2026).
+  const monthLabel = (dateStr) => {
+    if (!dateStr) return '';
+    const d = new Date(dateStr);
+    if (isNaN(d)) return '';
+    return d.toLocaleString('en', { month: 'short' }) + '-' + String(d.getFullYear()).slice(-2);
+  };
+
+  const details = data.map(r => ({
+    'Registration No.': r.registration_number, 'Type': r.upload_type, 'CVS/COD Date': r.cod_cvs_date,
+    'Month': monthLabel(r.cod_cvs_date),
+    'CVS Number': r.cvs_number, 'COD Number': r.cod_number,
+    // uploaded_in_dms_rewire holds the actual DMS/Rewire reference number
+    // (text), not a boolean — show the real value, not a Yes/No coercion.
+    'DMS Rewire No.': r.uploaded_in_dms_rewire || 'Pending', 'Filled On': r.filled_on,
+  }));
+  const types = ['CVS', 'COD'];
+  const summary = types.map(type => {
+    const rows = data.filter(r => r.upload_type === type);
+    return {
+      'Type': type, 'Total': rows.length,
+      'Completed (Uploaded in DMS)': rows.filter(r => r.uploaded_in_dms_rewire).length,
+      'Pending': rows.filter(r => !r.uploaded_in_dms_rewire).length,
+    };
+  });
+
+  // "COD vs CVS Gap" sheet (Ramvir, Sept 2026) — one row per vehicle
+  // (registration_number), showing COD No. / CVS No. / DMS Rewire No.
+  // side by side so a missing CVS-for-a-COD (or vice versa) is visible
+  // at a glance, instead of having to cross-reference two separate rows
+  // in the Details sheet. rewire_cod_cvs isn't linked by lead_id — only
+  // by registration_number/val_vehicle_number (same join already used by
+  // exportCodVsPurchasedReport/exportCodPendingReport below) — so the
+  // DMS Rewire No. (lead_no) is looked up from rewire_master_data here.
+  const byReg = {};
+  data.forEach(r => {
+    const reg = (r.registration_number || '').trim().toUpperCase();
+    if (!reg) return;
+    byReg[reg] = byReg[reg] || { cod: null, cvs: null };
+    if (r.upload_type === 'COD') byReg[reg].cod = r;
+    else if (r.upload_type === 'CVS') byReg[reg].cvs = r;
+  });
+  const allRegNos = Object.keys(byReg);
+  const leadByReg = {};
+  const gapChunkSize = 150;
+  for (let i = 0; i < allRegNos.length; i += gapChunkSize) {
+    const chunk = allRegNos.slice(i, i + gapChunkSize);
+    const { data: leadRows, error: leadErr } = await sb.from('rewire_master_data')
+      .select('lead_no, val_vehicle_number').in('val_vehicle_number', chunk);
+    if (leadErr) { console.error(leadErr); continue; }
+    (leadRows || []).forEach(l => { leadByReg[(l.val_vehicle_number || '').trim().toUpperCase()] = l.lead_no; });
+  }
+  const gapReport = allRegNos.map(reg => {
+    const { cod, cvs } = byReg[reg];
+    let gap = 'OK';
+    if (cod && !cvs) gap = 'CVS Missing';
+    else if (!cod && cvs) gap = 'COD Missing';
+    // Month = whichever date is actually present (COD's own date takes
+    // priority since a "CVS Missing" row only has a COD date anyway).
+    const dateForMonth = (cod && cod.cod_cvs_date) || (cvs && cvs.cod_cvs_date) || null;
+    return {
+      'Vehicle No.': reg,
+      'DMS Rewire No.': leadByReg[reg] || 'Not Found in DMS',
+      'COD No.': cod ? (cod.cod_number || '') : '',
+      'COD Date': cod ? (cod.cod_cvs_date || '') : '',
+      'CVS No.': cvs ? (cvs.cvs_number || '') : '',
+      'CVS Date': cvs ? (cvs.cod_cvs_date || '') : '',
+      'Month': monthLabel(dateForMonth),
+      'Gap': gap,
+    };
+  }).sort((a, b) => (a['Gap'] === 'OK' ? 1 : 0) - (b['Gap'] === 'OK' ? 1 : 0) || a['Vehicle No.'].localeCompare(b['Vehicle No.']));
+  const gapMissingCount = gapReport.filter(r => r['Gap'] !== 'OK').length;
+  gapReport.push({
+    'Vehicle No.': '', 'DMS Rewire No.': '', 'COD No.': '', 'COD Date': '', 'CVS No.': '', 'CVS Date': '', 'Month': '',
+    'Gap': `Total: ${gapReport.length} vehicles | ${gapMissingCount} with a gap`,
+  });
+
+  // Month-wise sheet (Ramvir, Sept 2026) — same FY (Apr-Mar) bucketing as
+  // the on-screen "CVS vs COD — Monthly Summary" widget (Dashboard +
+  // Reports tab, cvsVsCodFyBuckets() above), so the Excel export and the
+  // live widget always agree. Uses THIS export's own already-fetched
+  // `data` (respects the From/To date filter) rather than re-fetching via
+  // loadCvsVsCodRows(), which deliberately ignores that filter for the
+  // always-current live widget.
+  const monthlyBuckets = cvsVsCodFyBuckets();
+  const inBucket = (d, b) => (b.start === null || d >= b.start) && d < b.end;
+  // Ramvir, Sept 2026 (2nd pass) — CoDs/CvS/GAP are all now anchored to the
+  // COD's own month using the same "byReg" match built above for the
+  // "COD vs CVS Gap" sheet: CoDs = COD rows dated in this bucket, CvS = how
+  // many of THOSE have a matching CVS (so CvS can never exceed CoDs), GAP =
+  // the rest. The old version tallied CoDs and CvS independently by each
+  // row's own date, which let a month show more CVS than CODs (e.g.
+  // Apr-26: 327 CODs vs 570 CVS) — see identical fix in
+  // renderCvsVsCodMonthlySummary() (this file) for the full reasoning.
+  const hasMatchingCvsM = (r) => {
+    const reg = (r.registration_number || '').trim().toUpperCase();
+    const entry = byReg[reg];
+    return !!(entry && entry.cvs);
+  };
+  let grandCodM = 0, grandCvsM = 0, grandGapM = 0;
+  const monthlySummary = monthlyBuckets.map(b => {
+    const codRowsInBucketM = data.filter(r => r.upload_type === 'COD' && r.cod_cvs_date && inBucket(new Date(r.cod_cvs_date), b));
+    const codCount = codRowsInBucketM.length;
+    const cvsCount = codRowsInBucketM.filter(hasMatchingCvsM).length;
+    const gap = codCount - cvsCount;
+    grandCodM += codCount; grandCvsM += cvsCount; grandGapM += gap;
+    return { 'Month': b.label, 'CoDs': codCount, 'CvS': cvsCount, 'GAP': gap };
+  });
+  monthlySummary.push({ 'Month': 'Total', 'CoDs': grandCodM, 'CvS': grandCvsM, 'GAP': grandGapM });
+
+  downloadXlsxMulti('rewire-dms-cvs-vs-cod-report.xlsx', [
+    { name: 'COD vs CVS Gap', rows: gapReport },
+    { name: 'Monthly Summary', rows: monthlySummary },
+    { name: 'Summary (CVS vs COD)', rows: summary },
+    { name: 'Details', rows: details },
+  ]);
+}
+
+// ------------------------------------------------------------
+// CVS vs COD — MONTHLY SUMMARY (on-screen widget, Dashboard + Reports
+// tab). Ramvir wanted this as a live table matching his own monthly
+// tracker sheet (Sept 2026): Month / CoDs / CvS / GAP, bucketed by
+// India's financial year (April-March) with an "Older than April
+// {FY start}" row at the top and a Total row at the bottom, numbers
+// clickable to a detail popup, plus a Copy button (same pattern as
+// copyTableById()/renderLocationWiseSummary() in JS-Dashboard.html).
+// Bucketed by rewire_cod_cvs.cod_cvs_date (the actual COD/CVS date,
+// not filled_on — same field the "Details" sheet in the Excel export
+// above calls "CVS/COD Date"). Both COD and CVS rows always have this
+// set (verified — 0 nulls), so nothing is silently dropped.
+//
+// Called from two places (renderDashboard() in JS-Dashboard.html, and
+// showSection('reports') below) into two different container ids —
+// the underlying data/buckets are identical, only the DOM target
+// differs, so one function serves both rather than duplicating it.
+// ------------------------------------------------------------
+let _cvsVsCodRows = [];
+
+function cvsVsCodFyBuckets() {
+  const now = new Date();
+  // India's FY runs Apr-Mar. If today is Jan-Mar, we're still in the FY
+  // that started last April.
+  const fyStartYear = (now.getMonth() + 1) >= 4 ? now.getFullYear() : now.getFullYear() - 1;
+  const buckets = [{
+    key: 'older', label: `Older than April ${fyStartYear}`, start: null, end: new Date(fyStartYear, 3, 1),
+  }];
+  for (let i = 0; i < 12; i++) {
+    const start = new Date(fyStartYear, 3 + i, 1);
+    const end = new Date(fyStartYear, 3 + i + 1, 1);
+    buckets.push({
+      key: `${start.getFullYear()}-${start.getMonth() + 1}`,
+      label: start.toLocaleString('en', { month: 'short' }) + '-' + String(start.getFullYear()).slice(-2),
+      start, end,
+    });
+  }
+  return buckets;
+}
+
+async function loadCvsVsCodRows() {
+  const data = await fetchAllRows((from, to) => sb.from('rewire_cod_cvs')
+    .select('registration_number, upload_type, cod_cvs_date, cod_number, cvs_number, uploaded_in_dms_rewire')
+    .in('upload_type', ['COD', 'CVS'])
+    .range(from, to))
+    .catch(e => { console.error(e); return []; });
+  _cvsVsCodRows = data || [];
+  return _cvsVsCodRows;
+}
+
+async function renderCvsVsCodMonthlySummary(containerId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  const tableId = containerId + 'Tbl';
+  const rows = await loadCvsVsCodRows();
+  const buckets = cvsVsCodFyBuckets();
+  const inBucket = (d, b) => (b.start === null || d >= b.start) && d < b.end;
+
+  // Ramvir, Sept 2026 fix (2nd pass) — the first fix only corrected GAP,
+  // but left CODS/CVS as two independent monthly tallies (every COD dated
+  // this month vs every CVS dated this month, regardless of whose COD
+  // they belong to). That's how a month could show CVS > CODs (e.g. Apr-26:
+  // 327 CODs but 570 CVS) — a CVS is routinely filed weeks/months after its
+  // COD, so a lot of April's CVS work was actually clearing OLDER months'
+  // CODs, not April's own. Since "how many vehicles bought this month
+  // already have their CVS" is what CODS/CVS/GAP are actually meant to
+  // answer, every column is now anchored to the COD's own month:
+  //   CODS = vehicles whose COD is dated in this month
+  //   CVS  = of THOSE SAME vehicles, how many already have a CVS (whenever
+  //          it was filed — could be next month, doesn't matter)
+  //   GAP  = CODS - CVS (still can't go negative, since CVS here is a
+  //          subset of CODS by construction, not a second independent count)
+  // A CVS with no COD at all (the rare "COD Missing" anomaly) has no COD
+  // month to belong to, so it doesn't appear in this cohort view — it's
+  // still fully covered by the Excel export's "COD vs CVS Gap" sheet.
+  const byReg = {};
+  rows.forEach(r => {
+    const reg = (r.registration_number || '').trim().toUpperCase();
+    if (!reg) return;
+    byReg[reg] = byReg[reg] || { cod: null, cvs: null };
+    if (r.upload_type === 'COD') byReg[reg].cod = r;
+    else if (r.upload_type === 'CVS') byReg[reg].cvs = r;
+  });
+  const hasMatchingCvs = (r) => {
+    const reg = (r.registration_number || '').trim().toUpperCase();
+    const entry = byReg[reg];
+    return !!(entry && entry.cvs);
+  };
+
+  let grandCod = 0, grandCvs = 0, grandGap = 0;
+  const bodyRows = buckets.map(b => {
+    const codRowsInBucket = rows.filter(r => r.upload_type === 'COD' && inBucket(new Date(r.cod_cvs_date), b));
+    const codCount = codRowsInBucket.length;
+    const cvsCount = codRowsInBucket.filter(hasMatchingCvs).length;
+    const gap = codCount - cvsCount;
+    grandCod += codCount; grandCvs += cvsCount; grandGap += gap;
+    // Gridlines added (Ramvir, Sept 2026) — border on every cell, matching
+    // the app's other data tables, instead of just a border-top on rows.
+    const gridBorder = 'border:1px solid var(--color-border-tertiary);';
+    const cell = (n, type) => n > 0
+      ? `<td style="text-align:center;padding:7px 10px;cursor:pointer;color:#1d4ed8;font-weight:700;${gridBorder}" onclick="openCvsVsCodDetail('${b.key}','${type}')">${n}</td>`
+      : `<td style="text-align:center;padding:7px 10px;color:#cbd5e1;${gridBorder}">0</td>`;
+    // GAP cell is clickable too (Ramvir, Sept 2026) whenever there's
+    // anything to show, even if the raw count happens to be 0 (equal
+    // CoD/CVS counts don't guarantee every individual vehicle matched).
+    const gapCell = `<td style="text-align:center;padding:7px 10px;cursor:pointer;font-weight:700;${gridBorder}${gap > 0 ? 'color:#dc2626;' : ''}" onclick="openCvsVsCodDetail('${b.key}','GAP')">${gap}</td>`;
+    return `<tr>
+      <td style="padding:7px 10px;font-weight:500;${gridBorder}">${b.label}</td>
+      ${cell(codCount, 'COD')}
+      ${cell(cvsCount, 'CVS')}
+      ${gapCell}
+    </tr>`;
+  }).join('');
+
+  const gb = 'border:1px solid var(--color-border-tertiary);';
+  const totalRow = `<tr style="background:#1d4ed8;color:#fff;font-weight:700;">
+    <td style="padding:8px 10px;${gb}">Total</td>
+    <td style="text-align:center;padding:8px 10px;${gb}">${grandCod}</td>
+    <td style="text-align:center;padding:8px 10px;${gb}">${grandCvs}</td>
+    <td style="text-align:center;padding:8px 10px;${gb}">${grandGap}</td>
+  </tr>`;
+
+  container.innerHTML = `<table id="${tableId}" style="width:100%;border-collapse:collapse;font-size:12px;">
+    <thead><tr style="background:#1d4ed8;color:#fff;">
+      <th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.04em;${gb}">Month</th>
+      <th style="padding:8px 10px;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.04em;${gb}">CoDs</th>
+      <th style="padding:8px 10px;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.04em;${gb}">CvS</th>
+      <th style="padding:8px 10px;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.04em;${gb}">GAP</th>
+    </tr></thead>
+    <tbody>${bodyRows}${totalRow}</tbody>
+  </table>`;
+}
+
+function openCvsVsCodDetail(bucketKey, type) {
+  const b = cvsVsCodFyBuckets().find(x => x.key === bucketKey);
+  if (!b) return;
+  const inBucket = (d) => (b.start === null || d >= b.start) && d < b.end;
+  const head4 = document.getElementById('cvsVsCodDetailHead4');
+
+  // Ramvir, Sept 2026 (2nd pass) — every click-through here is now anchored
+  // to the SAME COD-cohort logic as the summary table itself (CODS = COD
+  // rows dated in this bucket; CVS/GAP are both derived from THAT set, not
+  // independently re-filtered by their own date) — otherwise the popups
+  // would show different vehicles than what the on-screen numbers actually
+  // count, the exact confusion this whole redesign was meant to fix.
+  const byReg = {};
+  _cvsVsCodRows.forEach(r => {
+    const reg = (r.registration_number || '').trim().toUpperCase();
+    if (!reg) return;
+    byReg[reg] = byReg[reg] || { cod: null, cvs: null };
+    if (r.upload_type === 'COD') byReg[reg].cod = r;
+    else if (r.upload_type === 'CVS') byReg[reg].cvs = r;
+  });
+  const codRowsInBucket = _cvsVsCodRows.filter(r => r.upload_type === 'COD' && inBucket(new Date(r.cod_cvs_date)));
+
+  if (type === 'GAP') {
+    const gapRows = codRowsInBucket.filter(r => {
+      const reg = (r.registration_number || '').trim().toUpperCase();
+      return !(byReg[reg] && byReg[reg].cvs);
+    });
+    if (head4) head4.textContent = 'Gap';
+    document.getElementById('cvsVsCodDetailTitle').textContent = `Gap — ${b.label} (${gapRows.length})`;
+    document.getElementById('cvsVsCodDetailBody').innerHTML = gapRows.length ? gapRows.map(r => `<tr>
+      <td>${r.registration_number}</td>
+      <td>${r.cod_number || '—'}</td>
+      <td>${r.cod_cvs_date}</td>
+      <td style="color:#dc2626;font-weight:600;">CVS Missing</td>
+    </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--color-text-tertiary);padding:16px;">No gap — every COD from this month already has a CVS.</td></tr>';
+    openModal('cvsVsCodDetailModal');
+    return;
+  }
+
+  if (type === 'CVS') {
+    // The CVS column is now "of this month's CODs, how many have a CVS" —
+    // so its detail popup shows those matched CVS rows (not CVS entries
+    // that merely happen to be DATED in this bucket, which could belong to
+    // a completely different month's COD cohort).
+    const matched = codRowsInBucket
+      .map(r => ({ reg: (r.registration_number || '').trim().toUpperCase(), codRow: r }))
+      .filter(({ reg }) => byReg[reg] && byReg[reg].cvs)
+      .map(({ reg }) => byReg[reg].cvs);
+    if (head4) head4.textContent = 'DMS/Rewire No.';
+    document.getElementById('cvsVsCodDetailTitle').textContent = `CVS — ${b.label} (${matched.length})`;
+    document.getElementById('cvsVsCodDetailBody').innerHTML = matched.length ? matched.map(r => `<tr>
+      <td>${r.registration_number}</td>
+      <td>${r.cvs_number || '—'}</td>
+      <td>${r.cod_cvs_date}</td>
+      <td>${r.uploaded_in_dms_rewire || 'Pending'}</td>
+    </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--color-text-tertiary);padding:16px;">No entries.</td></tr>';
+    openModal('cvsVsCodDetailModal');
+    return;
+  }
+
+  // type === 'COD' — unchanged: every COD dated in this bucket.
+  if (head4) head4.textContent = 'DMS/Rewire No.';
+  document.getElementById('cvsVsCodDetailTitle').textContent = `COD — ${b.label} (${codRowsInBucket.length})`;
+  document.getElementById('cvsVsCodDetailBody').innerHTML = codRowsInBucket.length ? codRowsInBucket.map(r => `<tr>
+    <td>${r.registration_number}</td>
+    <td>${r.cod_number || '—'}</td>
+    <td>${r.cod_cvs_date}</td>
+    <td>${r.uploaded_in_dms_rewire || 'Pending'}</td>
+  </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--color-text-tertiary);padding:16px;">No entries.</td></tr>';
+  openModal('cvsVsCodDetailModal');
+}
+
+// ------------------------------------------------------------
+// COD vs PURCHASED REPORT — every Purchased vehicle, whether a COD entry
+// exists for it yet (rewire_cod_cvs isn't linked by lead_id, only by
+// registration_number/val_vehicle_number, so this is a client-side join
+// same as renderCodCvsSection()/Vehicle Disposal's COD Date column),
+// with a Done/Pending summary.
+// ------------------------------------------------------------
+async function exportCodVsPurchasedReport() {
+  const leads = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_master_data')
+      .select(`lead_no, customer_name, val_vehicle_type, val_vehicle_number, val_make, val_model_variant,
+        ud_filled_on, pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name)`)
+      .eq('overall_status', 'Purchased').not('val_vehicle_number', 'is', null), 'ud_filled_on'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (leads === null) return;
+  if (!leads.length) { notify('No Purchased vehicles to export.', { icon: 'info' }); return; }
+
+  // Only upload_type='COD' rows count as a COD entry here — a vehicle can
+  // also have CVS/DMS-Rewire rows under the same registration number.
+  const regNos = [...new Set(leads.map(l => (l.val_vehicle_number || '').toUpperCase()).filter(Boolean))];
+  const codRows = [];
+  const codChunkSize = 150;
+  for (let i = 0; i < regNos.length; i += codChunkSize) {
+    const chunk = regNos.slice(i, i + codChunkSize);
+    const { data: chunkRows, error: chunkErr } = await sb.from('rewire_cod_cvs')
+      .select('registration_number, cod_number, cod_voucher_no, cod_amount, cod_cvs_date')
+      .eq('upload_type', 'COD').in('registration_number', chunk);
+    if (chunkErr) { console.error(chunkErr); continue; }
+    codRows.push(...(chunkRows || []));
+  }
+  const codByReg = {};
+  codRows.forEach(r => { codByReg[r.registration_number.toUpperCase()] = r; });
+
+  const details = leads.map(l => {
+    const reg = (l.val_vehicle_number || '').toUpperCase();
+    const cod = codByReg[reg];
+    return {
+      'Lead No.': l.lead_no, 'Customer': l.customer_name, 'PE': l.pe ? l.pe.name : '',
+      'Vehicle Type': l.val_vehicle_type, 'Vehicle No.': l.val_vehicle_number, 'Make': l.val_make, 'Model': l.val_model_variant,
+      'Delivered On': l.ud_filled_on, 'COD Status': cod ? 'Done' : 'Pending',
+      'COD No.': cod ? cod.cod_number : '', 'Voucher No.': cod ? cod.cod_voucher_no : '',
+      'Amount': cod ? cod.cod_amount : '', 'COD Issue Date': cod ? cod.cod_cvs_date : '',
+    };
+  });
+  const done = details.filter(d => d['COD Status'] === 'Done').length;
+  const summary = [{
+    'Total Purchased': leads.length, 'COD Done': done, 'COD Pending': leads.length - done,
+    '% Done': leads.length ? ((done / leads.length) * 100).toFixed(1) + '%' : '0%',
+  }];
+
+  downloadXlsxMulti('rewire-dms-cod-vs-purchased-report.xlsx', [{ name: 'Summary', rows: summary }, { name: 'Details', rows: details }]);
+}
+
+// ------------------------------------------------------------
+// COD PENDING REPORT — vehicles where PAYMENT is fully done (every
+// payment type actually due for the lead — Customer if pn_customer_payment
+// > 0, Broker if pn_broker_payment > 0 — is 'Completed' in rewire_payments/
+// rewire_payments_archive) but the COD entry (rewire_cod_cvs, upload_type
+// = 'COD', matched by registration number — same join as
+// exportCodVsPurchasedReport above) is still missing. Month Wise Summary
+// buckets by the month payment was completed in (the later of the due
+// types' completed_on).
+// ------------------------------------------------------------
+async function exportCodPendingReport() {
+  // (Ramvir, Oct 2026 — fixed double date-filter) — this used to ALSO run
+  // the leads query through applyReportDateFilter on ud_filled_on
+  // (Delivery date), while separately re-filtering the eligible list below
+  // on paymentCompletedOn against that same From/To range. Two different
+  // date columns both being AND-ed against one picked range meant a
+  // vehicle delivered outside the range got dropped before its payment
+  // date was ever checked — even though this report's own Month Wise
+  // Summary buckets purely by paymentCompletedOn, confirming that's the
+  // one date dimension this report actually means. Leads are now fetched
+  // unfiltered here; the paymentCompletedOn check further down (which
+  // already existed and is correct) is the only date filter that applies.
+  const leads = await fetchAllRows((from, to) =>
+    sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, val_vehicle_type, val_vehicle_number, val_make, val_model_variant, ud_filled_on,
+        pn_customer_payment, pn_broker_payment,
+        pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name), manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)`)
+      .not('val_vehicle_number', 'is', null)
+      .range(from, to)
+  ).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (leads === null) return;
+  if (!leads.length) { notify('No vehicles to check.', { icon: 'info' }); return; }
+
+  const leadIds = leads.map(l => l.id);
+  let payRows = [];
+  try {
+    const [liveP, archP] = await Promise.all([
+      fetchInChunks('rewire_payments', 'lead_id, payment_type, status, completed_on', 'lead_id', leadIds),
+      fetchInChunks('rewire_payments_archive', 'lead_id, payment_type, status, completed_on', 'lead_id', leadIds),
+    ]);
+    payRows = [...liveP, ...archP];
+  } catch (e) { notify('Export failed: ' + e.message, { icon: 'error' }); return; }
+  const payMap = {};
+  payRows.forEach(p => {
+    payMap[p.lead_id] = payMap[p.lead_id] || {};
+    // Archive rows are the final state — a lead that also has a stale live
+    // row should show the archived (Completed) one, so only overwrite if
+    // this row is itself Completed or nothing's been recorded yet.
+    const existing = payMap[p.lead_id][p.payment_type];
+    if (!existing || p.status === 'Completed') payMap[p.lead_id][p.payment_type] = p;
+  });
+
+  const regNos = [...new Set(leads.map(l => (l.val_vehicle_number || '').toUpperCase()).filter(Boolean))];
+  const codRows = [];
+  const codChunkSize = 150;
+  for (let i = 0; i < regNos.length; i += codChunkSize) {
+    const chunk = regNos.slice(i, i + codChunkSize);
+    const { data: chunkRows, error: chunkErr } = await sb.from('rewire_cod_cvs')
+      .select('registration_number').eq('upload_type', 'COD').in('registration_number', chunk);
+    if (chunkErr) { console.error(chunkErr); continue; }
+    codRows.push(...(chunkRows || []));
+  }
+  const codDoneRegs = new Set(codRows.map(r => r.registration_number.toUpperCase()));
+
+  const fromDate = document.getElementById('reportFromDate').value;
+  const toDate = document.getElementById('reportToDate').value;
+
+  const eligible = [];
+  leads.forEach(l => {
+    const due = [];
+    if (Number(l.pn_customer_payment) > 0) due.push('Customer');
+    if (Number(l.pn_broker_payment) > 0) due.push('Broker');
+    if (!due.length) return; // nothing was ever payable for this lead
+    const pay = payMap[l.id] || {};
+    const allCompleted = due.every(type => pay[type] && pay[type].status === 'Completed');
+    if (!allCompleted) return; // payment itself still pending — out of scope for this report
+
+    const reg = (l.val_vehicle_number || '').toUpperCase();
+    if (codDoneRegs.has(reg)) return; // COD already done — not pending
+
+    const completedDates = due.map(type => pay[type].completed_on).filter(Boolean).sort();
+    const paymentCompletedOn = completedDates.length ? completedDates[completedDates.length - 1] : null;
+
+    // Same IST-vs-UTC boundary bug as istDayStart/istDayEnd (JS-Core.html)
+    // fix elsewhere — paymentCompletedOn comes back from Supabase as a UTC
+    // ISO string, so comparing it against a bare, offset-less fromDate/toDate
+    // string silently dropped/leaked rows right at the day boundary. new
+    // Date(...).toISOString() here converts the IST day boundary to the
+    // correct UTC instant first, same as openPurchaseSummaryDetail() does.
+    if (fromDate && paymentCompletedOn && paymentCompletedOn < new Date(istDayStart(fromDate)).toISOString()) return;
+    if (toDate && paymentCompletedOn && paymentCompletedOn > new Date(istDayEnd(toDate)).toISOString()) return;
+
+    eligible.push({ lead: l, paymentCompletedOn });
+  });
+
+  if (!eligible.length) { notify('No vehicles found where payment is done but COD is pending.', { icon: 'info' }); return; }
+
+  const details = eligible.map(({ lead: l, paymentCompletedOn }) => ({
+    'Lead No.': l.lead_no, 'Customer': l.customer_name, 'PE': l.pe ? l.pe.name : '', 'Manager': l.manager ? l.manager.name : '',
+    'Vehicle Type': l.val_vehicle_type, 'Vehicle No.': l.val_vehicle_number, 'Make': l.val_make, 'Model': l.val_model_variant,
+    'Payment Completed On': paymentCompletedOn || '—', 'COD Status': 'Pending',
+  }));
+
+  const monthCounts = {};
+  eligible.forEach(({ paymentCompletedOn }) => {
+    const key = paymentCompletedOn ? paymentCompletedOn.slice(0, 7) : 'Unknown';
+    monthCounts[key] = (monthCounts[key] || 0) + 1;
+  });
+  const monthSummary = Object.entries(monthCounts).sort((a, b) => a[0].localeCompare(b[0])).map(([month, count]) => ({
+    'Month': month === 'Unknown' ? 'Unknown' : new Date(month + '-01').toLocaleString('en', { month: 'long', year: 'numeric' }),
+    'Vehicles (Payment Done, COD Pending)': count,
+  }));
+  monthSummary.push({ 'Month': 'Total', 'Vehicles (Payment Done, COD Pending)': eligible.length });
+
+  downloadXlsxMulti('rewire-dms-cod-pending-report.xlsx', [{ name: 'Month Wise Summary', rows: monthSummary }, { name: 'Details', rows: details }]);
+}
+
+// ------------------------------------------------------------
+// LOCATION TRACKING REPORT — where delivered vehicles are parked, based
+// on the Vehicle Parking field captured at Upload Delivery, plus a
+// per-location count summary.
+// ------------------------------------------------------------
+async function exportLocationTrackingReport() {
+  const data = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_master_data')
+      .select(`lead_no, customer_name, phone, val_vehicle_type, val_vehicle_number, val_make, val_model_variant,
+        ud_vehicle_parking, ud_vehicle_sub_parking, transportation_type, ud_filled_on, rewire_partners(partner_name)`)
+      .eq('ud_status', 'Complete'), 'ud_filled_on'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  if (!data.length) { notify('No delivered vehicles to export.', { icon: 'info' }); return; }
+
+  // Sub Location added next to Location in both sheets (Ramvir, Sept 2026)
+  // — was previously left out of this report entirely, even though the
+  // live Location Tracking tab (renderLocationTrackingSection(),
+  // JS-Operations.html) already shows it; this export had just never been
+  // updated to match.
+  const details = data.map(l => ({
+    'Lead No.': l.lead_no, 'Customer': l.customer_name, 'Phone': l.phone,
+    'Vehicle Type': l.val_vehicle_type, 'Vehicle No.': l.val_vehicle_number, 'Make': l.val_make, 'Model': l.val_model_variant,
+    'Partner': l.rewire_partners ? l.rewire_partners.partner_name : '',
+    'Vehicle Parking Location': l.ud_vehicle_parking || 'Not recorded',
+    'Sub Location': l.ud_vehicle_sub_parking || '',
+    'Transportation Type': l.transportation_type, 'Delivered On': l.ud_filled_on,
+  }));
+  const locCounts = {};
+  data.forEach(l => {
+    const loc = l.ud_vehicle_parking || 'Not recorded';
+    const sub = l.ud_vehicle_sub_parking || '—';
+    const key = loc + '||' + sub;
+    if (!locCounts[key]) locCounts[key] = { location: loc, subLocation: sub, count: 0 };
+    locCounts[key].count++;
+  });
+  const summary = Object.values(locCounts).sort((a, b) => b.count - a.count)
+    .map(({ location, subLocation, count }) => ({ 'Location': location, 'Sub Location': subLocation, 'Vehicle Count': count }));
+
+  downloadXlsxMulti('rewire-dms-location-tracking-report.xlsx', [{ name: 'Summary by Location', rows: summary }, { name: 'Details', rows: details }]);
+}
+
+// ------------------------------------------------------------
+// TRANSPORTER PAYMENTS REPORT — every dispatched vehicle, with Bill No.,
+// Received at Plant status (rst_no on rewire_vehicle_receipt), Debit
+// Amount (from the plant Accessories Check), and Final Amount — mirrors
+// exactly what renderLogisticsPaymentsSection() shows on screen.
+// ------------------------------------------------------------
+async function exportTransporterPaymentsReport() {
+  const leads = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, val_vehicle_number, logistics_transporter_name, logistics_transporter_vehicle_no,
+        logistics_dispatch_date, logistics_freight_amount, logistics_bill_no, logistics_payment_status, logistics_final_amount,
+        pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name), manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)`)
+      .eq('logistics_status', 'Sent to Plant').not('logistics_transporter_name', 'is', null), 'logistics_dispatch_date'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (leads === null) return;
+  if (!leads.length) { notify('No dispatched vehicles to export.', { icon: 'info' }); return; }
+
+  const receipts = await fetchAllRows((from, to) => sb.from('rewire_vehicle_receipt').select('lead_id, rst_no, plant_debit_amount').range(from, to));
+  const receiptByLead = {};
+  (receipts || []).forEach(r => { receiptByLead[r.lead_id] = r; });
+
+  const details = leads.map(l => {
+    const receipt = receiptByLead[l.id];
+    const receivedAtPlant = !!(receipt && receipt.rst_no);
+    const debitAmount = receipt && receipt.plant_debit_amount ? Number(receipt.plant_debit_amount) : 0;
+    const freightAmount = l.logistics_freight_amount ? Number(l.logistics_freight_amount) : null;
+    const finalAmount = l.logistics_payment_status === 'Paid' ? l.logistics_final_amount : (freightAmount !== null ? freightAmount - debitAmount : null);
+    return {
+      'Lead No.': l.lead_no, 'Customer': l.customer_name, 'Vehicle No.': l.val_vehicle_number,
+      'Transporter': l.logistics_transporter_name, 'Vehicle/Truck No.': l.logistics_transporter_vehicle_no,
+      'Dispatch Date': l.logistics_dispatch_date, 'Freight Amount': l.logistics_freight_amount || '',
+      'Bill No.': l.logistics_bill_no || '', 'Received at Plant': receivedAtPlant ? 'Received' : 'Pending',
+      'Debit Amount': debitAmount, 'Final Amount': finalAmount !== null ? finalAmount : '',
+      'Payment Status': l.logistics_payment_status || 'Pending',
+      'PE': l.pe ? l.pe.name : '', 'Manager': l.manager ? l.manager.name : '',
+    };
+  });
+  const paid = details.filter(d => d['Payment Status'] === 'Paid').length;
+  const summary = [{
+    'Total Dispatches': leads.length, 'Paid': paid, 'Pending': leads.length - paid,
+    'Received at Plant': details.filter(d => d['Received at Plant'] === 'Received').length,
+    'Total Debit Amount': details.reduce((s, d) => s + (Number(d['Debit Amount']) || 0), 0),
+  }];
+
+  downloadXlsxMulti('rewire-dms-transporter-payments-report.xlsx', [{ name: 'Summary', rows: summary }, { name: 'Details', rows: details }]);
+}
+
+// ------------------------------------------------------------
+// COMPANY/DEALERSHIP WISE REPORT — every lead tagged with a Company/
+// Dealership Name (captured at New Lead Entry — optional field), showing
+// its current pipeline stage + status, plus a per-company count summary.
+// ------------------------------------------------------------
+async function exportCompanyDealershipReport() {
+  const data = await fetchAllRows((from, to) => applyReportDateFilter(
+    sb.from('rewire_master_data')
+      .select(`lead_no, customer_name, phone, city, company_dealership_name, current_stage, overall_status, lead_status, sub_status,
+        val_vehicle_type, val_vehicle_number, val_make, val_model_variant, pe_id, created_at,
+        rewire_partners(partner_name)`)
+      .not('company_dealership_name', 'is', null)
+      .order('company_dealership_name'), 'created_at'
+  ).range(from, to)).catch(e => { notify('Export failed: ' + e.message, { icon: 'error' }); return null; });
+  if (data === null) return;
+  if (!data.length) { notify('No leads with a Company/Dealership Name to export.', { icon: 'info' }); return; }
+
+  const peMap = {};
+  (allPEs || []).forEach(p => { peMap[p.id] = p.name; });
+
+  const details = data.map(l => ({
+    'Company/Dealership': l.company_dealership_name, 'Lead No.': l.lead_no, 'Customer': l.customer_name,
+    'Phone': l.phone, 'City': l.city, 'Current Stage': STAGE_LABELS[l.current_stage] || 'Lead Entry',
+    'Overall Status': l.overall_status || '—', 'Lead Status': l.lead_status || '—', 'Sub Status': l.sub_status || '—',
+    'Vehicle Type': l.val_vehicle_type || '', 'Vehicle No.': l.val_vehicle_number || '', 'Make': l.val_make || '', 'Model': l.val_model_variant || '',
+    'Partner': l.rewire_partners ? l.rewire_partners.partner_name : '', 'PE': peMap[l.pe_id] || '', 'Created On': l.created_at,
+  }));
+
+  const grouped = {};
+  data.forEach(l => { (grouped[l.company_dealership_name] = grouped[l.company_dealership_name] || []).push(l); });
+  const summary = Object.entries(grouped).map(([company, rows]) => ({
+    'Company/Dealership': company, 'Total Leads': rows.length,
+    'Purchased (Complete)': rows.filter(r => r.overall_status === 'Purchased' || r.current_stage >= 4).length,
+    'Closed Lost': rows.filter(r => r.overall_status === 'Closed Lost').length,
+    'In Progress': rows.filter(r => r.overall_status !== 'Closed Lost' && !(r.overall_status === 'Purchased' || r.current_stage >= 4)).length,
+  }));
+
+  downloadXlsxMulti('rewire-dms-company-dealership-report.xlsx', [{ name: 'Summary', rows: summary }, { name: 'Details', rows: details }]);
+}
+
+
+</script>
+

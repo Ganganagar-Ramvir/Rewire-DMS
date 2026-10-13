@@ -1,0 +1,18 @@
+{
+  "name": "rewire-dms-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "REWIRE DMS — Node.js (Vercel) version. Data in Supabase, files in Google Drive.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "dev": "node scripts/build.js && vercel dev"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "@sparticuz/chromium": "^131.0.0",
+    "googleapis": "^144.0.0",
+    "nodemailer": "^6.9.15",
+    "puppeteer-core": "^23.0.0"
+  }
+}

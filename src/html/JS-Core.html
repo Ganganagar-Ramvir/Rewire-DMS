@@ -1,0 +1,3141 @@
+<script>
+// CORE: Supabase client init, login/auth (initAuth), notify/confirm helpers, Partners directory (CRUD), Commission-person directory, PE/Manager dropdowns, file upload helper.
+// ============================================================
+// REWIRE DMS — Supabase Integration Layer (v5: modularized, one file per feature area)
+// Included into App.html via include('JS-1-CoreAndPartners') — see App.html for the full include chain.
+// ============================================================
+
+const SUPABASE_URL = 'https://gbvbshyitvoxqwgcvmei.supabase.co';       // <-- replace with your Project URL
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdidmJzaHlpdHZveHF3Z2N2bWVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUwNDQ3NzQsImV4cCI6MjEwMDYyMDc3NH0.IKO9TKJ5InIDoXAgxmfIUtTN-ILR2HFf2oMdcLxS-xw';        // <-- replace with your anon key
+const LOGIN_EMAIL_DOMAIN = '@rewiredms.app';
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+let currentProfile = null;
+let activeLeadId = null;
+let activeLeadNo = null;
+let allPartners = [];
+let allCommissionPersons = []; // Cash Commission payout — lightweight name-only directory (no GST), separate from allPartners
+let allManagers = []; // populated by loadPeAndManagerOptions — used to look up a name for the read-only Manager display shown to PE
+let allPEs = []; // populated by loadPeAndManagerOptions — used to look up a PE's name by id (e.g. in reports)
+let allActiveUsers = []; // populated by loadPeAndManagerOptions — every active user regardless of role, e.g. for the Omini Pay "By Name" dropdown where any staff member processing the payment picks their own name
+let allCraneVendors = []; // Crane Charges payee directory — same shape as Commission Payees, separate table (rewire_crane_vendors)
+let allTransporters = []; // Logistics directory — same shape as Crane Vendors, separate table (rewire_transporters)
+let dropdownOptionsCache = {}; // { listKey: [{id, value}, ...] } — populated by loadDynamicDropdowns()
+
+// Payment Type "alt flow" check (Ramvir, Sept 2026 Credit addition) — every
+// stage-progression gate across this app (VZ/Manager Approval/Accessories/
+// Head Approval thresholds, Purchased-tab stage labels, Access Control edit
+// gates, the PE stage-breakdown DB function) branches on whether a lead's
+// pn_payment_type is the "normal" Post Delivery flow or one of the
+// "alt" flows (Advance Payment/Omini Pay/Instant Payments, which reorder
+// Delivery/VZ/Manager Approval relative to each other). Credit was added
+// as a payment type that must go through the EXACT SAME stage order as
+// Post Delivery — it only differs afterward, at the Payments stage, where
+// it lands in its own "Credit Payment" tab instead of the normal queue
+// (see renderCreditPaymentSection(), JS-Payments.html). So every one of
+// those isAltFlow checks needs 'Credit' treated the same as 'Post
+// Delivery' — this shared helper is the single source of truth for that,
+// used everywhere instead of each call site repeating its own
+// `!== 'Post Delivery'` check (which is how this logic used to be written,
+// duplicated ~10 times — a single centralized check here means a future
+// third "still follows Post Delivery order" payment type only needs to
+// change in one place).
+function isAltFlowPaymentType(pt) {
+  return !!pt && pt !== 'Post Delivery' && pt !== 'Credit';
+}
+
+// Durable record of the Instant Payment notification email. The actual send
+// happens via google.script.run -> GmailApp, which is fire-and-forget — its
+// only other signal is an ephemeral toast that nobody may be looking at when
+// it fires (modal's already closed, table's already refreshed, user's
+// already moved on). This writes the real outcome onto the lead itself so a
+// failure is a durable, query-able fact instead of a missed toast — this is
+// what makes L7103090-style "email silently didn't go, found out days
+// later" cases catchable going forward. Called from both the auto-send in
+// submitVerificationZoho() and the manual resendInstantPaymentEmail().
+async function markInstantEmailResult(leadId, status, errorMsg) {
+  try {
+    await sb.from('rewire_master_data').update({
+      pn_instant_email_status: status,
+      pn_instant_email_sent_at: status === 'Sent' ? new Date().toISOString() : null,
+      pn_instant_email_error: status === 'Failed' ? (errorMsg || 'Unknown error') : null,
+    }).eq('id', leadId);
+  } catch (e) { console.error('markInstantEmailResult failed', e); }
+}
+
+// Fetches EVERY row matching a query, paging past PostgREST/Supabase's
+// default row cap (1000) — a plain .select() with no .range() silently
+// truncates at that cap with no error, which is easy to miss on a small
+// table and only bites once a table grows past it. Bit this exact way:
+// the "Approved lead missing its Payment row" Health Check and the
+// Payments tab's "Find Missing Payment Rows" button both queried
+// rewire_payments (4700+ rows) with no .range() at all, so most existing
+// rows were invisible to the gap-check and got flagged as "missing"
+// (675 false positives) — trying to insert them then failed on
+// rewire_payments' unique (lead_id, payment_type) constraint, since a
+// row already existed. queryFn(from, to) must return a supabase query
+// (already filtered, NOT yet .range()'d) called with that range; this
+// loops until a page comes back shorter than pageSize.
+// .in('col', hugeList) breaks silently once the list is long (request URL too long -> error ignored ->
+// blank columns / missing rows, e.g. DMS/COD/CVS numbers empty in the Purchased export). Run it in chunks.
+// Usage: await fetchByIds(chunk => sb.from('t').select('...').in('col', chunk), ids)  ->  { data, error }
+async function fetchByIds(buildFn, ids, chunkSize = 120) {
+  const list = Array.from(new Set((ids || []).filter(x => x !== null && x !== undefined && x !== '')));
+  let out = [], firstError = null;
+  for (let i = 0; i < list.length; i += chunkSize) {
+    try {
+      const { data, error } = await buildFn(list.slice(i, i + chunkSize));
+      if (error) { console.error('fetchByIds', error); firstError = firstError || error; continue; }
+      out = out.concat(data || []);
+    } catch (e) { console.error('fetchByIds', e); firstError = firstError || e; }
+  }
+  return { data: out, error: firstError };
+}
+
+async function fetchAllRows(queryFn, pageSize = 1000) {
+  let all = [];
+  let from = 0;
+  let useIdOrder = true;
+  while (true) {
+    // Stable paging: PostgREST gives no row-order guarantee without ORDER BY, so rows updated
+    // while paging (or queries with no .order) could be skipped/duplicated across pages and the
+    // screen showed incomplete data. Add `id` as a final tie-breaker; fall back if a table has no `id`.
+    let res;
+    if (useIdOrder) {
+      try { const q = queryFn(from, from + pageSize - 1); res = typeof q.order === 'function' ? await q.order('id', { ascending: true }) : await q; }
+      catch (e) { res = { data: null, error: e }; }
+      if (res.error && /column .*\bid\b|"id"|\.id\b/i.test(String(res.error.message || ''))) { useIdOrder = false; res = await queryFn(from, from + pageSize - 1); }
+    } else {
+      res = await queryFn(from, from + pageSize - 1);
+    }
+    const { data, error } = res;
+    if (error) throw error;
+    all = all.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+}
+
+// Date-range filter boundaries (Ramvir, Sept 2026 — "date filter laga ke
+// export karte time pura data nahi aata" on the Purchased tab). Every
+// gte(dateStr)/lte(dateStr+'T23:59:59') pair across this app was sending a
+// plain, offset-less timestamp string to a timestamptz column while the DB
+// session runs in UTC — but the business (and every date picker here) runs
+// in IST (UTC+5:30). A bare "2026-09-01" gte was actually being read as
+// 2026-09-01 00:00 UTC, i.e. 2026-09-01 05:30 IST — silently EXCLUDING any
+// row from the first 5.5 hours of that IST calendar day. Symmetrically,
+// "...T23:59:59" lte was read as 2026-09-01 23:59:59 UTC, i.e. 2026-09-02
+// 05:29 IST — silently INCLUDING rows from the first 5.5 hours of the NEXT
+// day. Net effect: a "from X to Y" filter both dropped early-morning rows
+// on day X and leaked in early-morning rows from the day after Y. Appending
+// the explicit +05:30 offset makes Postgres read the boundary as the IST
+// calendar day the user actually picked, regardless of session timezone.
+// (Contrast with new Date(y,m,1).toISOString() elsewhere, e.g.
+// openPurchaseSummaryDetail() in JS-Dashboard.html — that reads the
+// browser's own local time first, so it was never affected by this bug.)
+function istDayStart(dateStr) { return dateStr + 'T00:00:00+05:30'; }
+function istDayEnd(dateStr) { return dateStr + 'T23:59:59+05:30'; }
+
+// ------------------------------------------------------------
+// GLOBAL TOPBAR SEARCH — "Search leads, customers, partners…" (App.html).
+// This box previously had no handler at all — nothing was wired up, so
+// typing into it did nothing. It's separate from every per-tab search
+// box (those already search the full table server-side, not just the
+// currently loaded page — see withSearch()). This one queries
+// rewire_master_data (leads/customers — same table) and rewire_partners
+// directly, across the WHOLE table regardless of which tab/page is
+// currently open, and shows a dropdown of matches under the search box.
+// ------------------------------------------------------------
+let globalSearchDebounceTimer = null;
+function onGlobalSearchInput(value) {
+  clearTimeout(globalSearchDebounceTimer);
+  const q = value.trim();
+  const dropdown = document.getElementById('globalSearchDropdown');
+  if (!dropdown) return;
+  if (q.length < 2) { dropdown.style.display = 'none'; dropdown.innerHTML = ''; return; }
+  globalSearchDebounceTimer = setTimeout(() => runGlobalSearch(q), 300);
+}
+
+// Best-effort "which table/tab is this lead currently sitting in" label
+// for a search result — mirrors the membership rules each section's own
+// query uses (loadNATab/loadQualTab/loadLostTab/renderPurchasedSection/
+// JS-Payments.html's gates), computed client-side from the lead's own
+// fields so the search result can say e.g. "Qualified Pipeline · Bank
+// KYC" or "Purchased Vehicles" without navigating there first. It's a
+// convenience hint, not a live re-check of each section's exact query —
+// if a section's own rules ever change, update the matching branch here
+// too.
+function describeLeadLocation(l) {
+  if (l.overall_status === 'Closed Lost') return 'Closed Lost';
+  if (l.lead_status === 'Need Analysis') return 'All Leads · Need Analysis';
+  if (l.ud_status === 'Complete' && l.ha_status === 'Approved') return 'Purchased Vehicles';
+  const isAlt = isAltFlowPaymentType(l.pn_payment_type);
+  // Payment Release — Advance Payment/Omini Pay only, current_stage 6,
+  // still Pending (see loadQualTab curStage===10).
+  if (isAlt && l.pn_payment_type !== 'Instant Payments' && l.current_stage === 6 && (l.payment_release_status || 'Pending') === 'Pending') {
+    return 'Qualified Pipeline · Payment Release';
+  }
+  // Manager Approval / Verification & Zoho for Advance Payment/Omini Pay
+  // — these land on current_stage 4 and 3 respectively (Delivery's slot
+  // is skipped for them, see submitVerificationZoho/loadQualTab
+  // curStage===6), NOT the generic STAGE_LABELS[current_stage+1] numbers
+  // the fallback below assumes. Checked explicitly and BEFORE the Upload
+  // Delivery check next, since "kyc done, ud not done" is true for this
+  // whole window too (Delivery is decoupled/parallel) and would
+  // otherwise always win first, masking a lead that's actually waiting
+  // on Manager Approval as "still needs Delivery". Instant Payments
+  // skips Manager Approval entirely — but NOT Verification & Zoho, which
+  // Instant Payments still goes through (loadQualTab curStage===5's
+  // altQuery includes all of ALT_PAYMENT_TYPES, Instant Payments included).
+  // The Manager Approval half is guarded separately from the VZ half so an
+  // Instant Payments lead genuinely due for VZ (current_stage===3) doesn't
+  // get excluded by the same guard meant only for Manager Approval — it
+  // used to fall through to the Upload Delivery check below instead
+  // (kyc done + ud not done is also true during this whole window),
+  // mislabeling it "Upload Delivery" instead of "Verification & Zoho".
+  if (isAlt && (!l.ma_status || l.ma_status === 'Pending')) {
+    if (l.current_stage === 4 && l.pn_payment_type !== 'Instant Payments') return 'Qualified Pipeline · Manager Approval';
+    if (l.current_stage === 3) return 'Qualified Pipeline · Verification & Zoho';
+  }
+  // Upload Delivery — decoupled for Advance Payment/Omini Pay/Instant
+  // Payments (fillable any time from Bank KYC done to Delivery done);
+  // straightforward current_stage===3 for Post Delivery.
+  if (isAlt ? (l.kyc_status === 'Complete' && l.ud_status !== 'Complete') : (l.current_stage === 3)) {
+    return 'Qualified Pipeline · Upload Delivery';
+  }
+  // Accessories Check — due once Manager Approval is done (or Instant
+  // Payments, which skips it), Delivery genuinely filled, and not yet
+  // Confirmed. For Post Delivery this ALSO requires current_stage===6
+  // (matching loadQualTab's real curStage===7 query, JS-Dashboard.html) —
+  // just trusting the ma_status flag isn't enough: a lead whose Delivery
+  // got reset/reopened after Manager Approval (e.g. the fake-Delivery
+  // cleanup batches) can end up back at current_stage 5 (needs Manager
+  // Approval again) while ma_status still stale-reads 'Approved' from
+  // before the reset. Without the current_stage check this mislabeled it
+  // "Accessories Check" even though the real tab correctly excluded it
+  // (L7102346/L7102183 case). For Alt types, requiring `ud_filled_on` too
+  // (not just ud_status==='Complete') matches the real query's defense
+  // against the historical "fake Complete" import artifact — without it,
+  // a fake-complete Alt-type lead would be mislabeled here even though
+  // both real Accessories Check queries correctly exclude it.
+  const maOk = l.ma_status === 'Approved' || l.pn_payment_type === 'Instant Payments';
+  const accessoriesDue = isAlt ? (l.ud_status === 'Complete' && !!l.ud_filled_on) : l.current_stage === 6;
+  if (maOk && l.accessories_check_status !== 'Confirmed' && accessoriesDue) {
+    return 'Qualified Pipeline · Accessories Check';
+  }
+  // Head Approval — Alt payment types only, checked explicitly here (not
+  // reachable via the generic STAGE_LABELS fallback below): current_stage
+  // stays parked at 6 for these the whole time Delivery/Accessories Check
+  // run in parallel, only advancing once submitHeadApproval() itself runs
+  // — so once Delivery + Accessories are BOTH genuinely done but Head
+  // Approval hasn't happened yet, current_stage is still 6, and the
+  // fallback's `STAGE_LABELS[current_stage+1]` would give 'Accessories
+  // Check' again (wrong — accessories is already Confirmed at this point).
+  if (isAlt && l.ud_status === 'Complete' && l.ud_filled_on && l.accessories_check_status === 'Confirmed') {
+    return 'Qualified Pipeline · Head Approval';
+  }
+  // Everything else (Valuation/Price Negotiation/Bank KYC/Verification &
+  // Zoho/Manager Approval/final Head Approval — Post Delivery only, Alt
+  // types are all handled explicitly above) — falls out of the same
+  // "next stage after current_stage" numbering every one of those tabs
+  // uses, via STAGE_LABELS (JS-Wiring.html).
+  const label = (typeof STAGE_LABELS !== 'undefined' && STAGE_LABELS[(l.current_stage || 0) + 1]) || null;
+  return label ? ('Qualified Pipeline · ' + label) : (l.lead_status || l.overall_status || '—');
+}
+
+// A lead's core Leads-pipeline stage (describeLeadLocation above) is only
+// ONE of possibly several places it's sitting right now — Logistics,
+// Logistics Payments, Received at Plant, RC Tracking, COD/CVS and
+// Payments/Instant Payment/Archive are all separate, PARALLEL modules
+// keyed off the same lead (or its vehicle number), not mutually
+// exclusive with the pipeline stage or with each other. E.g. a dispatched
+// vehicle shows in BOTH "Received at Plant" and "Logistics Payments" at
+// the same time. Returns an array of {label, go()} — zero or more extra
+// locations, on top of the one describeLeadLocation()/navigateToLeadLocation()
+// already give — computed client-side from fields already fetched by
+// runGlobalSearch(), mirroring each section's own query filter (see the
+// comment above each one in JS-Operations.html/JS-Tracking.html/
+// JS-Payments.html).
+// Every pushed location now carries a `pending` flag (true = something
+// still needs doing there, false = informational/terminal — already done,
+// just showing where it ended up). See the ranking note in runGlobalSearch
+// for why this replaced the two earlier (wrong) attempts at ranking by
+// "most urgent tab" and then by "latest in the sequence" — Ramvir pointed
+// out those both mis-highlighted a DONE/terminal location (Received at
+// Plant, then Payments Archive) over a genuinely still-pending one (RC
+// Tracking, COD/CVS). The only rule that actually holds up: anything still
+// pending always outranks anything already done, full stop.
+function getOperationalLocations(l, paymentsByLead, archiveByLead, codCvsByReg, receiptByLead, docsByLead, materialsByLead) {
+  const locs = [];
+  // Logistics — delivered, not yet dispatched to plant.
+  // (Ramvir, Oct 2026) — excludes vehicles already in a terminal Vehicle
+  // Disposal state (Reserved/Scrapped/Scrapped - Provisionally). Found on
+  // DL8CNA6599 (lead L7100499): it's long since Scrapped, but ud_status
+  // stayed 'Complete' and logistics_status was never set from its original
+  // delivery, so this block still fired and the global search showed
+  // "Logistics" instead of "Vehicle Disposal · Scrapped" — the disposal
+  // block below (lines ~284-290) already treats those 3 values as final,
+  // this condition just didn't know about them.
+  const udParkingIsDisposed = l.ud_vehicle_parking === 'Reserved' || l.ud_vehicle_parking === 'Scrapped' || l.ud_vehicle_parking === 'Scrapped - Provisionally';
+  // Vehicles already parked AT Jaipur Plant never appear in the Logistics tab (nothing left to send), so don't claim they do.
+  if (l.ud_status === 'Complete' && !l.logistics_status && !udParkingIsDisposed && l.ud_vehicle_parking !== 'Jaipur Plant') {
+    locs.push({ label: 'Logistics', pending: true, go: () => showSection('logistics') });
+  }
+  if (l.logistics_status === 'Sent to Plant') {
+    // Received at Plant is a WORKING list, not a permanent log — once both
+    // halves (Accessories/plant_spare_wheel AND the RST no.) are done for a
+    // lead, renderReceivedPlantSection() (JS-Operations.html) drops it from
+    // its own "remaining" list entirely (see the comment there). This used
+    // to unconditionally show "Received at Plant" for every dispatched
+    // vehicle regardless of that — reported on RJ21GB7423, which had long
+    // since finished plant processing (and moved on to Scrapped) but still
+    // got shown, and even highlighted, as "Received at Plant". Now mirrors
+    // the exact same not-both-done check the real tab uses, so it only
+    // ever shows here while it's genuinely still pending.
+    const receipt = receiptByLead ? receiptByLead[l.id] : null;
+    const plantRemaining = !(receipt && receipt.rst_no && receipt.plant_spare_wheel);
+    if (plantRemaining) {
+      locs.push({ label: 'Vehicle Receiving', pending: true, go: () => showSection('receivedplant') });
+    }
+    // Logistics Payments, unlike Received at Plant, never drops a row once
+    // paid (renderLogisticsPaymentsSection() shows "every dispatched
+    // vehicle ever, Paid or not") — so it always shows for a dispatched
+    // vehicle, but its pending flag now genuinely tracks whether the
+    // freight is actually still owed. Restricted to vehicles that went via
+    // a paid transporter (logistics_transporter_name set), matching that
+    // tab's own filter — self-carried dispatches never appear there.
+    if (l.logistics_transporter_name) {
+      const paid = l.logistics_payment_status === 'Paid';
+      locs.push({ label: 'Logistics Payments · ' + (paid ? 'Paid' : 'Pending'), pending: !paid, go: () => showSection('logistics-payments') });
+    }
+  }
+  // Vehicle Disposal (Ramvir, Sept 2026 — was missing entirely, reported
+  // on RJ21GB7423: it was actually sitting in the Scrapped tab but the
+  // global search dropdown never said so). Keyed off the same
+  // ud_vehicle_parking value each of the 3 Vehicle Disposal tabs itself
+  // filters on (JS-Operations.html) — 'Jaipur Plant' = still pending a
+  // disposal decision (pending:true — someone needs to act), 'Reserved'/
+  // 'Scrapped'/'Scrapped - Provisionally' are all final outcomes
+  // (pending:false — that vehicle's disposal is done, this is just where
+  // it physically ended up).
+  if (l.ud_vehicle_parking === 'Jaipur Plant' && l.overall_status !== 'Closed Lost') {
+    locs.push({ label: 'Vehicle Disposal · Pending', pending: true, go: () => showSection('vehicle-disposal') });
+  } else if (l.ud_vehicle_parking === 'Reserved') {
+    locs.push({ label: 'Vehicle Disposal · Reserved', pending: false, go: () => showSection('vehicle-disposal-reserved') });
+  } else if (l.ud_vehicle_parking === 'Scrapped' || l.ud_vehicle_parking === 'Scrapped - Provisionally') {
+    locs.push({ label: 'Vehicle Disposal · ' + l.ud_vehicle_parking, pending: false, go: () => showSection('vehicle-disposal-scrapped') });
+  }
+  // RC Tracking — Physical RC leads only, still active. Split Pending vs
+  // Received (isRcReceived(), JS-Tracking.html) the same way the tab
+  // itself splits into two sub-sections — previously this showed
+  // "RC Tracking" unconditionally even once the RC was already received,
+  // which (like the Received at Plant bug above) could win a ranking it
+  // had no business winning.
+  if (l.ud_status === 'Complete' && l.ud_rc_received_type === 'Physical RC' && l.overall_status !== 'Closed Lost') {
+    const received = typeof isRcReceived === 'function' && isRcReceived(l.rc_status);
+    locs.push({
+      label: 'RC Tracking · ' + (received ? 'Received' : 'Pending'),
+      pending: !received,
+      go: () => { showSection(received ? 'rc-tracking-received' : 'rc-tracking'); const el = document.getElementById('searchRc'); if (el) { el.value = l.lead_no; onSearchRc(l.lead_no); } },
+    });
+  }
+  // COD/CVS — keyed by vehicle registration number, not lead_id.
+  const codRow = l.val_vehicle_number ? codCvsByReg[l.val_vehicle_number.toUpperCase()] : null;
+  if (codRow) {
+    const codDone = !!codRow.uploaded_in_dms_rewire;
+    locs.push({
+      label: 'COD/CVS · ' + (codDone ? 'Completed' : 'Pending'),
+      pending: !codDone,
+      go: () => { showSection('codcvs'); const el = document.getElementById('searchCod'); if (el) { el.value = l.val_vehicle_number; filterCodCvsTable(l.val_vehicle_number); } },
+    });
+  }
+  // Document Management — same eligibility as renderDocumentsSection()
+  // (JS-Tracking.html): parked at Jaipur Plant, still active. Completeness
+  // reuses that same tab's own DOCUMENT_ITEMS/isDocItemCollected() logic
+  // (13 items) so the count here can never drift out of sync with what the
+  // tab itself shows. Added per Ramvir's request — this was missing
+  // entirely before, same gap Vehicle Disposal had.
+  if (l.ud_vehicle_parking === 'Jaipur Plant' && l.overall_status !== 'Closed Lost' && typeof DOCUMENT_ITEMS !== 'undefined') {
+    const doc = docsByLead ? docsByLead[l.id] : null;
+    const collected = DOCUMENT_ITEMS.filter(([, , statusKey, , isRcType]) => isDocItemCollected(doc, statusKey, isRcType)).length;
+    const complete = collected === DOCUMENT_ITEMS.length;
+    locs.push({
+      label: `Document Management · ${collected}/${DOCUMENT_ITEMS.length}`,
+      pending: !complete,
+      go: () => { showSection('documents'); if (typeof showDocumentsTab === 'function') showDocumentsTab(complete ? 'all' : 'incomplete'); },
+    });
+  }
+  // Material — same eligibility as renderMaterialSection() (JS-Tracking.
+  // html): ud_status Complete + dispatched to plant + actually received
+  // (rst_no filled). Completeness reuses MATERIAL_CATEGORIES/
+  // countMaterialCategoriesFilled() (14 categories), same reasoning as
+  // Document Management above. Also new — was missing entirely before.
+  const receiptForMat = receiptByLead ? receiptByLead[l.id] : null;
+  if (l.ud_status === 'Complete' && l.logistics_status === 'Sent to Plant' && receiptForMat && receiptForMat.rst_no && typeof MATERIAL_CATEGORIES !== 'undefined') {
+    const mat = materialsByLead ? materialsByLead[l.id] : null;
+    const collected = typeof countMaterialCategoriesFilled === 'function' ? countMaterialCategoriesFilled(mat) : 0;
+    const complete = collected === MATERIAL_CATEGORIES.length;
+    locs.push({
+      label: `Material · ${collected}/${MATERIAL_CATEGORIES.length}`,
+      pending: !complete,
+      go: () => showSection('material'),
+    });
+  }
+  // Instant Payment email — the auto-send at VZ-complete
+  // (submitVerificationZoho(), JS-Pipeline.html) is a fire-and-forget
+  // google.script.run -> GmailApp call; its only signal used to be an
+  // ephemeral toast, which is exactly why this kept needing a manual
+  // resend nobody noticed was needed (reported repeatedly, e.g. L7103090).
+  // pn_instant_email_status is now written for real by markInstantEmailResult()
+  // on both the auto-send and resendInstantPaymentEmail() — surfaced here so
+  // "did the email actually go" is something the pending-first search
+  // catches on its own instead of relying on someone watching the screen at
+  // the exact moment it fires.
+  //
+  // Split into 2 cases (Ramvir, Sept 2026 — permanent-fix pass, after
+  // finding the REAL root cause: rewire_verification_zoho's AFTER INSERT
+  // trigger mirrors the new status onto rewire_master_data.vz_status before
+  // submitVerificationZoho() ever re-reads it, so its old "was this already
+  // Complete" guard always read true — every Instant Payments lead in the
+  // DB had pn_instant_email_status = null, a 100% failure rate, not an edge
+  // case; fixed at the source in submitVerificationZoho()). A DB sweep at
+  // the same time found 168 already-Complete leads stuck with no
+  // pn_omni_pay_to recorded at all — for those, "Resend" has nothing to
+  // send (it doesn't know Customer/Broker/Both), so this used to hide them
+  // from the pending list entirely (the `l.pn_omni_pay_to &&` condition
+  // silently excluded them) — now surfaced with their own actionable label
+  // instead of vanishing.
+  if (l.pn_payment_type === 'Instant Payments' && l.vz_status === 'Complete' && l.pn_instant_email_status !== 'Sent') {
+    if (l.pn_omni_pay_to) {
+      locs.push({
+        label: 'Instant Payment Email · ' + (l.pn_instant_email_status === 'Failed' ? 'Failed' : 'Not Sent'),
+        pending: true,
+        go: () => { if (typeof resendInstantPaymentEmail === 'function') resendInstantPaymentEmail(l.id); },
+      });
+    } else {
+      locs.push({
+        label: 'Instant Payment Email · Missing Omni/InstantPay To',
+        pending: true,
+        go: () => showSection('leads') && showTab('tab-qual'),
+      });
+    }
+  }
+  // Payments — a lead can have a Customer row AND a Broker row open at
+  // once, each sitting in a different one of the 4 live tabs (Pending /
+  // Hold / To be Sent for Payment / Pending UTR) depending on its own
+  // status. Completed/Rejected rows are meant to have moved to Archive
+  // already (handled below) — skip here in case the archive-move trigger
+  // left a stale copy behind (same defensive filter
+  // renderPaymentsSection/renderPendingUtrSection use).
+  const isInstant = l.pn_payment_type === 'Instant Payments';
+  const isCredit = l.pn_payment_type === 'Credit'; // own tab, never Pending/Hold/To be Sent/Pending UTR — see renderCreditPaymentSection() (JS-Payments.html)
+  (paymentsByLead[l.id] || []).forEach(p => {
+    if (p.status === 'Completed' || p.status === 'Rejected') return;
+    let sectionId, searchInputId, filterFn, tabLabel;
+    if (isCredit) {
+      sectionId = 'credit-payment'; searchInputId = 'searchCreditPayment'; filterFn = filterCreditPaymentTable;
+      tabLabel = 'Credit Payment';
+    } else if (isInstant || p.status === 'Pending UTR') {
+      sectionId = 'pending-utr'; searchInputId = 'searchPendingUtr'; filterFn = filterPendingUtrTable;
+      tabLabel = isInstant ? 'Instant Payment' : 'Pending UTR';
+    } else if (p.status === 'Hold') {
+      sectionId = 'payments-hold'; searchInputId = 'searchPaymentsHold'; filterFn = filterPaymentsHoldTable;
+      tabLabel = 'Payments Hold';
+    } else if (p.status === 'To be Sent for Payment') {
+      sectionId = 'payments-tobesent'; searchInputId = 'searchToBeSent'; filterFn = filterToBeSentTable;
+      tabLabel = 'To be Sent for Payment';
+    } else {
+      sectionId = 'payments'; searchInputId = 'searchPayments'; filterFn = filterPaymentsTable;
+      tabLabel = 'Payments';
+    }
+    locs.push({
+      label: tabLabel + ' · ' + p.payment_type + ' · ' + p.status,
+      pending: true, // every live (non-Completed/Rejected) rewire_payments row is, by definition, still owed
+      go: () => { showSection(sectionId); const el = document.getElementById(searchInputId); if (el) { el.value = l.lead_no; } filterFn(l.lead_no); },
+    });
+  });
+  if (archiveByLead[l.id]) {
+    locs.push({
+      label: 'Payments Archive',
+      pending: false,
+      go: () => { showSection('payments-archive'); const el = document.getElementById('searchPaymentsArchive'); if (el) { el.value = l.lead_no; } filterPaymentsArchiveTable(l.lead_no); },
+    });
+  }
+  return locs;
+}
+
+// Actually navigates to wherever describeLeadLocation() said the lead is
+// — mirrors that same logic (see there for the "why" on each branch,
+// especially the Advance Payment/Omini Pay stage numbers) but calls the
+// real navigation functions instead of returning a text label. Lets the
+// user land directly on the tab/section itself, rather than only getting
+// a text hint and having to go hunt for it — which is what exposed the
+// L7102577 case in the first place (search said "Verification & Zoho",
+// but nothing in that real tab, or any tab, actually had it — describe
+// AND navigate now agree, and the underlying tab-query bug is fixed in
+// loadQualTab curStage===6 / supabase-batch64).
+let lastGlobalSearchLeads = [];
+// Populated fresh on every runGlobalSearch() render — each entry is the
+// actual go() closure for one location line in the dropdown (both the
+// primary pipeline-stage line and every extra operational-tab line).
+// Indices are embedded in the rendered HTML (onmousedown="...
+// lastGlobalSearchActions[N]()"), so this array must stay in the exact
+// order the HTML was built in — never sorted/mutated after render.
+let lastGlobalSearchActions = [];
+function navigateToLeadLocation(idx) {
+  const l = lastGlobalSearchLeads[idx];
+  if (!l) return;
+  closeGlobalSearch();
+  if (l.overall_status === 'Closed Lost') { showSection('leads'); showTab('tab-lost'); return; }
+  if (l.lead_status === 'Need Analysis') { showSection('leads'); showTab('tab-na'); return; }
+  if (l.ud_status === 'Complete' && l.ha_status === 'Approved') { showSection('purchased'); return; }
+  showSection('leads'); showTab('tab-qual');
+  const isAlt = isAltFlowPaymentType(l.pn_payment_type);
+  if (isAlt && l.pn_payment_type !== 'Instant Payments' && l.current_stage === 6 && (l.payment_release_status || 'Pending') === 'Pending') {
+    setStage(10); return;
+  }
+  if (isAlt && (!l.ma_status || l.ma_status === 'Pending')) {
+    if (l.current_stage === 4 && l.pn_payment_type !== 'Instant Payments') { setStage(6); return; }
+    if (l.current_stage === 3) { setStage(5); return; }
+  }
+  if (isAlt ? (l.kyc_status === 'Complete' && l.ud_status !== 'Complete') : (l.current_stage === 3)) {
+    setStage(4); return;
+  }
+  const maOk = l.ma_status === 'Approved' || l.pn_payment_type === 'Instant Payments';
+  const accessoriesDue = isAlt ? (l.ud_status === 'Complete' && !!l.ud_filled_on) : l.current_stage === 6;
+  if (maOk && l.accessories_check_status !== 'Confirmed' && accessoriesDue) {
+    setStage(7); return;
+  }
+  if (isAlt && l.ud_status === 'Complete' && l.ud_filled_on && l.accessories_check_status === 'Confirmed') {
+    setStage(8); return;
+  }
+  const idxStage = (l.current_stage || 0) + 1;
+  if (idxStage >= 1 && idxStage <= 9) setStage(idxStage);
+}
+
+async function runGlobalSearch(q) {
+  const dropdown = document.getElementById('globalSearchDropdown');
+  if (!dropdown) return;
+  const esc = q.replace(/'/g, "''");
+  const [{ data: leads, error: leadErr }, { data: partners, error: partnerErr }] = await Promise.all([
+    sb.from('rewire_master_data')
+      .select(`id, lead_no, customer_name, phone, val_vehicle_number, overall_status, lead_status,
+        pn_payment_type, current_stage, kyc_status, ma_status, ud_status, ud_filled_on, accessories_check_status,
+        ha_status, payment_release_status, logistics_status, ud_rc_received_type, ud_vehicle_parking,
+        logistics_transporter_name, logistics_payment_status, rc_status, vz_status, pn_omni_pay_to,
+        pn_instant_email_status, logistics_manifest_id`)
+      .or(`lead_no.ilike.%${esc}%,customer_name.ilike.%${esc}%,phone.ilike.%${esc}%,val_vehicle_number.ilike.%${esc}%`)
+      .order('created_at', { ascending: false })
+      .limit(30),
+    sb.from('rewire_partners')
+      .select('id, partner_name, mobile')
+      .or(`partner_name.ilike.%${esc}%,mobile.ilike.%${esc}%`)
+      .limit(10),
+  ]);
+  // Manifests (Ramvir, Oct 2026): a vehicle's manifest shows as a location line, and typing a manifest no. finds it directly.
+  let manifestHits = [], manifestById = {};
+  try {
+    const mIds = [...new Set((leads || []).map(l => l.logistics_manifest_id).filter(Boolean))];
+    const [byId, byNo] = await Promise.all([
+      mIds.length ? sb.from('rewire_logistics_manifests').select('id, manifest_no, transport_mode, payment_status, dispatch_date, to_location').in('id', mIds) : Promise.resolve({ data: [] }),
+      /[\/]|^gvupl/i.test(q) || q.length >= 5 ? sb.from('rewire_logistics_manifests').select('id, manifest_no, transport_mode, payment_status, dispatch_date, to_location').ilike('manifest_no', `%${esc}%`).limit(8) : Promise.resolve({ data: [] }),
+    ]);
+    (byId.data || []).forEach(m => { manifestById[m.id] = m; });
+    manifestHits = byNo.data || [];
+  } catch (e) { console.error('global search manifests', e); }
+  if (leadErr) console.error(leadErr);
+  if (partnerErr) console.error(partnerErr);
+  lastGlobalSearchLeads = leads || [];
+
+  // Extra lookups so a matched lead can show EVERY tab it's currently
+  // sitting in (Payments/Instant Payment/Archive, COD/CVS), not just its
+  // core Leads-pipeline stage — see getOperationalLocations() above.
+  // Scoped to only the leads actually matched here (at most 30), so this
+  // stays cheap even though rewire_payments/rewire_cod_cvs are large
+  // tables overall.
+  const leadIds = lastGlobalSearchLeads.map(l => l.id);
+  const vehicleNos = lastGlobalSearchLeads.map(l => l.val_vehicle_number).filter(Boolean);
+  let paymentsExtra = [], archiveExtra = [], codCvsExtra = [], receiptExtra = [], docsExtra = [], materialsExtra = [];
+  if (leadIds.length) {
+    const [{ data: payData, error: payErr }, { data: archData, error: archErr }, { data: receiptData, error: receiptErr },
+      { data: docsData, error: docsErr }, { data: materialsData, error: materialsErr }] = await Promise.all([
+      sb.from('rewire_payments').select('lead_id, payment_type, status').in('lead_id', leadIds),
+      sb.from('rewire_payments_archive').select('lead_id').in('lead_id', leadIds),
+      // rst_no + plant_spare_wheel — same "is it actually still in the
+      // Received at Plant working list" check renderReceivedPlantSection()
+      // itself does (see getOperationalLocations() above).
+      sb.from('rewire_vehicle_receipt').select('lead_id, rst_no, plant_spare_wheel').in('lead_id', leadIds),
+      // Full rows (select('*')) for Documents/Material — same as their own
+      // render functions fetch, since completeness is computed from every
+      // one of DOCUMENT_ITEMS'/MATERIAL_CATEGORIES' field names, not a
+      // short fixed list.
+      sb.from('rewire_documents').select('*').in('lead_id', leadIds),
+      sb.from('rewire_materials').select('*').in('lead_id', leadIds),
+    ]);
+    if (payErr) console.error(payErr);
+    if (archErr) console.error(archErr);
+    if (receiptErr) console.error(receiptErr);
+    if (docsErr) console.error(docsErr);
+    if (materialsErr) console.error(materialsErr);
+    paymentsExtra = payData || [];
+    archiveExtra = archData || [];
+    receiptExtra = receiptData || [];
+    docsExtra = docsData || [];
+    materialsExtra = materialsData || [];
+  }
+  if (vehicleNos.length) {
+    const vEsc = vehicleNos.map(v => v.replace(/'/g, "''"));
+    const { data: codData, error: codErr } = await sb.from('rewire_cod_cvs')
+      .select('registration_number, uploaded_in_dms_rewire')
+      .or(vEsc.map(v => `registration_number.ilike.${v}`).join(','));
+    if (codErr) console.error(codErr);
+    codCvsExtra = codData || [];
+  }
+  const paymentsByLead = {};
+  paymentsExtra.forEach(p => { (paymentsByLead[p.lead_id] = paymentsByLead[p.lead_id] || []).push(p); });
+  const archiveByLead = {};
+  archiveExtra.forEach(a => { archiveByLead[a.lead_id] = true; });
+  const codCvsByReg = {};
+  codCvsExtra.forEach(c => { if (c.registration_number) codCvsByReg[c.registration_number.toUpperCase()] = c; });
+  const receiptByLead = {};
+  receiptExtra.forEach(r => { receiptByLead[r.lead_id] = r; });
+  const docsByLead = {};
+  docsExtra.forEach(d => { docsByLead[d.lead_id] = d; });
+  const materialsByLead = {};
+  materialsExtra.forEach(m => { materialsByLead[m.lead_id] = m; });
+
+  lastGlobalSearchActions = [];
+  const rowStyle = 'padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--color-border-tertiary);';
+  // Row itself still opens View Lead Details (unchanged) — each location
+  // line underneath is its own clickable link (stopPropagation so it
+  // doesn't also trigger the row's popup-open) that jumps straight to
+  // that tab/section. A lead shows one line per tab it's CURRENTLY
+  // sitting in — usually just one (its pipeline stage), but often more
+  // (e.g. dispatched + Logistics Payments + a pending Broker payment, all
+  // at once) — see getOperationalLocations() above for why.
+  //
+  // Highlighting the single most "where should I actually look" location
+  // (Ramvir, Sept 2026, reported on RJ21GB7423 — it was sitting in Vehicle
+  // Disposal · Scrapped, but with 5-6 locations listed with no ranking,
+  // that one got lost in the noise). Two earlier attempts both got the
+  // rule wrong:
+  //   1st attempt — rank by "most urgent tab" (Payments/RC/Logistics all
+  //   tied for top): wrongly picked Received at Plant over Scrapped, since
+  //   Received at Plant/Logistics/RC Tracking were all lumped into one
+  //   top tier regardless of whether they were still genuinely pending.
+  //   2nd attempt — rank by "latest in the lifecycle sequence": wrongly
+  //   picked Payments Archive (the sequence's very last step) over RC
+  //   Tracking · Pending / COD/CVS · Pending, even though Payments being
+  //   DONE says nothing about whether those other two are done.
+  // The rule that actually holds up, per Ramvir: a location that still has
+  // something PENDING always outranks one that's already done/terminal,
+  // full stop — never mind sequence order. Every location object from
+  // getOperationalLocations() now carries a `pending` boolean for exactly
+  // this (see the comment above that function). Among several pending
+  // locations, first-in-array wins (they're pushed in a reasonable
+  // business-priority order already: Logistics/Plant, Vehicle Disposal,
+  // RC Tracking, COD/CVS, Document Management, Material, then Payments).
+  // Document Management and Material (also missing from this dropdown
+  // entirely before — same gap Vehicle Disposal had) are now included too.
+  const leadRows = (lastGlobalSearchLeads).map((l, i) => {
+    const locations = [
+      { label: describeLeadLocation(l), pending: !(l.ud_status === 'Complete' && l.ha_status === 'Approved'), go: () => navigateToLeadLocation(i) },
+      ...getOperationalLocations(l, paymentsByLead, archiveByLead, codCvsByReg, receiptByLead, docsByLead, materialsByLead),
+    ];
+    const lm = l.logistics_manifest_id ? manifestById[l.logistics_manifest_id] : null;
+    if (lm) locations.push({ label: 'Manifest · ' + lm.manifest_no + ' (' + (lm.transport_mode || 'Logistic Carrier') + ' · ' + (lm.payment_status || 'Pending') + ')', pending: false,
+      go: () => { closeGlobalSearch(); if (typeof openManifestPopupById === 'function') openManifestPopupById(lm.id); } });
+    let topIdx = 0;
+    for (let idx = 0; idx < locations.length; idx++) {
+      if (locations[idx].pending && !locations[topIdx].pending) { topIdx = idx; break; }
+    }
+    const locationLines = locations.map((loc, idx) => {
+      const actionIdx = lastGlobalSearchActions.push(loc.go) - 1;
+      const isTop = idx === topIdx;
+      const style = isTop
+        ? 'font-size:11px;color:#fff;background:#1d4ed8;font-weight:700;margin-top:4px;padding:3px 8px;border-radius:5px;display:inline-block;'
+        : 'font-size:10.5px;color:#1d4ed8;font-weight:600;margin-top:2px;text-decoration:underline;';
+      return `<div style="${style}" onmousedown="event.stopPropagation();lastGlobalSearchActions[${actionIdx}]()" title="${isTop ? 'Most likely where you need to look' : 'Go to this tab'}">${loc.label} <i class="ti ti-arrow-right" style="font-size:10px;" aria-hidden="true"></i></div>`;
+    }).join('');
+    return `
+    <div style="${rowStyle}" onmousedown="closeGlobalSearch();viewLeadDetails('${l.id}')">
+      <div style="font-weight:600;font-size:12.5px;color:#111827;">${l.customer_name || '—'} <span style="color:#6b7280;font-weight:400;">${l.lead_no}</span></div>
+      <div style="font-size:11px;color:#6b7280;">${l.phone || '—'}${l.val_vehicle_number ? ' · ' + l.val_vehicle_number : ''}</div>
+      ${locationLines}
+    </div>`;
+  }).join('');
+  const partnerRows = (partners || []).map(p => `
+    <div style="${rowStyle}" onmousedown="closeGlobalSearch();showSection('partners');document.getElementById('searchPartners').value='${(p.partner_name || '').replace(/'/g, "\\'")}';filterPartnersTable(document.getElementById('searchPartners').value);">
+      <div style="font-weight:600;font-size:12.5px;color:#111827;">${p.partner_name} <span style="color:#6b7280;font-weight:400;">Partner</span></div>
+      <div style="font-size:11px;color:#6b7280;">${p.mobile || '—'}</div>
+      <div style="font-size:10.5px;color:#1d4ed8;font-weight:600;margin-top:2px;">Partners</div>
+    </div>`).join('');
+
+  const manifestRows = manifestHits.map(m => `
+    <div style="${rowStyle}" onmousedown="closeGlobalSearch();openManifestPopupById('${m.id}')">
+      <div style="font-weight:600;font-size:12.5px;color:#111827;">${m.manifest_no} <span style="color:#6b7280;font-weight:400;">Manifest</span></div>
+      <div style="font-size:11px;color:#6b7280;">${m.transport_mode || 'Logistic Carrier'} · ${m.dispatch_date || ''} · ${m.payment_status || 'Pending'}${m.to_location ? ' · to ' + m.to_location : ''}</div>
+      <div style="font-size:10.5px;color:#1d4ed8;font-weight:600;margin-top:2px;">Click to see vehicles in this manifest</div>
+    </div>`).join('');
+  const html = manifestRows + leadRows + partnerRows;
+  dropdown.innerHTML = html || '<div style="padding:12px;font-size:12px;color:#6b7280;">No matches found.</div>';
+  dropdown.style.display = '';
+}
+
+function closeGlobalSearch() {
+  const dropdown = document.getElementById('globalSearchDropdown');
+  const input = document.getElementById('globalSearchInput');
+  if (dropdown) { dropdown.style.display = 'none'; dropdown.innerHTML = ''; }
+  if (input) input.value = '';
+}
+
+document.addEventListener('click', (e) => {
+  const dropdown = document.getElementById('globalSearchDropdown');
+  const input = document.getElementById('globalSearchInput');
+  if (!dropdown || !input) return;
+  if (e.target !== input && !dropdown.contains(e.target)) dropdown.style.display = 'none';
+});
+
+// ------------------------------------------------------------
+// MASTER DATA — Admin-managed lists (Settings → Master Data), backed by
+// rewire_dropdown_options (list_key, value). Two consumption patterns:
+//   1. DYNAMIC_DROPDOWNS — fills a plain <select> (e.g. Lead Source).
+//   2. The generic MASTER SEARCH widget below — a searchable, but
+//      STRICTLY select-from-list field (Make, Location, Company/
+//      Dealership, Crane Vendor). Deliberately does NOT accept free
+//      typing as a final value — only Admin can add new values (via
+//      Master Data / Manage Vendors), so reports never end up with
+//      one-off typo'd/inconsistent values. See MASTER SEARCH WIDGET
+//      section further below for the input/validation functions.
+// Add a new managed list by adding one entry to whichever of the two
+// above fits, plus one entry to MASTER_DATA_LISTS (its card on the
+// Master Data tab) — no other code changes needed.
+// ------------------------------------------------------------
+const DYNAMIC_DROPDOWNS = [
+  { listKey: 'lead_source', selector: '#addModal [data-field="lead_source"]', placeholder: 'Select source' },
+];
+const MASTER_DATA_LISTS = [
+  { listKey: 'vehicle_make', label: 'Make' },
+  { listKey: 'lead_source', label: 'Lead Source' },
+  { listKey: 'location', label: 'Location' },
+  // Sub-Location (Ramvir, Sept 2026) — a Location can have named
+  // Sub-Locations under it (e.g. Udaipur -> TLC Udaipur). Same
+  // rewire_dropdown_options table, just with parent_value set to the
+  // owning Location's value — parentListKey here tells
+  // renderMasterDataSection() to render/manage it as a two-level list
+  // instead of a flat one.
+  { listKey: 'sub_location', label: 'Sub-Location', parentListKey: 'location' },
+  { listKey: 'company_dealership', label: 'Company / Dealership Name' },
+  { listKey: 'vehicle_dropping_person', label: 'Vehicle Dropping Person' },
+  // Scrap Sold (Ramvir, Sept 2026) — "Commodity Name (Material Category)"
+  // with a Sub Category dependent on it, same two-level parentListKey
+  // pattern as Location -> Sub-Location above.
+  { listKey: 'scrap_commodity_category', label: 'Scrap Commodity Category' },
+  { listKey: 'scrap_commodity_subcategory', label: 'Scrap Commodity Sub Category', parentListKey: 'scrap_commodity_category' },
+];
+
+async function loadDynamicDropdowns() {
+  const { data, error } = await sb.from('rewire_dropdown_options').select('id, list_key, value, parent_value').eq('active', true).order('sort_order').order('value');
+  if (error) { console.error(error); return; }
+  const grouped = {};
+  (data || []).forEach(row => {
+    (grouped[row.list_key] = grouped[row.list_key] || []).push({ id: row.id, value: row.value, parentValue: row.parent_value });
+  });
+  dropdownOptionsCache = grouped;
+  DYNAMIC_DROPDOWNS.forEach(({ listKey, selector, placeholder }) => {
+    const el = document.querySelector(selector);
+    if (!el) return;
+    const opts = grouped[listKey] || [];
+    const current = el.value;
+    el.innerHTML = `<option value="">${placeholder}</option>` + opts.map(o => `<option>${o.value}</option>`).join('');
+    if (current) el.value = current;
+  });
+}
+
+function renderMasterDataSection() {
+  const container = document.getElementById('masterDataLists');
+  if (!container) return;
+  container.innerHTML = MASTER_DATA_LISTS.map(({ listKey, label, parentListKey }) => {
+    const opts = dropdownOptionsCache[listKey] || [];
+    const chip = (o) => `<span style="display:inline-flex;align-items:center;gap:6px;background:#f1f5f9;border:0.5px solid var(--color-border-secondary);border-radius:20px;padding:5px 10px;font-size:12px;margin:0 6px 6px 0;">${o.value}<i class="ti ti-pencil" style="cursor:pointer;color:#64748b;font-size:12px;" title="Rename" onclick="editDropdownOption('${o.id}','${o.value.replace(/'/g, "\\'")}')"></i><span style="cursor:pointer;color:#94a3b8;font-weight:700;" onclick="deleteDropdownOption('${o.id}')">&times;</span></span>`;
+
+    // Hierarchical list (currently just Sub-Location under Location) —
+    // grouped under each parent Location heading instead of one flat chip
+    // bag, and the "Add" row needs a parent picked first.
+    if (parentListKey) {
+      const parentOpts = dropdownOptionsCache[parentListKey] || [];
+      const groups = parentOpts.map(p => {
+        const children = opts.filter(o => o.parentValue === p.value);
+        const chips = children.map(chip).join('');
+        return `<div style="margin-bottom:10px;">
+          <div style="font-size:11px;font-weight:700;color:var(--color-text-secondary);margin-bottom:5px;">${p.value} <span style="font-weight:400;color:var(--color-text-tertiary);">(${children.length})</span></div>
+          <div style="display:flex;flex-wrap:wrap;">${chips || '<span style="font-size:11px;color:var(--color-text-tertiary);">No sub-locations yet</span>'}</div>
+        </div>`;
+      }).join('');
+      // Sub-locations whose parent Location got renamed/deleted after they
+      // were added would otherwise silently vanish from view — surface them
+      // under an "Unassigned" heading instead of hiding them.
+      const orphans = opts.filter(o => !parentOpts.some(p => p.value === o.parentValue));
+      const orphanBlock = orphans.length ? `<div style="margin-bottom:10px;">
+        <div style="font-size:11px;font-weight:700;color:#dc2626;margin-bottom:5px;">Unassigned (parent Location missing) (${orphans.length})</div>
+        <div style="display:flex;flex-wrap:wrap;">${orphans.map(chip).join('')}</div>
+      </div>` : '';
+      return `<div class="vd-card" style="margin-bottom:16px;">
+        <div style="font-weight:700;font-size:13px;margin-bottom:10px;">${label} <span style="font-weight:400;color:var(--color-text-tertiary);">(${opts.length})</span></div>
+        <div style="max-height:260px;overflow-y:auto;border:0.5px solid var(--color-border-tertiary);border-radius:8px;padding:10px;">${groups}${orphanBlock || (parentOpts.length ? '' : '<span style="font-size:12px;color:var(--color-text-tertiary);">Add a Location first, above.</span>')}</div>
+        <div style="display:flex;gap:8px;margin-top:10px;max-width:500px;">
+          <select id="ddParent_${listKey}" style="border:0.5px solid var(--color-border-secondary);border-radius:6px;padding:6px 10px;font-size:12px;">
+            <option value="">Location…</option>
+            ${parentOpts.map(p => `<option value="${p.value.replace(/"/g, '&quot;')}">${p.value}</option>`).join('')}
+          </select>
+          <input id="ddNew_${listKey}" placeholder="New ${label} value" style="flex:1;border:0.5px solid var(--color-border-secondary);border-radius:6px;padding:6px 10px;font-size:12px;" onkeydown="if(event.key==='Enter')addDropdownOption('${listKey}','${parentListKey}')" />
+          <button class="btn btn-primary" onclick="addDropdownOption('${listKey}','${parentListKey}')">Add</button>
+        </div>
+      </div>`;
+    }
+
+    // Chip text is now a click target for rename (pencil icon) instead of
+    // plain text — Admin could previously only delete-and-re-add a value,
+    // which loses the "this rebrands to that" link (existing records keep
+    // showing the OLD text, since delete never rewrites rows that already
+    // used it). Editing in place via UPDATE keeps the same row id, so any
+    // Master Search widget currently showing this value doesn't break.
+    const chips = opts.map(chip).join('');
+    return `<div class="vd-card" style="margin-bottom:16px;">
+      <div style="font-weight:700;font-size:13px;margin-bottom:10px;">${label} <span style="font-weight:400;color:var(--color-text-tertiary);">(${opts.length})</span></div>
+      <div style="display:flex;flex-wrap:wrap;width:100%;box-sizing:border-box;max-height:260px;overflow-y:auto;border:0.5px solid var(--color-border-tertiary);border-radius:8px;padding:10px;">${chips || '<span style="font-size:12px;color:var(--color-text-tertiary);">No values yet</span>'}</div>
+      <div style="display:flex;gap:8px;margin-top:10px;max-width:400px;">
+        <input id="ddNew_${listKey}" placeholder="New ${label} value" style="flex:1;border:0.5px solid var(--color-border-secondary);border-radius:6px;padding:6px 10px;font-size:12px;" onkeydown="if(event.key==='Enter')addDropdownOption('${listKey}')" />
+        <button class="btn btn-primary" onclick="addDropdownOption('${listKey}')">Add</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function addDropdownOption(listKey, parentListKey) {
+  const input = document.getElementById('ddNew_' + listKey);
+  const value = input ? input.value.trim() : '';
+  if (!value) return;
+  let parentValue = null;
+  if (parentListKey) {
+    const parentSelect = document.getElementById('ddParent_' + listKey);
+    parentValue = parentSelect ? parentSelect.value : '';
+    if (!parentValue) { notify('Pick a Location first.', { icon: 'error', title: 'Missing field' }); return; }
+  }
+  const { error } = await sb.from('rewire_dropdown_options').insert({ list_key: listKey, value, parent_value: parentValue, created_by: currentProfile.id });
+  if (error) { notify('Error adding value: ' + error.message, { icon: 'error' }); return; }
+  if (input) input.value = '';
+  await loadDynamicDropdowns();
+  renderMasterDataSection();
+}
+
+async function editDropdownOption(id, currentValue) {
+  const trimmed = await promptDialog('Rename this value', currentValue);
+  if (!trimmed || trimmed === currentValue) return;
+  const { error } = await sb.from('rewire_dropdown_options').update({ value: trimmed }).eq('id', id);
+  if (error) { notify('Error renaming value: ' + error.message, { icon: 'error' }); return; }
+  notify('Renamed. Existing records that already used the old text keep showing it — only the dropdown itself is updated.');
+  await loadDynamicDropdowns();
+  renderMasterDataSection();
+}
+
+async function deleteDropdownOption(id) {
+  const ok = await confirmDialog('Remove this value? Records that already used it will keep showing it, only the dropdown loses the option.');
+  if (!ok) return;
+  const { error } = await sb.from('rewire_dropdown_options').delete().eq('id', id);
+  if (error) { notify('Error deleting value: ' + error.message, { icon: 'error' }); return; }
+  await loadDynamicDropdowns();
+  renderMasterDataSection();
+}
+
+// ------------------------------------------------------------
+// EXISTING-UPLOAD HINT (Ramvir, Sept 2026 — "form edit karte hai to upload
+// option dobara mangta hai... pahle se upload hui image bhi dikhni chahiye").
+// The actual data was never being lost on re-save for most multi-file edit
+// forms (Bank KYC/VZ/Upload Delivery already keep the old URL when no new
+// file is picked — see each submit function's `if (url) payload.x = url`
+// pattern) — the gap was purely visual: reopening one of these forms showed
+// every file input as "No file chosen" with nothing telling the user a file
+// is already saved, which reads as "it's gone" even though it isn't. This
+// helper is the one fix for that everywhere: call it after prefilling a
+// modal's other fields, with a {field: url} map (field = the input's
+// data-field value), and it drops a small "Already uploaded" note + View
+// link right under each file input that has a saved value, or hides that
+// note when there's nothing saved (fresh entry). Doesn't touch save logic
+// at all — purely what's shown on screen.
+function markExistingUploads(modalSelector, urlsByField) {
+  Object.entries(urlsByField).forEach(([field, url]) => {
+    const input = document.querySelector(modalSelector + ' [data-field="' + field + '"]');
+    if (!input || input.type !== 'file') return;
+    let hint = input.nextElementSibling;
+    if (!hint || !hint.classList || !hint.classList.contains('upload-existing-hint')) {
+      hint = document.createElement('div');
+      hint.className = 'upload-existing-hint';
+      hint.style.cssText = 'font-size:11px;color:var(--color-text-tertiary);margin-top:4px;';
+      input.insertAdjacentElement('afterend', hint);
+    }
+    if (isRealFileUrl(url)) {
+      hint.innerHTML = '<i class="ti ti-circle-check" style="color:#059669;font-size:11px;" aria-hidden="true"></i> Already uploaded — pick a file only to replace it. <a href="javascript:void(0)" onclick="viewAccessoryPhoto(\'' + url.replace(/'/g, "\\'") + '\',\'File\')" style="color:#1d4ed8;text-decoration:underline;">View</a>';
+      hint.style.display = '';
+    } else {
+      hint.style.display = 'none';
+    }
+  });
+}
+
+// ------------------------------------------------------------
+// MASTER SEARCH WIDGET — generic searchable-but-strict-select input.
+// HTML pattern (put this around any <input>):
+//   <div class="partner-search-wrap">
+//     <div class="ps-input-row" onclick="toggleMasterSearchDD('someId',event)">
+//       <i class="ti ti-search"></i>
+//       <input id="someId" data-field="..." data-masterlist="location"
+//              placeholder="Search…" oninput="filterMasterSearchInput(this)"
+//              onclick="openMasterSearch('someId');event.stopPropagation()" autocomplete="off" />
+//       <i class="ti ti-chevron-down"></i>
+//     </div>
+//     <div class="ps-dropdown" id="msd_someId"><div class="ps-list" id="msl_someId"></div></div>
+//   </div>
+// data-masterlist can be any rewire_dropdown_options list_key, or the
+// special value "crane_vendor" (reads allCraneVendors instead).
+// The input's typed text only ever FILTERS the list — the field's real
+// value is only ever set by clicking a suggestion (pickMasterSearchValue),
+// so free-typed text that doesn't match anything simply won't validate
+// at save time (see isValidMasterValue, called from each submit fn).
+// ------------------------------------------------------------
+function getMasterListValues(listKey) {
+  // Send to Plant "To Location" (Oct 2026): Jaipur Plant + Jaipur's own
+  // sub-locations (yards) + the From Location's sub-locations (local move).
+  // Entries are "Location — Sub-Location" labels, parsed by parseLogisticsTo().
+  if (listKey === 'logistics_to') {
+    const fromEl = document.getElementById('logisticsFromLocation');
+    const from = normalizeMasterValue('location', fromEl ? fromEl.value : '');
+    const subsOf = loc => (dropdownOptionsCache.sub_location || []).filter(o => (o.parentValue || '').trim().toLowerCase() === (loc || '').trim().toLowerCase()).map(o => o.value);
+    const out = ['Jaipur Plant'];
+    subsOf('Jaipur').forEach(sv => out.push('Jaipur — ' + sv));
+    if (from && from.toLowerCase() !== 'jaipur' && from.toLowerCase() !== 'jaipur plant') subsOf(from).forEach(sv => out.push(from + ' — ' + sv));
+    return out;
+  }
+  if (listKey === 'crane_vendor') return allCraneVendors.map(v => v.vendor_name);
+  if (listKey === 'transporter') return allTransporters.map(t => t.transporter_name);
+  return (dropdownOptionsCache[listKey] || []).map(o => o.value);
+}
+function isValidMasterValue(listKey, value) {
+  if (!value) return true;
+  return getMasterListValues(listKey).some(v => v.toLowerCase() === value.trim().toLowerCase());
+}
+
+// Returns the master list's OWN casing for a value that matches
+// case-insensitively (e.g. typed "ALWAR" -> master list's "Alwar"), or the
+// trimmed input unchanged if nothing matches. isValidMasterValue() above
+// only checks case-insensitively but every save site was still writing the
+// user's raw typed casing straight to the DB — that's how "Alwar"/"ALWAR"/
+// "alwar" all ended up live as separate values (Ramvir, Sept 2026, Location
+// Tracking filter dropdown). Every isValidMasterValue() call that gates a
+// save must run its value through this before writing, so only ONE casing
+// per master value ever reaches the database again.
+function normalizeMasterValue(listKey, value) {
+  if (!value) return value;
+  const trimmed = value.trim();
+  const match = getMasterListValues(listKey).find(v => v.toLowerCase() === trimmed.toLowerCase());
+  return match || trimmed;
+}
+
+// Sub-Location dependent dropdown (Ramvir, Sept 2026) — a plain <select>
+// rather than the searchable Master Search widget above, since its list
+// depends on which Location was picked first. Used by the Upload Delivery
+// form (udVehicleSubParking) and Location Tracking's Update modal
+// (locUpdateSubParking). Call whenever the Location field changes, and
+// once more after data loads to restore a saved value.
+function refreshSubLocationSelect(selectId, locationValue, currentSubValue) {
+  const el = document.getElementById(selectId);
+  if (!el) return;
+  const loc = (locationValue || '').trim();
+  // Case/whitespace-insensitive match (Ramvir, Sept 2026 fix) — this used
+  // to be a strict === compare, which silently returned zero Sub-Location
+  // options whenever the typed/stored Location differed from the master
+  // list's exact casing (e.g. "delhi" typed by hand and blurred without
+  // clicking a suggestion, vs the master list's "Delhi") — the location
+  // field itself still accepted the value (isValidMasterValue's own check
+  // is already case-insensitive), so the mismatch was invisible except for
+  // the Sub-Location dropdown quietly showing only "— None —". Matches the
+  // same case-insensitive convention isValidMasterValue() uses.
+  const locLower = loc.toLowerCase();
+  const opts = (dropdownOptionsCache.sub_location || []).filter(o => (o.parentValue || '').trim().toLowerCase() === locLower);
+  el.innerHTML = '<option value="">— None —</option>' + opts.map(o => `<option value="${o.value.replace(/"/g, '&quot;')}">${o.value}</option>`).join('');
+  el.disabled = !loc;
+  if (currentSubValue) {
+    const match = opts.find(o => o.value.trim().toLowerCase() === currentSubValue.trim().toLowerCase());
+    if (match) el.value = match.value;
+  }
+}
+// Positions a master-search dropdown at fixed (viewport) coordinates
+// computed from its input's current on-screen position. Needed because
+// some of these widgets render inside .crm-table, which sets
+// overflow:hidden for its own rounded corners — that clips a plain
+// position:absolute dropdown almost immediately (looks like it "flashes
+// and hides"). position:fixed with JS-computed coordinates escapes any
+// ancestor's overflow clipping entirely.
+function positionMasterDropdown(id) {
+  const input = document.getElementById(id);
+  const dd = document.getElementById('msd_' + id);
+  if (!input || !dd) return;
+  const anchor = input.closest('.ps-input-row') || input;
+  const rect = anchor.getBoundingClientRect();
+  dd.style.position = 'fixed';
+  dd.style.right = 'auto';
+  dd.style.left = rect.left + 'px';
+  dd.style.top = (rect.bottom + 3) + 'px';
+  dd.style.width = rect.width + 'px';
+}
+function openMasterSearch(id) {
+  const d = document.getElementById('msd_' + id);
+  if (d) {
+    // Populate the full list on click/arrow (Ramvir, Oct 2026) — used to
+    // stay empty until something was typed.
+    const input = document.getElementById(id);
+    if (input) renderMasterSearchList(input, true);
+    positionMasterDropdown(id); d.classList.add('open');
+  }
+}
+function toggleMasterSearchDD(id, e) {
+  e.stopPropagation();
+  const d = document.getElementById('msd_' + id);
+  if (!d) return;
+  const nowOpen = !d.classList.contains('open');
+  if (nowOpen) { const inp = document.getElementById(id); if (inp) renderMasterSearchList(inp, true); positionMasterDropdown(id); }
+  d.classList.toggle('open', nowOpen);
+}
+// Open dropdowns are screen-anchored (position:fixed) rather than
+// scrolling with their container, so close them on any scroll instead of
+// letting them visually drift away from the input. Capture phase so this
+// also catches scrolling inside nested scrollable containers (.table-area etc).
+//
+// Fix (Ramvir, Sept 2026 — Company/Dealership Name and "every searchable
+// dropdown": couldn't scroll down the suggestion list, and a value below
+// the fold couldn't be picked at all unless typed out in full). Root cause:
+// the dropdown's OWN result list (.ps-list) is itself a scrollable region
+// when it has more items than fit — scrolling inside it fires a 'scroll'
+// event whose target is that list, and since this listener runs in the
+// capture phase it still sees that event on its way down to the target
+// even though 'scroll' doesn't bubble, closing the dropdown on literally
+// the first scroll tick inside its own list. That's why it only ever felt
+// selectable when narrowing the filter (by typing enough characters) shrank
+// the list to fit without needing to scroll at all. Skipping any scroll
+// whose target is INSIDE an already-open dropdown fixes both — the
+// close-on-page-scroll behavior this was written for (scrolling the
+// modal/table body behind it) is untouched, since that scroll target is
+// never inside the dropdown itself.
+document.addEventListener('scroll', function (e) {
+  document.querySelectorAll('.ps-dropdown.open[id^="msd_"]').forEach(d => {
+    if (d.contains(e.target)) return;
+    d.classList.remove('open');
+  });
+}, true);
+function filterMasterSearchInput(inputEl) {
+  const id = inputEl.id;
+  const d = document.getElementById('msd_' + id);
+  if (d) { positionMasterDropdown(id); d.classList.add('open'); }
+  renderMasterSearchList(inputEl, false);
+}
+function renderMasterSearchList(inputEl, showAll) {
+  const id = inputEl.id;
+  const listKey = inputEl.dataset.masterlist;
+  let items = getMasterListValues(listKey);
+  // Optional data-exclude="Value One|Value Two" on the <input> itself —
+  // hides specific master-list values from just THIS field's dropdown
+  // without touching the shared master list (other fields using the same
+  // listKey still see the full list). Used for Location Tracking's
+  // Update Location field: "Jaipur Plant" is reached only via Logistics'
+  // own "Send to Plant" flow (which also flips logistics_status, the real
+  // gate Vehicle Disposal/Received at Plant key off) — picking it here
+  // instead would fake that transition without it, silently misrouting
+  // the vehicle into Vehicle Disposal.
+  if (inputEl.dataset.exclude) {
+    const excluded = inputEl.dataset.exclude.split('|');
+    items = items.filter(v => !excluded.includes(v));
+  }
+  const q = showAll ? '' : inputEl.value.toLowerCase().trim();
+  const filtered = q ? items.filter(v => v.toLowerCase().includes(q)) : items;
+  const el = document.getElementById('msl_' + id);
+  if (!el) return;
+  el.innerHTML = filtered.length
+    ? filtered.map(v => `<div class="ps-item" onclick="pickMasterSearchValue('${id}','${v.replace(/'/g, "\\'")}')">
+        <div class="ps-item-avatar">${v.charAt(0).toUpperCase()}</div>
+        <div><div class="ps-item-name">${v}</div></div>
+      </div>`).join('')
+    : '<div class="ps-item" style="color:var(--color-text-tertiary);font-size:12px;">No match — ask Admin to add it in Master Data</div>';
+}
+function pickMasterSearchValue(id, value) {
+  const input = document.getElementById(id);
+  if (input) input.value = value;
+  const d = document.getElementById('msd_' + id);
+  if (d) d.classList.remove('open');
+  // Vehicle Send to = "Logistic Carrier" is the one value that means an
+  // actual paid transporter is arranging the move — every other Vehicle
+  // Dropping Person value means someone's self-carrying/self-driving it,
+  // so the Transporter block only makes sense for that one case.
+  if (id === 'logisticsVehicleSendTo' && typeof handleLogisticsVehicleSendTo === 'function') handleLogisticsVehicleSendTo(value);
+  // Picking a Location refreshes its paired Sub-Location <select> — see
+  // refreshSubLocationSelect() above. Upload Delivery and Location
+  // Tracking's Update modal are the two places Location is actually set.
+  if (id === 'udVehicleParking') refreshSubLocationSelect('udVehicleSubParking', value);
+  if (id === 'locUpdateValue') refreshSubLocationSelect('locUpdateSubValue', value);
+  // Price Negotiation's Location field (Modals-Pipeline.html) has the
+  // exact same paired Sub-Location <select> as Upload Delivery/Location
+  // Tracking, but was missing here — clicking a Location suggestion left
+  // pnVehicleSubParking stuck on "— None —" even for a Location (e.g.
+  // Udaipur) with 20+ real Sub-Locations configured. The field's onblur
+  // handler alone wasn't reliably covering the click-a-suggestion path.
+  if (id === 'pnVehicleParking') refreshSubLocationSelect('pnVehicleSubParking', value);
+  if (id === 'plantReceiveLocation') refreshSubLocationSelect('plantReceiveSubLocation', value);
+  if (id === 'logisticsFromLocation') { const t = document.getElementById('logisticsToLocation'); if (t) t.value = ''; }
+}
+
+// Logistics "Send to Plant" popup — shows/hides the Transporter block
+// (Transporter/Vehicle No/Dispatch Date/Freight Amount) based on what was
+// picked for "Vehicle Send to". Only "Logistic Carrier" needs those —
+// any other named Vehicle Dropping Person is self-carrying the vehicle,
+// nothing to ask. Called on pick (pickMasterSearchValue above) and on
+// blur (in case someone typed the exact value without clicking a
+// suggestion) — see logisticsSendModal, Modals-General.html.
+function handleLogisticsVehicleSendTo(value) {
+  const m = (value || '').trim();
+  const vis = {
+    logisticsTransporterField: m === 'Logistic Carrier',
+    logisticsCraneField: m === 'Crane',
+    logisticsDriverField: m === 'Driver',
+    logisticsDriverPhoneField: m === 'Driver',
+    logisticsFromLocationField: !!m,
+    logisticsToLocationField: !!m,
+    logisticsVehicleNoField: ['Logistic Carrier', 'Towing'].includes(m),
+    logisticsDispatchDateField: !!m,
+    logisticsOtherDetailsField: ['Logistic Carrier', 'Towing'].includes(m),
+    logisticsCraneRatesField: m === 'Crane',
+  };
+  Object.keys(vis).forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = vis[id] ? '' : 'none';
+  });
+  if (m === 'Driver') {
+    const dl = document.getElementById('logisticsDriverList');
+    if (dl) dl.innerHTML = getMasterListValues('vehicle_dropping_person').filter(x => /^driver/i.test(x)).map(x => '<option value="' + x.replace(/^driver[\s\-:]*/i, '').replace(/"/g, '&quot;') + '">').join('');
+  }
+  if (m === 'Crane' && typeof renderLogisticsCraneRates === 'function') renderLogisticsCraneRates();
+}
+document.addEventListener('click', function (e) {
+  document.querySelectorAll('.ps-dropdown[id^="msd_"]').forEach(d => {
+    if (d.parentElement && !d.parentElement.contains(e.target)) d.classList.remove('open');
+  });
+});
+
+// Compact HTML-string version of the same widget, for use inside
+// dynamically-built table rows (e.g. Crane Charges) where each row
+// needs its own uniquely-id'd instance. `width` is a CSS width string.
+function renderMasterSearchField(id, listKey, value, placeholder, width) {
+  const v = (value || '').replace(/"/g, '&quot;');
+  return `<div class="partner-search-wrap" style="width:${width || '130px'};">
+    <div class="ps-input-row" style="padding:4px 7px;" onclick="toggleMasterSearchDD('${id}',event)">
+      <input id="${id}" value="${v}" data-masterlist="${listKey}" placeholder="${placeholder || 'Search…'}" style="font-size:12px;" oninput="filterMasterSearchInput(this)" onclick="openMasterSearch('${id}');event.stopPropagation()" autocomplete="off" />
+      <i class="ti ti-chevron-down" aria-hidden="true"></i>
+    </div>
+    <div class="ps-dropdown" id="msd_${id}"><div class="ps-list" id="msl_${id}"></div></div>
+  </div>`;
+}
+// (allLeadsCache removed — replaced by per-tab paginated caches below,
+// so memory/network usage stays bounded no matter how much data exists)
+
+// ------------------------------------------------------------
+// NOTIFY — SweetAlert2 wrapper used everywhere instead of notify()
+// ------------------------------------------------------------
+function notify(message, opts) {
+  opts = opts || {};
+  const isError = /error|failed|fail/i.test(message);
+  Swal.fire({
+    icon: opts.icon || (isError ? 'error' : 'success'),
+    title: opts.title || (isError ? 'Something went wrong' : 'Done'),
+    text: message,
+    confirmButtonColor: '#1d4ed8',
+    timer: opts.icon === 'error' || isError ? undefined : 2200,
+    timerProgressBar: !isError,
+  });
+}
+function toProperCase(str) {
+  if (!str) return str;
+  return str.replace(/\w\S*/g, t => t.charAt(0).toUpperCase() + t.substr(1).toLowerCase());
+}
+
+function confirmDialog(message) {
+  return Swal.fire({
+    icon: 'question',
+    title: 'Are you sure?',
+    text: message,
+    showCancelButton: true,
+    confirmButtonColor: '#1d4ed8',
+    cancelButtonColor: '#94a3b8',
+    confirmButtonText: 'Yes',
+  }).then(r => r.isConfirmed);
+}
+
+// Single-text-field prompt, SweetAlert-styled to match confirmDialog rather
+// than falling back to the browser's plain window.prompt(). Returns the
+// trimmed new value, or null if cancelled/left blank/unchanged.
+function promptDialog(title, defaultValue) {
+  return Swal.fire({
+    title: title,
+    input: 'text',
+    inputValue: defaultValue || '',
+    showCancelButton: true,
+    confirmButtonColor: '#1d4ed8',
+    cancelButtonColor: '#94a3b8',
+    confirmButtonText: 'Save',
+  }).then(r => (r.isConfirmed && r.value ? r.value.trim() : null));
+}
+
+// Generic "Mark Lost" usable from any stage form — prompts for a reason,
+// records which stage the lead was lost at, then closes the lead out.
+async function markLeadLost(stageName) {
+  if (!activeLeadId) { notify('No lead selected', { icon: 'error' }); return; }
+  const { value: reason } = await Swal.fire({
+    icon: 'warning',
+    title: `Mark lost at ${stageName}?`,
+    input: 'text',
+    inputPlaceholder: 'Reason for losing this lead…',
+    showCancelButton: true,
+    confirmButtonText: 'Mark Lost',
+    confirmButtonColor: '#dc2626',
+    inputValidator: (v) => !v || !v.trim() ? 'A reason is required' : undefined,
+  });
+  const trimmedReason = (reason || '').trim();
+  if (!trimmedReason) return;
+
+  const { error } = await sb.from('rewire_master_data').update({
+    overall_status: 'Closed Lost',
+    lead_status: 'Closed Lost with Reason',
+    lost_at_stage: stageName,
+    lost_reason: trimmedReason,
+    last_updated_by: currentProfile.id,
+  }).eq('id', activeLeadId);
+  if (error) { notify('Error marking lost: ' + error.message, { icon: 'error' }); return; }
+
+  notify(`Lead marked Lost at ${stageName}.`);
+  document.querySelectorAll('.modal-backdrop').forEach(m => m.style.display = 'none');
+  await refreshLeadsTable();
+}
+
+// ------------------------------------------------------------
+// AUTH
+// ------------------------------------------------------------
+async function initAuth() {
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) {
+    document.body.innerHTML =
+      '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:Inter,sans-serif;gap:16px;">' +
+      '<div style="font-size:15px;color:#475569;">You\'re not signed in.</div>' +
+      '<button onclick="window.top.location.href=APP_URL+\'?page=login\'" ' +
+      'style="padding:10px 20px;background:#1d4ed8;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">Go to Login</button>' +
+      '</div>';
+    return;
+  }
+  if (!(await loadCurrentProfile())) return;
+  // These 6 loaders are mutually independent (each fetches its own table into
+  // its own cache var) — loadPeAndManagerOptions only reads currentProfile
+  // (already set above), it doesn't depend on the other 5. Running them in
+  // parallel instead of one-by-one cuts app-bootstrap network round-trips
+  // from 7 sequential awaits down to 2, which was a real contributor to the
+  // "DMS load hone me bahut time laga rha hai" slowness complaint.
+  await Promise.all([
+    loadPartners(),
+    loadCommissionPersons(),
+    loadPeAndManagerOptions(),
+    loadDynamicDropdowns(),
+    loadCraneVendors(),
+    loadTransporters(),
+  ]);
+  await refreshLeadsTable();
+  if (typeof renderDashboard === 'function') renderDashboard();
+  wireTableEnhancements();
+  if (typeof initSidebarGroups === 'function') initSidebarGroups();
+  // All Leads report's "Columns" picker (JS-TableExport.html) — has no
+  // live table to toggle visibility on (Reports is just download cards),
+  // it only needs to exist so exportLeadsReport() can read the selection.
+  if (typeof initColumnPicker === 'function' && typeof ALL_LEADS_COLUMNS !== 'undefined') {
+    initColumnPicker('allLeads', ALL_LEADS_COLUMNS, 'allLeadsColumnPicker', 'no-such-table-allLeads');
+  }
+}
+
+// ------------------------------------------------------------
+// TABLE ENHANCEMENTS — applies to every <table class="crm-table"> in the
+// app automatically, with no per-table wiring needed:
+//   1) Click any column header to sort by it (click again to reverse).
+//   2) Client-side pagination at 50 rows/page (Prev/Next under the table).
+// Works generically off the rendered DOM (header text + cell text), so it
+// doesn't matter how each section builds its rows. A MutationObserver on
+// each table's <tbody> re-applies pagination automatically whenever a
+// section's render function replaces the rows (new data, a filter, etc.)
+// — sections never need to call anything here themselves.
+// ------------------------------------------------------------
+const TW_PAGE_SIZE = 50;
+
+function wireTableEnhancements() {
+  let twCounter = 0;
+  // table[data-no-enhance] opts a table out entirely — for small fixed
+  // reference tables inside a modal (e.g. plantAccessoriesModal's
+  // Item/Valuation/Delivery/Present-at-Plant comparison table) where
+  // sort/column-filter/pagination/frozen-columns make no sense and were
+  // actively getting in the way (unwanted filter icons cluttering the
+  // modal, and the tbody-replacement MutationObserver re-running on every
+  // modal open interfering with the row's own click handlers).
+  document.querySelectorAll('table.crm-table:not([data-no-enhance])').forEach(table => {
+    try { wireOneTable(table, twCounter++); } catch (e) { console.error('wireTableEnhancements failed for a table:', e); }
+  });
+}
+
+function wireOneTable(table, twCounter) {
+    if (table.dataset.twEnhanced) return;
+    table.dataset.twEnhanced = '1';
+    if (!table.id) table.id = 'twTable' + (twCounter++) + '_' + Math.random().toString(36).slice(2, 7);
+
+    const thead = table.querySelector('thead');
+    if (thead) {
+      thead.querySelectorAll('th').forEach((th, colIndex) => {
+        // Skip header cells that hold a real control (e.g. the Logistics
+        // "select all" checkbox) — sorting doesn't apply to those, and
+        // overwriting their textContent for the sort arrow would delete
+        // the control.
+        if (th.querySelector('input, select, button, a')) return;
+        // Wrap the header's label text in its own <span> — sortTableByColumn
+        // needs somewhere to write/clear the ▲▼ arrow, but doing that via
+        // th.textContent (as before) wipes out ANY other child element,
+        // including the column-filter icon wireColumnFilters appends right
+        // after this loop. Sorting one column used to silently delete every
+        // table's filter icons the first time it ran. Everything now reads
+        // and writes only this span, leaving sibling elements alone.
+        const label = document.createElement('span');
+        label.className = 'th-sort-label';
+        label.textContent = th.textContent;
+        th.textContent = '';
+        th.appendChild(label);
+        th.style.cursor = 'pointer';
+        th.style.userSelect = 'none';
+        th.title = 'Click to sort';
+        th.addEventListener('click', () => sortTableByColumn(table, colIndex, th));
+      });
+    }
+    wireColumnFilters(table);
+    wireStickyColumns(table);
+
+    // Generic search box — only added when this table's filter-row doesn't
+    // already have one of its own (most sections already wired a
+    // purpose-built search input; this just fills the gap for the rest,
+    // e.g. Logistics, Omini Pay, Commission, Received at Plant).
+    const filterRow = table.closest('.table-area') ? table.closest('.table-area').querySelector('.filter-row') : null;
+    if (filterRow && !filterRow.querySelector('.search-field, input[type="search"]')) {
+      const wrap = document.createElement('div');
+      wrap.className = 'search-field';
+      wrap.innerHTML = '<i class="ti ti-search" aria-hidden="true"></i><input placeholder="Search…" />';
+      filterRow.insertBefore(wrap, filterRow.firstChild);
+      wrap.querySelector('input').addEventListener('input', (e) => filterTableGeneric(table, e.target.value));
+    }
+
+    const tbody = table.querySelector('tbody');
+    if (tbody) {
+      // Column widths are re-measured on every tbody change, not just once —
+      // wireOneTable() runs at app bootstrap while most sections (and their
+      // tables) are still display:none, where getBoundingClientRect() would
+      // measure 0 width. By the time a section's render function actually
+      // populates real rows (this observer firing), that section is visible
+      // and widths are measurable, so this is also effectively the "first
+      // real" placement for frozen columns, not just a resync.
+      new MutationObserver(() => { applyColumnFilters(table); paginateTable(table, 0); applyStickyColumnOffsets(table); applyStickyHeaderOffset(table); }).observe(tbody, { childList: true });
+      applyColumnFilters(table);
+      paginateTable(table, 0);
+    }
+}
+
+// ------------------------------------------------------------
+// FROZEN FIRST COLUMNS — "last column tak scroll karte hi pata nahi chalta
+// kis customer ka row hai" on wide tables (Purchased, Payments, Crane
+// Charges, etc.). Detects the "Lead No." + "Customer" header pair by TEXT
+// rather than hardcoding column 1/2, since several tables lead with a
+// checkbox or an "Edit" action column instead (Logistics, To be Sent for
+// Payment, Closed Lost) — freezing literal columns 1-2 there would pin the
+// checkbox and scroll Customer out of view, missing the entire point.
+// Falls back to literal columns 1-2 only for a wide table with neither
+// column (there are none today, but keeps this safe for future tables).
+// Column widths are real content-driven pixel widths, not fixed, so they're
+// measured via getBoundingClientRect() and re-applied whenever a table's
+// data changes (piggy-backed on the same tbody MutationObserver used for
+// filters/pagination above) or the window resizes.
+// ------------------------------------------------------------
+function wireStickyColumns(table) {
+  const headRow = table.querySelector('thead tr');
+  if (!headRow) return;
+  const ths = Array.from(headRow.children);
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const idxLead = ths.findIndex(th => norm(th.textContent).indexOf('lead no') === 0);
+  let start, count;
+  if (idxLead !== -1 && ths[idxLead + 1] && norm(ths[idxLead + 1].textContent) === 'customer') {
+    start = idxLead; count = 2;
+    // A "select all" checkbox column right before Lead No. (Logistics,
+    // To be Sent for Payment, Closed Lost) was deliberately left
+    // unfrozen before — but the whole point of scrolling right on these
+    // tables is to check Location/Vehicle details BEFORE deciding what to
+    // select, and losing the checkbox off-screen while doing that defeats
+    // that (Ramvir, screenshot — Logistics tab). Pin it along with Lead
+    // No./Customer whenever it's there.
+    if (idxLead > 0 && ths[idxLead - 1].querySelector('input[type="checkbox"]')) {
+      start = idxLead - 1; count = 3;
+    }
+  } else if (ths.length > 6) {
+    start = 0; count = 2; // fallback for a wide table with no Lead No./Customer pair
+  } else {
+    return; // narrow table (e.g. COD/CVS, directory tables) — nothing worth freezing
+  }
+  table.dataset.freezeStart = String(start);
+  table.dataset.freezeCount = String(count);
+}
+
+function applyStickyColumnOffsets(table) {
+  if (table.dataset.freezeStart === undefined) return;
+  const startIdx = parseInt(table.dataset.freezeStart, 10);
+  const count = parseInt(table.dataset.freezeCount, 10);
+  const headRow = table.querySelector('thead tr');
+  if (!headRow || !headRow.children.length) return;
+  let running = 0;
+  for (let i = 0; i < startIdx; i++) {
+    const cell = headRow.children[i];
+    if (cell) running += cell.getBoundingClientRect().width;
+  }
+  if (startIdx > 0 && running === 0) return; // table not laid out yet (still display:none) — skip, next data change will retry
+  const offsets = [];
+  for (let i = startIdx; i < startIdx + count; i++) {
+    offsets.push(running);
+    const cell = headRow.children[i];
+    running += cell ? cell.getBoundingClientRect().width : 0;
+  }
+  const rows = [headRow, ...Array.from(table.querySelectorAll('tbody > tr'))];
+  rows.forEach(row => {
+    for (let k = 0; k < count; k++) {
+      const idx = startIdx + k;
+      const cell = row.children[idx];
+      if (!cell) continue;
+      cell.style.position = 'sticky';
+      cell.style.left = offsets[k] + 'px';
+      cell.classList.add('frozen-col');
+      cell.classList.toggle('frozen-col-last', k === count - 1);
+    }
+  });
+}
+
+// A sticky thead alone left the filter-row above it (search box, date
+// range, Filter/Clear buttons — see .table-area>.filter-row in
+// Stylesheet.html) scrolling away, since only the <th> cells had
+// position:sticky. That filter-row is now ALSO sticky at top:0, so this
+// pushes the thead's own sticky offset down to sit right below it instead
+// of underneath/behind it. Measured via getBoundingClientRect() rather
+// than assumed, since the row can wrap to 2 lines on a narrow screen —
+// re-run on every data change (same MutationObserver as the column
+// freezing above) and on resize, for the same reason.
+function applyStickyHeaderOffset(table) {
+  const area = table.closest('.table-area');
+  const filterRow = area ? area.querySelector(':scope > .filter-row') : null;
+  const offset = filterRow ? Math.ceil(filterRow.getBoundingClientRect().height) : 0;
+  table.querySelectorAll('thead th').forEach(th => { th.style.top = offset + 'px'; });
+}
+
+window.addEventListener('resize', () => {
+  clearTimeout(window._stickyColResizeTimer);
+  window._stickyColResizeTimer = setTimeout(() => {
+    document.querySelectorAll('table.crm-table[data-freeze-start]').forEach(applyStickyColumnOffsets);
+    document.querySelectorAll('table.crm-table').forEach(applyStickyHeaderOffset);
+  }, 150);
+});
+
+// ------------------------------------------------------------
+// COLUMN HEADER FILTERS ("Option A" — Excel-style per-column dropdown
+// filters), requested to replace the old per-table PE/Manager <select>
+// dropdowns (removed from Sections.html) so filtering by PE, Manager, or
+// ANY other column works the same way, from that column's own header.
+//
+// Applied generically to every table.crm-table via wireOneTable() above —
+// same DOM-text-reading approach already used for sort/search/pagination,
+// so no per-table code is needed. Qualified Pipeline and All Leads render
+// as card grids (lead-cards-grid), not <table>, so they're automatically
+// untouched by this — matches the explicit request to leave Qualified
+// Pipeline out of this feature.
+//
+// State is stored in columnFilterState, keyed by the table's
+// data-filter-prefix attribute (set in Sections.html to match that
+// section's existing tableFilterState prefix) so it survives the table's
+// tbody being fully replaced on every re-render (status changes, search,
+// etc.). Tables with no prefix (Crane Vendors/Transporters/Commission
+// Persons/Bulk Update preview) fall back to the table's own auto-assigned
+// id, which is stable across re-renders too.
+// ------------------------------------------------------------
+let columnFilterState = {}; // { [tableKey]: { [colIndex]: Set(allowedValues) } }
+
+function tableFilterKey(table) {
+  return table.dataset.filterPrefix || table.id;
+}
+
+function wireColumnFilters(table) {
+  const thead = table.querySelector('thead');
+  if (!thead) return;
+  thead.querySelectorAll('th').forEach((th, colIndex) => {
+    if (th.querySelector('input, select, button, a')) return; // checkbox/action columns — nothing to filter
+    if (th.dataset.colFilterWired) return;
+    th.dataset.colFilterWired = '1';
+    const icon = document.createElement('i');
+    icon.className = 'ti ti-filter col-filter-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.style.cssText = 'font-size:11px;margin-left:5px;opacity:0.5;cursor:pointer;';
+    icon.title = 'Filter this column';
+    icon.addEventListener('click', (e) => {
+      e.stopPropagation(); // don't also trigger this header's sort-click
+      openColumnFilterMenu(table, colIndex, icon);
+    });
+    th.appendChild(icon);
+  });
+}
+
+function applyColumnFilters(table) {
+  const state = columnFilterState[tableFilterKey(table)];
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  Array.from(tbody.children).filter(r => r.tagName === 'TR').forEach(row => {
+    if (row.querySelector('td[colspan]')) { row.dataset.twColFiltered = ''; return; } // "Loading…" / empty-state row
+    let hide = false;
+    if (state) {
+      for (const colIndex in state) {
+        const allowed = state[colIndex];
+        if (!allowed || !allowed.size) continue;
+        const cell = row.children[colIndex];
+        if (!allowed.has(cell ? cell.textContent.trim() : '')) { hide = true; break; }
+      }
+    }
+    row.dataset.twColFiltered = hide ? '1' : '';
+  });
+  updateFilteredCountBadge(table);
+  // Optional per-table hook (Ramvir, Sept 2026) — a table can name a global
+  // function via data-col-filter-hook="fnName" to be notified whenever its
+  // column filters change, e.g. to recompute a summary/stats row that sits
+  // above the table and isn't itself part of this generic engine (see
+  // psOnColumnFilterChange, JS-Dashboard.html, wired to psTable).
+  const hookName = table.dataset.colFilterHook;
+  if (hookName && typeof window[hookName] === 'function') window[hookName](table);
+  if (typeof pruneHiddenDisposalSelection === 'function') pruneHiddenDisposalSelection(table);
+}
+
+// The count text next to each table (e.g. "404 vehicles", "847 vehicles
+// waiting") is set once by the render function from the raw, UNfiltered
+// server response — a column-header filter (openColumnFilterMenu above)
+// only ever hides/shows <tr>s client-side afterward, so that number never
+// moved even while a filter was narrowing what's actually on screen.
+// Appends a small "· Filtered: N" suffix onto the same .filter-count
+// element (found via the table's closest .table-area wrapper, same DOM
+// shape every table in Sections.html uses) whenever a column filter is
+// active for this table, showing the true count of currently-visible
+// rows; removes the suffix the moment no filter is active again.
+function updateFilteredCountBadge(table) {
+  const area = table.closest('.table-area');
+  const countEl = area ? area.querySelector('.filter-count') : null;
+  if (!countEl) return;
+  const key = tableFilterKey(table);
+  const state = columnFilterState[key];
+  const hasActiveFilter = state && Object.keys(state).length > 0;
+  let suffix = countEl.querySelector('.col-filter-count-suffix');
+  if (!hasActiveFilter) {
+    if (suffix) suffix.remove();
+    return;
+  }
+  const tbody = table.querySelector('tbody');
+  const allRows = tbody ? Array.from(tbody.children).filter(r => r.tagName === 'TR' && !r.querySelector('td[colspan]')) : [];
+  const visible = allRows.filter(r => r.dataset.twColFiltered !== '1' && r.dataset.twFiltered !== '1').length;
+  if (!suffix) {
+    suffix = document.createElement('span');
+    suffix.className = 'col-filter-count-suffix';
+    suffix.style.cssText = 'color:#1d4ed8;font-weight:600;margin-left:6px;';
+    countEl.appendChild(suffix);
+  }
+  suffix.textContent = `· Filtered: ${visible}`;
+}
+
+function markColumnFilterIcon(table, colIndex, active) {
+  const th = table.querySelectorAll('thead th')[colIndex];
+  const icon = th ? th.querySelector('.col-filter-icon') : null;
+  if (!icon) return;
+  icon.style.opacity = active ? '1' : '0.5';
+  icon.style.color = active ? '#1d4ed8' : '';
+}
+
+function clearColumnFiltersForTable(table) {
+  delete columnFilterState[tableFilterKey(table)];
+  table.querySelectorAll('thead th .col-filter-icon').forEach(icon => { icon.style.opacity = '0.5'; icon.style.color = ''; });
+  applyColumnFilters(table);
+  paginateTable(table, 0);
+}
+
+function closeColumnFilterMenu() {
+  const existing = document.getElementById('colFilterMenu');
+  if (existing) existing.remove();
+  document.removeEventListener('mousedown', onColFilterDocClick);
+}
+function onColFilterDocClick(e) {
+  const menu = document.getElementById('colFilterMenu');
+  if (menu && !menu.contains(e.target)) closeColumnFilterMenu();
+}
+
+function openColumnFilterMenu(table, colIndex, anchorEl) {
+  closeColumnFilterMenu();
+  const tbody = table.querySelector('tbody');
+  const rows = tbody ? Array.from(tbody.children).filter(r => r.tagName === 'TR' && !r.querySelector('td[colspan]')) : [];
+  const values = new Set();
+  rows.forEach(r => { const c = r.children[colIndex]; if (c) values.add(c.textContent.trim()); });
+  const sorted = Array.from(values).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  const key = tableFilterKey(table);
+  const activeSet = (columnFilterState[key] && columnFilterState[key][colIndex]) || null; // null = all selected, no filter
+
+  const menu = document.createElement('div');
+  menu.id = 'colFilterMenu';
+  menu.style.cssText = 'position:fixed;z-index:9999;background:#fff;border:0.5px solid #d1d5db;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.18);width:220px;max-height:320px;display:flex;flex-direction:column;font-size:12px;font-family:inherit;';
+  menu.innerHTML = `
+    <div style="padding:8px;border-bottom:0.5px solid #e5e7eb;"><input type="text" id="colFilterSearch" placeholder="Search values…" style="width:100%;box-sizing:border-box;border:0.5px solid #d1d5db;border-radius:6px;padding:5px 8px;font-size:12px;" /></div>
+    <div style="padding:6px 8px;border-bottom:0.5px solid #f1f5f9;display:flex;gap:12px;">
+      <a href="javascript:void(0)" id="colFilterSelectAll" style="font-size:11px;color:#1d4ed8;text-decoration:none;">Select All</a>
+      <a href="javascript:void(0)" id="colFilterClearAll" style="font-size:11px;color:#dc2626;text-decoration:none;">Clear</a>
+    </div>
+    <div id="colFilterOptions" style="overflow-y:auto;flex:1;padding:4px 8px;"></div>
+    <div style="padding:8px;border-top:0.5px solid #e5e7eb;display:flex;justify-content:flex-end;gap:8px;">
+      <button class="btn" id="colFilterCancelBtn" style="padding:4px 10px;font-size:12px;">Cancel</button>
+      <button class="btn btn-primary" id="colFilterApplyBtn" style="padding:4px 10px;font-size:12px;">Apply</button>
+    </div>`;
+  document.body.appendChild(menu);
+
+  const renderOptions = (q) => {
+    const wrap = menu.querySelector('#colFilterOptions');
+    const ql = (q || '').toLowerCase();
+    const shown = sorted.filter(v => !ql || v.toLowerCase().includes(ql));
+    wrap.innerHTML = shown.length ? shown.map(v => {
+      const checked = !activeSet || activeSet.has(v);
+      return `<label style="display:flex;align-items:center;gap:6px;padding:3px 2px;cursor:pointer;"><input type="checkbox" value="${v.replace(/"/g, '&quot;')}" ${checked ? 'checked' : ''} style="flex-shrink:0;" /><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${v || '(blank)'}</span></label>`;
+    }).join('') : '<div style="color:#94a3b8;padding:8px 2px;">No values</div>';
+  };
+  renderOptions('');
+
+  menu.querySelector('#colFilterSearch').addEventListener('input', (e) => renderOptions(e.target.value));
+  menu.querySelector('#colFilterSelectAll').addEventListener('click', () => menu.querySelectorAll('#colFilterOptions input[type="checkbox"]').forEach(cb => cb.checked = true));
+  menu.querySelector('#colFilterClearAll').addEventListener('click', () => menu.querySelectorAll('#colFilterOptions input[type="checkbox"]').forEach(cb => cb.checked = false));
+  menu.querySelector('#colFilterCancelBtn').addEventListener('click', closeColumnFilterMenu);
+  menu.querySelector('#colFilterApplyBtn').addEventListener('click', () => {
+    // Only checkboxes matching the CURRENT search text exist in the DOM
+    // right now — start from the previous selection (or "everything" if no
+    // filter was active) and apply just the checked/unchecked deltas for
+    // values that are visible, so typing a search then toggling doesn't
+    // silently drop values hidden by that search text.
+    const selected = activeSet ? new Set(activeSet) : new Set(sorted);
+    menu.querySelectorAll('#colFilterOptions input[type="checkbox"]').forEach(cb => {
+      if (cb.checked) selected.add(cb.value); else selected.delete(cb.value);
+    });
+    const isFilterActive = selected.size > 0 && selected.size < sorted.length;
+    if (!columnFilterState[key]) columnFilterState[key] = {};
+    if (!isFilterActive && selected.size !== 0) delete columnFilterState[key][colIndex]; // "everything" selected == no filter
+    else columnFilterState[key][colIndex] = selected; // includes the "nothing selected" (show 0 rows) case
+    markColumnFilterIcon(table, colIndex, !!columnFilterState[key][colIndex]);
+    applyColumnFilters(table);
+    paginateTable(table, 0);
+    closeColumnFilterMenu();
+  });
+
+  const r = anchorEl.getBoundingClientRect();
+  menu.style.left = r.left + 'px';
+  menu.style.top = (r.bottom + 4) + 'px';
+  requestAnimationFrame(() => {
+    const mw = menu.offsetWidth, mh = menu.offsetHeight;
+    let left = r.left, top = r.bottom + 4;
+    if (left + mw > window.innerWidth - 8) left = Math.max(8, window.innerWidth - mw - 8);
+    if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+  });
+  setTimeout(() => document.addEventListener('mousedown', onColFilterDocClick), 0);
+}
+
+function filterTableGeneric(table, query) {
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  const q = query.trim().toLowerCase();
+  Array.from(tbody.children).filter(r => r.tagName === 'TR').forEach(row => {
+    if (row.querySelector('td[colspan]')) return; // "Loading…" / "No data" placeholder row
+    row.dataset.twFiltered = (q && !row.textContent.toLowerCase().includes(q)) ? '1' : '';
+  });
+  paginateTable(table, 0);
+}
+
+function sortTableByColumn(table, colIndex, th) {
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  const allRows = Array.from(tbody.children).filter(r => r.tagName === 'TR');
+  if (allRows.length < 2 || (allRows.length === 1 && allRows[0].querySelector('td[colspan]'))) return;
+
+  const currentDir = th.getAttribute('data-sort-dir') || 'none';
+  const newDir = currentDir === 'asc' ? 'desc' : 'asc';
+  // Read/write only the .th-sort-label span (added in wireOneTable above),
+  // never th.textContent directly — that used to also wipe out the
+  // column-filter icon appended alongside it as a sibling.
+  table.querySelectorAll('thead th').forEach(h => {
+    h.removeAttribute('data-sort-dir');
+    const lbl = h.querySelector('.th-sort-label');
+    if (lbl) lbl.textContent = lbl.textContent.replace(/ [▲▼]$/, '');
+  });
+  th.setAttribute('data-sort-dir', newDir);
+  const thLbl = th.querySelector('.th-sort-label');
+  if (thLbl) thLbl.textContent = thLbl.textContent.replace(/ [▲▼]$/, '') + (newDir === 'asc' ? ' ▲' : ' ▼');
+
+  const getText = (row) => (row.children[colIndex] ? row.children[colIndex].textContent.trim() : '');
+  const parseNum = (s) => { const c = s.replace(/[₹,%\s]/g, ''); return c !== '' && !isNaN(c) ? parseFloat(c) : null; };
+  const parseDate = (s) => { const d = new Date(s); return isNaN(d.getTime()) ? null : d.getTime(); };
+
+  allRows.sort((a, b) => {
+    const va = getText(a), vb = getText(b);
+    const na = parseNum(va), nb = parseNum(vb);
+    let cmp;
+    if (na !== null && nb !== null) cmp = na - nb;
+    else { const da = parseDate(va), db = parseDate(vb);
+      cmp = (da !== null && db !== null) ? da - db : va.localeCompare(vb, undefined, { sensitivity: 'base', numeric: true }); }
+    return newDir === 'asc' ? cmp : -cmp;
+  });
+  allRows.forEach(r => tbody.appendChild(r)); // triggers the MutationObserver, which re-paginates from page 0
+}
+
+function paginateTable(table, page) {
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  const allRows = Array.from(tbody.children).filter(r => r.tagName === 'TR');
+  const isPlaceholder = allRows.length <= 1 && allRows[0] && allRows[0].querySelector('td[colspan]');
+  const bar = getOrCreatePaginationBar(table);
+  if (isPlaceholder) {
+    allRows.forEach(r => r.style.display = '');
+    bar.style.display = 'none';
+    return;
+  }
+  // Rows knocked out by the search box (filterTableGeneric) or by an active
+  // column-header filter (applyColumnFilters, see below) stay hidden and
+  // don't count toward pagination at all.
+  const isHidden = r => r.dataset.twFiltered === '1' || r.dataset.twColFiltered === '1';
+  const filteredOut = allRows.filter(isHidden);
+  filteredOut.forEach(r => r.style.display = 'none');
+  const rows = allRows.filter(r => !isHidden(r));
+
+  if (rows.length === 0 && filteredOut.length > 0) {
+    // Search matched nothing — nothing else to show, no pagination bar.
+    bar.style.display = 'none';
+    return;
+  }
+  if (rows.length <= TW_PAGE_SIZE) {
+    rows.forEach(r => r.style.display = '');
+    bar.style.display = 'none';
+    return;
+  }
+  const totalPages = Math.max(1, Math.ceil(rows.length / TW_PAGE_SIZE));
+  page = Math.min(Math.max(0, page), totalPages - 1);
+  rows.forEach((row, i) => { row.style.display = (i >= page * TW_PAGE_SIZE && i < (page + 1) * TW_PAGE_SIZE) ? '' : 'none'; });
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <button class="btn btn-outline" style="padding:3px 10px;font-size:12px;" ${page === 0 ? 'disabled' : ''} onclick="paginateTable(document.getElementById('${table.id}'), ${page - 1})">Prev</button>
+    <span>Page ${page + 1} of ${totalPages} · ${rows.length} rows</span>
+    <button class="btn btn-outline" style="padding:3px 10px;font-size:12px;" ${page >= totalPages - 1 ? 'disabled' : ''} onclick="paginateTable(document.getElementById('${table.id}'), ${page + 1})">Next</button>`;
+}
+
+// ------------------------------------------------------------
+// BULK UPDATE (Settings → Bulk Update, Admin only) — generic CSV/XLSX
+// driven bulk update: works on any table, any columns. First column in
+// the uploaded file is the match key (id / lead_no / whatever is unique
+// per row); every other column present in the file gets written to the
+// matching row via .update({...}).eq(keyCol, keyValue) — one request per
+// row, run sequentially so the results list stays accurate and a single
+// bad row doesn't abort the whole batch.
+// ------------------------------------------------------------
+let bulkUpdateRows = null;
+let bulkUpdateHeader = null;
+
+function resetBulkUpdate() {
+  bulkUpdateRows = null;
+  bulkUpdateHeader = null;
+  const fileInput = document.getElementById('buFile');
+  if (fileInput) fileInput.value = '';
+  const previewArea = document.getElementById('buPreviewArea');
+  if (previewArea) previewArea.style.display = 'none';
+  const resultsArea = document.getElementById('buResultsArea');
+  if (resultsArea) { resultsArea.style.display = 'none'; resultsArea.innerHTML = ''; }
+  const sqlResultsArea = document.getElementById('buSqlResultsArea');
+  if (sqlResultsArea) { sqlResultsArea.style.display = 'none'; sqlResultsArea.innerHTML = ''; }
+  showBulkUpdateMode('file');
+}
+
+function showBulkUpdateMode(mode) {
+  document.querySelectorAll('#settpane-bulkupdate .tabs-row .tab').forEach(t => t.classList.remove('active'));
+  const nav = document.getElementById('bunav-' + mode);
+  if (nav) nav.classList.add('active');
+  const filePane = document.getElementById('bupane-file');
+  const sqlPane = document.getElementById('bupane-sql');
+  if (filePane) filePane.style.display = mode === 'file' ? '' : 'none';
+  if (sqlPane) sqlPane.style.display = mode === 'sql' ? '' : 'none';
+}
+
+function getBulkUpdateTableName() {
+  const sel = document.getElementById('buTableName');
+  if (!sel) return '';
+  if (sel.value === '__other__') return document.getElementById('buTableNameOther').value.trim();
+  return sel.value;
+}
+
+// Runs a hand-written SQL statement (typically a single-column UPDATE)
+// via the exec_admin_sql() DB function — a SECURITY DEFINER function that
+// bypasses RLS the same way Supabase Studio's own SQL editor does, so it
+// works even on tables like rewire_omini_pay_archive that only have a
+// read policy for the app's normal client-side calls.
+async function runBulkUpdateSql() {
+  const sqlText = document.getElementById('buSqlText').value.trim();
+  const resultsArea = document.getElementById('buSqlResultsArea');
+  if (!sqlText) { notify('Write a SQL statement first.', { icon: 'error' }); return; }
+  if (!confirm('This runs directly against the database with no undo. Continue?\n\n' + sqlText)) return;
+
+  const { data, error } = await sb.rpc('exec_admin_sql', { sql_text: sqlText });
+  resultsArea.style.display = '';
+  if (error) {
+    resultsArea.innerHTML = `<div class="info-banner" style="background:#fef2f2;border-color:#fecaca;"><i class="ti ti-alert-triangle" aria-hidden="true"></i><span style="color:#dc2626;">${error.message}</span></div>`;
+    notify('SQL failed: ' + error.message, { icon: 'error' });
+  } else {
+    const rowsAffected = data && data.rows_affected !== undefined ? data.rows_affected : JSON.stringify(data);
+    resultsArea.innerHTML = `<div class="info-banner"><i class="ti ti-circle-check" aria-hidden="true"></i><span><strong>${rowsAffected}</strong> row(s) affected.</span></div>`;
+    notify(`SQL ran — ${rowsAffected} row(s) affected.`);
+  }
+}
+
+function bulkUpdateFileSelected(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const resultsArea = document.getElementById('buResultsArea');
+  if (resultsArea) { resultsArea.style.display = 'none'; resultsArea.innerHTML = ''; }
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const json = XLSX.utils.sheet_to_json(ws, { defval: '' });
+      if (!json.length) { notify('File has no data rows.', { icon: 'error' }); return; }
+      // SheetJS names any column whose header cell is blank "__EMPTY",
+      // "__EMPTY_1", etc — a common leftover from Excel formatting (extra
+      // bordered/merged cells with no real header). Those aren't real
+      // columns in the DB and would fail the update with "Could not find
+      // the '__EMPTY' column ... in the schema cache" — drop them here so
+      // the file doesn't need manual cleanup before every bulk update.
+      const rawHeader = Object.keys(json[0]);
+      bulkUpdateHeader = rawHeader.filter(h => !/^__EMPTY/.test(h));
+      bulkUpdateRows = json;
+      renderBulkUpdatePreview();
+    } catch (err) {
+      notify('Could not read file: ' + err.message, { icon: 'error' });
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function renderBulkUpdatePreview() {
+  const previewArea = document.getElementById('buPreviewArea');
+  const head = document.getElementById('buPreviewHead');
+  const body = document.getElementById('buPreviewBody');
+  if (!bulkUpdateRows || !bulkUpdateRows.length) { previewArea.style.display = 'none'; return; }
+
+  head.innerHTML = '<tr>' + bulkUpdateHeader.map(h => `<th>${h}</th>`).join('') + '</tr>';
+  const showRows = bulkUpdateRows.slice(0, 200); // preview cap — full file still runs on update
+  body.innerHTML = showRows.map(r => '<tr>' + bulkUpdateHeader.map(h => `<td>${r[h] === '' || r[h] === undefined ? '—' : r[h]}</td>`).join('') + '</tr>').join('');
+  document.getElementById('buPreviewCount').textContent = bulkUpdateRows.length + ' row(s) parsed'
+    + (bulkUpdateRows.length > 200 ? ' (showing first 200)' : '') + ' — key column: ' + bulkUpdateHeader[0];
+  previewArea.style.display = '';
+}
+
+async function runBulkUpdate() {
+  const tableName = getBulkUpdateTableName();
+  const keyColumn = document.getElementById('buKeyColumn').value.trim();
+  if (!tableName) { notify('Enter the table name.', { icon: 'error', title: 'Missing table' }); return; }
+  if (!keyColumn) { notify('Enter the match key column.', { icon: 'error', title: 'Missing key column' }); return; }
+  if (!bulkUpdateRows || !bulkUpdateRows.length) { notify('Upload a file first.', { icon: 'error' }); return; }
+  if (!bulkUpdateHeader.includes(keyColumn)) { notify(`Key column "${keyColumn}" is not a column in the uploaded file.`, { icon: 'error' }); return; }
+  const updateCols = bulkUpdateHeader.filter(h => h !== keyColumn);
+  if (!updateCols.length) { notify('File only has the key column — nothing to update.', { icon: 'error' }); return; }
+
+  if (!confirm(`This will update ${bulkUpdateRows.length} row(s) in "${tableName}" (columns: ${updateCols.join(', ')}), matched by "${keyColumn}". This cannot be undone in bulk. Continue?`)) return;
+
+  let success = 0, failed = [];
+  for (const row of bulkUpdateRows) {
+    const keyVal = row[keyColumn];
+    if (keyVal === '' || keyVal === undefined) { failed.push({ key: '(blank)', error: 'Blank key value — row skipped' }); continue; }
+    const payload = {};
+    updateCols.forEach(c => { payload[c] = (row[c] === '' ? null : row[c]); });
+    // .select() after .update() is required to actually see whether a row
+    // came back — without it, Supabase returns no error even when RLS (or
+    // a bad key value) silently matched zero rows, which looks exactly
+    // like success but nothing was written.
+    const { data, error } = await sb.from(tableName).update(payload).eq(keyColumn, keyVal).select();
+    if (error) failed.push({ key: keyVal, error: error.message });
+    else if (!data || data.length === 0) failed.push({ key: keyVal, error: 'No row updated — either no row matches this key, or a permission/RLS policy on this table is silently blocking the write.' });
+    else success++;
+  }
+
+  const resultsArea = document.getElementById('buResultsArea');
+  resultsArea.style.display = '';
+  resultsArea.innerHTML = `
+    <div class="info-banner" style="margin-bottom:10px;${failed.length ? 'background:#fef2f2;border-color:#fecaca;' : ''}">
+      <i class="ti ti-${failed.length ? 'alert-triangle' : 'circle-check'}" aria-hidden="true"></i>
+      <span><strong>${success}</strong> row(s) updated successfully${failed.length ? `, <strong>${failed.length}</strong> failed (see below)` : '.'}</span>
+    </div>
+    ${failed.length ? `<table class="crm-table"><thead><tr><th>${keyColumn}</th><th>Error</th></tr></thead><tbody>${
+      failed.map(f => `<tr><td>${f.key}</td><td style="color:#dc2626;">${f.error}</td></tr>`).join('')
+    }</tbody></table>` : ''}`;
+  notify(`Bulk update done: ${success} succeeded, ${failed.length} failed.`, { icon: failed.length ? 'error' : 'success' });
+}
+
+function getOrCreatePaginationBar(table) {
+  let bar = table.nextElementSibling;
+  if (!bar || !bar.classList.contains('tw-pagination')) {
+    bar = document.createElement('div');
+    bar.className = 'tw-pagination';
+    bar.style.cssText = 'display:none;align-items:center;justify-content:center;gap:10px;padding:10px 4px;font-size:12px;color:var(--color-text-tertiary);';
+    table.parentNode.insertBefore(bar, table.nextSibling);
+  }
+  return bar;
+}
+
+async function logout() {
+  await sb.auth.signOut();
+  window.top.location.href = APP_URL + '?page=login';
+}
+
+// ------------------------------------------------------------
+// MANUAL DATA REFRESH — the app does NOT auto-refresh on any timer;
+// data only reloads on initial sign-in or right after an action you take
+// (save/submit/etc). This button, next to Logout, lets anyone pull the
+// latest data on demand without a full page reload — refreshes the
+// leads/pipeline tabs + badges, and re-runs whichever section is
+// currently on screen (Purchased, Omini Pay, Accessories, etc.).
+// ------------------------------------------------------------
+async function refreshCrmData(btn) {
+  if (btn) { btn.disabled = true; btn.classList.add('spinning'); }
+  try {
+    await refreshLeadsTable();
+    if (typeof showSection === 'function') showSection(currentSectionName || 'dashboard');
+    notify('CRM data refreshed.');
+  } catch (err) {
+    notify('Refresh failed: ' + err.message, { icon: 'error' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('spinning'); }
+  }
+}
+
+async function loadCurrentProfile() {
+  // Retries (a transient network/auth-refresh hiccup used to leave currentProfile = null and every
+  // section then crashed with "Cannot read properties of null (reading 'role')" - Ramvir, Oct 2026).
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const { data: { user }, error: uErr } = await sb.auth.getUser();
+      if (uErr) throw uErr;
+      if (!user) { lastErr = new Error('Session expired - please log in again.'); break; }
+      const { data, error } = await sb.from('rewire_user_profiles').select('*').eq('id', user.id).single();
+      if (error) throw error;
+      currentProfile = data;
+      document.getElementById('userNameLabel').textContent = data.name + ' (' + data.role + ')';
+      document.getElementById('userAvatar').textContent = data.name.split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
+      await applyRoleBasedUI(data.role);
+      if (data.role === 'CRE') { currentSectionName = 'calling-today'; if (typeof showSection === 'function') setTimeout(() => showSection('calling-today'), 0); }
+      return currentProfile;
+    } catch (e) {
+      lastErr = e; console.error('loadCurrentProfile attempt ' + attempt + ' failed', e);
+      await new Promise(r => setTimeout(r, 700 * attempt));
+    }
+  }
+  const msg = (lastErr && lastErr.message) ? lastErr.message : 'Unknown error';
+  document.body.innerHTML =
+    '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:Inter,sans-serif;gap:14px;text-align:center;padding:20px;">' +
+    '<div style="font-size:15px;color:#475569;">Could not load your profile.</div>' +
+    '<div style="font-size:12px;color:#b91c1c;max-width:520px;">' + String(msg).replace(/</g, '&lt;') + '</div>' +
+    '<div style="display:flex;gap:10px;"><button onclick="location.reload()" style="padding:10px 20px;background:#1d4ed8;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">Retry</button>' +
+    '<button onclick="window.top.location.href=APP_URL+\'?page=login\'" style="padding:10px 20px;background:#fff;color:#1d4ed8;border:1px solid #1d4ed8;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">Login again</button></div></div>';
+  return null;
+}
+
+// Registry of every data-role-gate key in the app (Ramvir, Sept 2026 —
+// permissions redesign). Drives the Settings > Permissions Editor UI's
+// checkbox grid (grouped by `group`) and doubles as documentation of what
+// each gate key actually controls. Access itself is no longer hardcoded
+// here — it lives in the `rewire_role_permissions` DB table (one row per
+// role+gate_key that role is allowed to see), editable by Admin from the
+// front end (per Ramvir's explicit ask: "admin per access nahi de sakte ki
+// front se hi change karte rahe"). Admin itself is NEVER stored in this
+// table — it stays hardcoded to '*' below so a bad edit in the Permissions
+// Editor can never lock Admin out of their own app.
+// Re-ordered to follow the sidebar sequence and extended with a gate for
+// EVERY sub-tab (Ramvir, Oct 2026) — "↳" rows are tabs/buttons inside the
+// screen above them. "Edit —" rows control actual WORK (restrictedTo caps them
+// to PE/Manager because check_master_column_permissions() in the database only
+// lets those two write val_*/pn_*/kyc_*/ud_* columns; see
+// renderPermissionsEditorTable() for how restrictedTo greys the box).
+const PERMISSION_GATE_REGISTRY = [
+  { key: 'dashboard', label: 'Dashboard (section)', group: 'Dashboard' },
+  { key: 'dashboard-overview', label: '   ↳ Overview', group: 'Dashboard' },
+  { key: 'dashboard-purchases', label: '   ↳ Purchases', group: 'Dashboard' },
+  { key: 'dashboard-performance', label: '   ↳ PE / Team Performance', group: 'Dashboard' },
+  { key: 'dashboard-inventory', label: '   ↳ Inventory', group: 'Dashboard' },
+  { key: 'dashboard-codtrading', label: '   ↳ CoD Trading', group: 'Dashboard' },
+  { key: 'leads', label: 'Leads (section)', group: 'Leads & Partners' },
+  { key: 'partners', label: 'Partners', group: 'Leads & Partners' },
+  { key: 'purchased', label: 'Purchased (section)', group: 'Leads & Partners' },
+  { key: 'bank-kyc-view', label: 'Bank KYC (View)', group: 'Leads & Partners' },
+  { key: 'plant-bulk-purchase', label: 'Plant Bulk Purchase (Honda/Tata)', group: 'Leads & Partners' },
+  { key: 'pipeline-na', label: 'Need Analysis (sidebar shortcut)', group: 'Qualified Pipeline' },
+  { key: 'pipeline-qual', label: 'Qualified Pipeline (base/Qualified shortcut)', group: 'Qualified Pipeline' },
+  { key: 'pipeline-lost', label: 'Closed Lost (sidebar shortcut)', group: 'Qualified Pipeline' },
+  { key: 'pipeline-valuation', label: 'Pipeline Step — Valuation', group: 'Qualified Pipeline' },
+  { key: 'edit-valuation', label: '   ↳ Edit — Valuation', group: 'Qualified Pipeline', restrictedTo: ['PE', 'Manager'] },
+  { key: 'pipeline-pn', label: 'Pipeline Step — Price Negotiation', group: 'Qualified Pipeline' },
+  { key: 'edit-pn', label: '   ↳ Edit — Price Negotiation', group: 'Qualified Pipeline', restrictedTo: ['PE', 'Manager'] },
+  { key: 'pipeline-bankkyc', label: 'Pipeline Step — Bank KYC', group: 'Qualified Pipeline' },
+  { key: 'edit-bankkyc', label: '   ↳ Edit — Bank KYC', group: 'Qualified Pipeline', restrictedTo: ['PE', 'Manager'] },
+  { key: 'pipeline-delivery', label: 'Pipeline Step — Upload Delivery', group: 'Qualified Pipeline' },
+  { key: 'edit-delivery', label: '   ↳ Edit — Upload Delivery', group: 'Qualified Pipeline', restrictedTo: ['PE', 'Manager'] },
+  { key: 'pipeline-vz', label: 'Pipeline Step — Verification & Zoho', group: 'Qualified Pipeline' },
+  { key: 'pipeline-payment-release', label: 'Pipeline Step — Payment Release', group: 'Qualified Pipeline' },
+  { key: 'pipeline-accessories', label: 'Pipeline Step — Accessories Check', group: 'Qualified Pipeline' },
+  { key: 'pipeline-rc-send', label: 'Pipeline Step — RC Send shortcut', group: 'Qualified Pipeline' },
+  { key: 'manager-approval', label: 'Approval — Manager Approval', group: 'Qualified Pipeline' },
+  { key: 'head-approval', label: 'Approval — Head Approval', group: 'Qualified Pipeline' },
+  { key: 'reports', label: 'Reports Download', group: 'Reports & Debit Register' },
+  { key: 'debit-register', label: 'Debit Register (section)', group: 'Reports & Debit Register' },
+  { key: 'debit-register-accessories', label: '   ↳ Accessories Check', group: 'Reports & Debit Register' },
+  { key: 'debit-register-plant', label: '   ↳ Vehicle Receiving', group: 'Reports & Debit Register' },
+  { key: 'debit-register-transporter', label: '   ↳ Logistic Shortage', group: 'Reports & Debit Register' },
+  { key: 'location-tracking', label: 'Location Tracking', group: 'Operations' },
+  { key: 'logistics', label: 'Logistics', group: 'Operations' },
+  { key: 'logistics-payments', label: 'Logistics Payments (section)', group: 'Operations' },
+  { key: 'logistics-payments-lc', label: '   ↳ Logistic Carrier', group: 'Operations' },
+  { key: 'logistics-payments-crane', label: '   ↳ Crane (QR)', group: 'Operations' },
+  { key: 'logistics-payments-driver', label: '   ↳ Driver / Towing', group: 'Operations' },
+  { key: 'logistics-payments-archive', label: '   ↳ Archive', group: 'Operations' },
+  { key: 'receivedplant', label: 'Vehicle Receiving (section)', group: 'Operations' },
+  { key: 'receivedplant-lc', label: '   ↳ Logistic Carrier', group: 'Operations' },
+  { key: 'receivedplant-crane', label: '   ↳ Crane', group: 'Operations' },
+  { key: 'receivedplant-dts', label: '   ↳ Driver / Towing / Self', group: 'Operations' },
+  { key: 'rst-pending', label: 'RST Pending (menu item)', group: 'Operations' },
+  { key: 'vehicle-disposal', label: 'Vehicle Disposal (section)', group: 'Operations' },
+  { key: 'vehicle-disposal-pending', label: '   ↳ Pending Disposal', group: 'Operations' },
+  { key: 'vehicle-disposal-allocated', label: '   ↳ Contractor', group: 'Operations' },
+  { key: 'vehicle-disposal-reserved', label: '   ↳ Reserved', group: 'Operations' },
+  { key: 'vehicle-disposal-scrapped', label: '   ↳ Scrapped', group: 'Operations' },
+  { key: 'payments', label: 'Vehicle Payments (section)', group: 'Payments' },
+  { key: 'payments-pending', label: '   ↳ Pending', group: 'Payments' },
+  { key: 'payments-hold', label: '   ↳ Hold', group: 'Payments' },
+  { key: 'payments-tobesent', label: '   ↳ To be Sent for Payment', group: 'Payments' },
+  { key: 'payments-pendingutr', label: '   ↳ Pending UTR', group: 'Payments' },
+  { key: 'payments-credit', label: '   ↳ Credit Payment', group: 'Payments' },
+  { key: 'payments-archive', label: '   ↳ Archive', group: 'Payments' },
+  { key: 'payments-repair', label: '   ↳ Repair (scan missing payments)', group: 'Payments' },
+  { key: 'ominipay', label: 'Omini Pay (section)', group: 'Payments' },
+  { key: 'ominipay-archive', label: '   ↳ View Archive', group: 'Payments' },
+  { key: 'commission', label: 'Commission (section)', group: 'Payments' },
+  { key: 'commission-persons', label: '   ↳ Manage Payees', group: 'Payments' },
+  { key: 'commission-archive', label: '   ↳ View Paid', group: 'Payments' },
+  { key: 'cranecharges', label: 'Crane Charges (retired)', group: 'Payments' },
+  { key: 'incentive', label: 'Incentive', group: 'Payments' },
+  { key: 'conveyance', label: 'Conveyance', group: 'Payments' },
+  { key: 'calling-today', label: 'Today\'s Calls', group: 'Calling' },
+  { key: 'calling-leads', label: 'Total Leads', group: 'Calling' },
+  { key: 'calling-other', label: 'Other Leads (Parts/New Vehicle/Misc)', group: 'Calling' },
+  { key: 'calling-performance', label: 'Performance + Leaderboard', group: 'Calling' },
+  { key: 'rc-tracking', label: 'RC Tracking (section)', group: 'Compliance' },
+  { key: 'rc-send', label: '   ↳ Pending / Send', group: 'Compliance' },
+  { key: 'rc-received', label: '   ↳ Received', group: 'Compliance' },
+  { key: 'codcvs', label: 'COD/CVS (section)', group: 'Compliance' },
+  { key: 'codcvs-entries', label: '   ↳ Entries + Bulk Upload', group: 'Compliance' },
+  { key: 'codcvs-trades', label: '   ↳ Purchased / Sold', group: 'Compliance' },
+  { key: 'cod-trading', label: 'CoD Trading (section)', group: 'Compliance' },
+  { key: 'cod-trading-trades', label: '   ↳ Purchased / Sold', group: 'Compliance' },
+  { key: 'cod-trading-dashboard', label: '   ↳ Dealers & Reports', group: 'Compliance' },
+  { key: 'accessories', label: 'Accessories Check', group: 'Compliance' },
+  { key: 'accessories-review', label: 'Accessories Review', group: 'Compliance' },
+  { key: 'documents', label: 'Documents Management (section)', group: 'Compliance' },
+  { key: 'documents-all', label: '   ↳ Pending', group: 'Compliance' },
+  { key: 'documents-incomplete', label: '   ↳ Incomplete', group: 'Compliance' },
+  { key: 'documents-completed', label: '   ↳ Completed', group: 'Compliance' },
+  { key: 'documents-part1', label: '   ↳ Pre-Dispatch (Send)', group: 'Compliance' },
+  { key: 'documents-part2', label: '   ↳ At Plant (Received)', group: 'Compliance' },
+  { key: 'material', label: 'Material / Stock', group: 'Inventory' },
+  { key: 'part-sold', label: 'Part Sold (section)', group: 'Sold' },
+  { key: 'part-sold-entry', label: '   ↳ Sell Part (create Challan)', group: 'Sold' },
+  { key: 'part-sold-invoice', label: '   ↳ Pending Invoice (Accounts Invoice/Gate Pass)', group: 'Sold' },
+  { key: 'part-sold-completed', label: '   ↳ Completed', group: 'Sold' },
+  { key: 'part-sold-approval', label: '   ↳ Approval (Head)', group: 'Sold' },
+  { key: 'part-sold-stock', label: '   ↳ Stock (view + upload)', group: 'Sold' },
+  { key: 'scrap-sold', label: 'Scrap Sold (section)', group: 'Sold' },
+  { key: 'scrap-sold-challan', label: '   ↳ Vehicle Challan', group: 'Sold' },
+  { key: 'scrap-sold-sales', label: '   ↳ Sales / Invoice / Gate Pass', group: 'Sold' },
+  { key: 'scrap-sold-completed', label: '   ↳ Completed', group: 'Sold' },
+  { key: 'settings-users', label: 'Settings - Users', group: 'Settings' },
+  { key: 'settings-masterdata', label: 'Settings - Master Data', group: 'Settings' },
+  { key: 'settings-bulkupdate', label: 'Settings - Bulk Update', group: 'Settings' },
+  { key: 'settings-healthcheck', label: 'Settings - Health Check', group: 'Settings' },
+  { key: 'settings-permissions', label: 'Settings - Access Control (Editor)', group: 'Settings' },
+];
+
+// Set of gate keys the CURRENT logged-in user's role is allowed to see.
+// Populated by applyRoleBasedUI() below. Admin is represented as the
+// special value '*' (never fetched from the DB — see comment above).
+let currentAllowedGates = new Set();
+
+// Returns true if the current user's role has access to `key`. Use this
+// (instead of re-deriving from roleAccess, which no longer exists) for any
+// JS logic that needs to branch on role access outside of a plain
+// data-role-gate DOM toggle — e.g. "smart routing" to whichever COD/CVS
+// tab or RC Tracking view the role actually has.
+function hasGateAccess(key) {
+  return currentAllowedGates.has('*') || currentAllowedGates.has(key);
+}
+
+async function applyRoleBasedUI(role) {
+  if (role === 'Admin') {
+    // Admin is hardcoded — never touches rewire_role_permissions, so a
+    // mistaken edit in the Permissions Editor can never lock Admin out.
+    currentAllowedGates = new Set(['*']);
+  } else {
+    const { data, error } = await sb.from('rewire_role_permissions').select('gate_key').eq('role', role);
+    if (error) {
+      console.error('Failed to load role permissions:', error);
+      currentAllowedGates = new Set();
+    } else {
+      currentAllowedGates = new Set((data || []).map(r => r.gate_key));
+    }
+    // Calling access switch (Settings > Users) — lets a PE (or any role) also use the Calling module without changing their role
+    if (currentProfile && currentProfile.calling_access) ['calling-today', 'calling-leads', 'calling-other', 'calling-performance'].forEach(g => currentAllowedGates.add(g));
+  }
+  document.querySelectorAll('[data-role-gate]').forEach(el => {
+    if (el.hasAttribute('data-disabled')) { el.style.display = 'none'; return; } // Crane Charges retired (Oct 2026)
+    const need = el.getAttribute('data-role-gate');
+    el.style.display = hasGateAccess(need) ? '' : 'none';
+  });
+
+  // Stock Bulk Update (Ramvir, Sept 2026) — hardcoded Admin-only, deliberately
+  // NOT wired through rewire_role_permissions like the rest of this
+  // function: this writes Material/Stock data directly in bulk, so it
+  // should never be grantable to another role via the Permissions Editor.
+  const stockBulkBtn = document.getElementById('stockBulkUpdateBtn');
+  if (stockBulkBtn) stockBulkBtn.style.display = (role === 'Admin') ? '' : 'none';
+
+  // Manager sees Purchased/Payments/Commission but view-only for the
+  // commission LEDGER itself — "Generate Excel" (which flips pending
+  // records to Paid) is hidden. Manage Payees stays visible since Manager
+  // is the one who adds/maintains the payee list. The Payments table
+  // itself swaps its inputs for plain text at render time (see
+  // renderPaymentsTable in JS-Payments.html) based on this same check.
+  window.isViewOnlyRole = (role === 'Manager');
+  const commissionExport = document.getElementById('commissionExportControls');
+  if (commissionExport) commissionExport.style.display = window.isViewOnlyRole ? 'none' : '';
+}
+
+
+// ------------------------------------------------------------
+// PARTNERS — load from Supabase, wire search dropdown + directory table
+// ------------------------------------------------------------
+async function loadPartners() {
+  // Directory list, paginated defensively — grows slowly but never
+  // shrinks, same class of bug fixed everywhere else this session.
+  allPartners = await fetchAllRows((from, to) => sb.from('rewire_partners').select('*').order('partner_name').range(from, to))
+    .catch(err => { console.error(err); return []; });
+  renderPartnerList('pListAdd', allPartners);
+  renderPartnersTable(allPartners);
+}
+
+// ------------------------------------------------------------
+// COMMISSION PERSONS — lightweight searchable name directory used by
+// the Cash Commission payout picker in Price Negotiation. Deliberately
+// separate from allPartners/rewire_partners since GST/bank details are
+// not required here (per business requirement).
+// ------------------------------------------------------------
+async function loadCommissionPersons() {
+  allCommissionPersons = await fetchAllRows((from, to) => sb.from('rewire_commission_persons').select('*').order('name').range(from, to))
+    .catch(err => { console.error(err); return []; });
+}
+function filterCommissionPS(idx, v) {
+  openPSD('psdComm' + idx);
+  const el = document.getElementById('pListComm' + idx);
+  if (!el) return;
+  const q = v.toLowerCase().trim();
+  const filtered = q ? allCommissionPersons.filter(p => p.name.toLowerCase().includes(q)) : allCommissionPersons;
+  let html = filtered.map(p => `<div class="ps-item" onclick="selectCommissionPerson(${idx},'${p.id}','${p.name.replace(/'/g,"\\'")}')">
+    <div class="ps-item-avatar">${p.name.charAt(0)}</div>
+    <div><div class="ps-item-name">${p.name}</div></div>
+  </div>`).join('');
+  if (q && !allCommissionPersons.some(p => p.name.toLowerCase() === q)) {
+    html += `<div class="ps-add" onclick="selectCommissionPerson(${idx},'','${v.replace(/'/g,"\\'")}')"><i class="ti ti-plus" style="font-size:14px;" aria-hidden="true"></i> Add "${v}" as new person</div>`;
+  }
+  el.innerHTML = html || '<div class="ps-item" style="color:var(--color-text-tertiary);font-size:12px;">Type a name to search or add</div>';
+}
+function selectCommissionPerson(idx, id, name) {
+  const input = document.getElementById('pnCommissionName' + idx);
+  if (!input) return;
+  input.value = name;
+  input.dataset.personId = id || '';
+  const dd = document.getElementById('psdComm' + idx);
+  if (dd) dd.classList.remove('open');
+}
+
+// ------------------------------------------------------------
+// COMMISSION PAYEES DIRECTORY — "Manage Payees" screen (Commission →
+// Manage Payees). Lists/searches everyone in allCommissionPersons and
+// lets Admin register a new payee via commissionPersonRegModal. Mirrors
+// the Partners directory pattern (renderPartnersTable/filterPartnersTable).
+// ------------------------------------------------------------
+function renderCommissionPersonsTableRows(list) {
+  const tbody = document.getElementById('tbodyCommissionPersons');
+  const count = document.getElementById('countCommissionPersons');
+  if (count) count.textContent = list.length + ' payees';
+  if (!tbody) return;
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No payees yet — click "Add Payee" to register one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map(p => `<tr>
+    <td style="font-weight:500;">${p.name}</td>
+    <td>${p.mobile || '—'}</td>
+    <td>${p.location || '—'}</td>
+    <td>${p.bank_name || '—'}</td>
+    <td>${p.created_at ? new Date(p.created_at).toLocaleDateString() : '—'}</td>
+    <td><button class="ab ab-view" onclick="viewCommissionPerson('${p.id}')"><i class="ti ti-eye" style="font-size:11px;" aria-hidden="true"></i> View</button></td>
+  </tr>`).join('');
+}
+
+function renderCommissionPersonsSection() {
+  renderCommissionPersonsTableRows(allCommissionPersons);
+}
+
+function filterCommissionPersonsTable(v) {
+  const q = v.toLowerCase();
+  const filtered = allCommissionPersons.filter(p =>
+    p.name.toLowerCase().includes(q) || (p.mobile || '').includes(q) || (p.location || '').toLowerCase().includes(q));
+  renderCommissionPersonsTableRows(filtered);
+}
+
+function viewCommissionPerson(id) {
+  const p = allCommissionPersons.find(x => x.id === id);
+  if (!p) return;
+  Swal.fire({
+    title: p.name,
+    html: `<div style="text-align:left;font-size:13px;line-height:1.9;">
+      <div><strong>Phone:</strong> ${p.mobile || '—'}</div>
+      <div><strong>Location:</strong> ${p.location || '—'}</div>
+      <div><strong>Account Holder Name:</strong> ${p.account_holder_name || '—'}</div>
+      <div><strong>Bank:</strong> ${p.bank_name || '—'}</div>
+      <div><strong>Branch:</strong> ${p.branch_name || '—'}</div>
+      <div><strong>Account No.:</strong> ${p.account_number || '—'}</div>
+      <div><strong>IFSC:</strong> ${p.ifsc_code || '—'}</div>
+      ${isRealFileUrl(p.cheque_photo_url) ? `<div style="margin-top:8px;"><a href="javascript:void(0)" onclick="viewAccessoryPhoto('${p.cheque_photo_url}','Cancelled Cheque')" style="color:#1d4ed8;text-decoration:underline;">View Cheque Photo</a></div>` : ''}
+    </div>`,
+    confirmButtonColor: '#1d4ed8',
+    confirmButtonText: 'Close',
+  });
+}
+
+// Payment Mode dropdown (UPI/Bank) — UPI shows Phone Number + QR Code,
+// Bank shows the existing Bank Details section. Neither section shows
+// until a mode is picked, matching how the PN form's Customer/Broker
+// bank sections stay hidden until their own trigger field is set.
+function handleCpPaymentMode(v){
+  document.getElementById('cpUpiSection').style.display = (v === 'UPI') ? '' : 'none';
+  document.getElementById('cpBankSection').style.display = (v === 'Bank') ? '' : 'none';
+}
+
+async function submitNewCommissionPerson() {
+  const paymentMode = document.getElementById('cpPaymentMode').value;
+  const payload = readFields('#commissionPersonRegModal', {
+    name: 'cp_name', mobile: 'cp_mobile', location: 'cp_location',
+    account_holder_name: 'cp_account_holder_name', bank_name: 'cp_bank_name', branch_name: 'cp_branch_name',
+    account_number: 'cp_account_number', ifsc_code: 'cp_ifsc_code',
+    upi_phone_number: 'cp_upi_phone',
+  });
+  if (!payload.name) { notify('Name is required'); return; }
+  payload.payment_mode = paymentMode || null;
+  // Only keep the fields belonging to the selected mode — clears whichever
+  // half wasn't shown instead of saving stale/blank values either way.
+  if (paymentMode !== 'UPI') payload.upi_phone_number = null;
+  if (paymentMode !== 'Bank') {
+    payload.account_holder_name = null; payload.bank_name = null; payload.branch_name = null;
+    payload.account_number = null; payload.ifsc_code = null;
+  }
+
+  const chequeFile = document.querySelector('#commissionPersonRegModal [data-field="cp_cheque_photo"]');
+  payload.cheque_photo_url = (paymentMode === 'Bank' && chequeFile && chequeFile.files.length) ? await uploadFile(chequeFile.files[0], payload.name, 'Cancelled_Cheque') : null;
+  const qrFile = document.querySelector('#commissionPersonRegModal [data-field="cp_upi_qr"]');
+  payload.upi_qr_code_url = (paymentMode === 'UPI' && qrFile && qrFile.files.length) ? await uploadFile(qrFile.files[0], payload.name, 'UPI_QR_Code') : null;
+  payload.created_by = currentProfile.id;
+
+  const { error } = await sb.from('rewire_commission_persons').insert(payload);
+  if (error) { notify('Error saving payee: ' + error.message, { icon: 'error' }); return; }
+
+  notify('Payee saved.');
+  closeModal('commissionPersonRegModal');
+  document.querySelectorAll('#commissionPersonRegModal input[data-field]').forEach(el => {
+    if (el.type === 'file') el.value = ''; else el.value = '';
+  });
+  document.getElementById('cpPaymentMode').value = '';
+  handleCpPaymentMode('');
+  await loadCommissionPersons();
+  if (typeof renderCommissionPersonsSection === 'function') renderCommissionPersonsSection();
+}
+
+// ------------------------------------------------------------
+// CRANE VENDORS DIRECTORY — "Manage Vendors" screen (Crane Charges →
+// Manage Vendors). Own table (rewire_crane_vendors) since — unlike the
+// Location/Make/Lead Source master lists — a vendor needs bank/contact
+// details, same shape as the Commission Payees directory.
+// ------------------------------------------------------------
+async function loadCraneVendors() {
+  allCraneVendors = await fetchAllRows((from, to) => sb.from('rewire_crane_vendors').select('*').order('vendor_name').range(from, to))
+    .catch(err => { console.error(err); return []; });
+}
+
+function renderCraneVendorsTableRows(list) {
+  const tbody = document.getElementById('tbodyCraneVendors');
+  const count = document.getElementById('countCraneVendors');
+  if (count) count.textContent = list.length + ' vendors';
+  if (!tbody) return;
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No vendors yet — click "Add Crane Vendor" to register one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map(v => `<tr>
+    <td style="font-weight:500;">${v.vendor_name}</td>
+    <td>${v.contact_person || '—'}</td>
+    <td>${v.phone || '—'}</td>
+    <td>${v.bank_name || '—'}</td>
+    <td>${v.created_at ? new Date(v.created_at).toLocaleDateString() : '—'}</td>
+    <td><button class="ab ab-view" onclick="viewCraneVendor('${v.id}')"><i class="ti ti-eye" style="font-size:11px;" aria-hidden="true"></i> View</button></td>
+  </tr>`).join('');
+}
+
+function renderCraneVendorsSection() {
+  renderCraneVendorsTableRows(allCraneVendors);
+}
+
+function filterCraneVendorsTable(v) {
+  const q = v.toLowerCase();
+  const filtered = allCraneVendors.filter(x =>
+    x.vendor_name.toLowerCase().includes(q) || (x.contact_person || '').toLowerCase().includes(q) || (x.phone || '').includes(q));
+  renderCraneVendorsTableRows(filtered);
+}
+
+function viewCraneVendor(id) {
+  const v = allCraneVendors.find(x => x.id === id);
+  if (!v) return;
+  Swal.fire({
+    title: v.vendor_name,
+    html: `<div style="text-align:left;font-size:13px;line-height:1.9;">
+      <div><strong>Contact Person:</strong> ${v.contact_person || '—'}</div>
+      <div><strong>Phone:</strong> ${v.phone || '—'}</div>
+      <div><strong>Account Holder Name:</strong> ${v.account_holder_name || '—'}</div>
+      <div><strong>Bank:</strong> ${v.bank_name || '—'}</div>
+      <div><strong>Branch:</strong> ${v.branch_name || '—'}</div>
+      <div><strong>Account No.:</strong> ${v.account_number || '—'}</div>
+      <div><strong>IFSC:</strong> ${v.ifsc_code || '—'}</div>
+      <div><strong>UPI QR:</strong> ${isRealFileUrl(v.upi_qr_code_url) ? `<a href="javascript:void(0)" onclick="viewAccessoryPhoto('${v.upi_qr_code_url}','UPI QR Code')" style="color:#1d4ed8;text-decoration:underline;">View QR</a>` : '<span style="color:#dc2626;">Not uploaded</span>'}</div>
+      ${isRealFileUrl(v.cheque_photo_url) ? `<div style="margin-top:8px;"><a href="javascript:void(0)" onclick="viewAccessoryPhoto('${v.cheque_photo_url}','Cancelled Cheque')" style="color:#1d4ed8;text-decoration:underline;">View Cheque Photo</a></div>` : ''}
+    </div>`,
+    confirmButtonColor: '#1d4ed8',
+    confirmButtonText: 'Close',
+  });
+}
+
+async function submitNewCraneVendor() {
+  const payload = readFields('#craneVendorRegModal', {
+    vendor_name: 'cv_vendor_name', contact_person: 'cv_contact_person', phone: 'cv_phone',
+    account_holder_name: 'cv_account_holder_name', bank_name: 'cv_bank_name', branch_name: 'cv_branch_name',
+    account_number: 'cv_account_number', ifsc_code: 'cv_ifsc_code',
+  });
+  if (!payload.vendor_name) { notify('Crane Company Name is required'); return; }
+
+  const chequeFile = document.querySelector('#craneVendorRegModal [data-field="cv_cheque_photo"]');
+  payload.cheque_photo_url = chequeFile && chequeFile.files.length ? await uploadFile(chequeFile.files[0], payload.vendor_name, 'Cancelled_Cheque') : null;
+  const qrFileCv = document.querySelector('#craneVendorRegModal [data-field="cv_upi_qr"]');
+  // QR is mandatory (Ramvir, Oct 2026) — crane payments are made ONLY by scanning this QR.
+  if (!qrFileCv || !qrFileCv.files.length) { notify('UPI QR Code upload karna zaruri hai — crane ki payment isi QR se hogi.', { icon: 'error', title: 'QR required' }); return; }
+  payload.upi_qr_code_url = qrFileCv && qrFileCv.files.length ? await uploadFile(qrFileCv.files[0], payload.vendor_name, 'UPI_QR') : null;
+  payload.created_by = currentProfile.id;
+
+  const { error } = await sb.from('rewire_crane_vendors').insert(payload);
+  if (error) { notify('Error saving vendor: ' + error.message, { icon: 'error' }); return; }
+
+  notify('Crane vendor saved.');
+  closeModal('craneVendorRegModal');
+  document.querySelectorAll('#craneVendorRegModal input[data-field]').forEach(el => {
+    if (el.type === 'file') el.value = ''; else el.value = '';
+  });
+  await loadCraneVendors();
+  if (typeof renderCraneVendorsSection === 'function') renderCraneVendorsSection();
+}
+
+// ------------------------------------------------------------
+// TRANSPORTERS DIRECTORY — "Manage Transporters" screen (Logistics →
+// Manage Transporters). Own table (rewire_transporters), same directory
+// pattern as Crane Vendors, minus bank details — Logistics only tracks
+// which transporter carried a vehicle, not a payout against them.
+// ------------------------------------------------------------
+async function loadTransporters() {
+  allTransporters = await fetchAllRows((from, to) => sb.from('rewire_transporters').select('*').order('transporter_name').range(from, to))
+    .catch(err => { console.error(err); return []; });
+}
+
+function renderTransportersTableRows(list) {
+  const tbody = document.getElementById('tbodyTransporters');
+  const count = document.getElementById('countTransporters');
+  if (count) count.textContent = list.length + ' transporters';
+  if (!tbody) return;
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No transporters yet — click "Add Transporter" to register one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map(t => `<tr>
+    <td style="font-weight:500;">${t.transporter_name}</td>
+    <td>${t.contact_person || '—'}</td>
+    <td>${t.phone || '—'}</td>
+    <td>${t.vehicle_number || '—'}</td>
+    <td>${t.created_at ? new Date(t.created_at).toLocaleDateString() : '—'}</td>
+    <td><button class="ab ab-view" onclick="viewTransporter('${t.id}')"><i class="ti ti-eye" style="font-size:11px;" aria-hidden="true"></i> View</button></td>
+  </tr>`).join('');
+}
+
+function viewTransporter(id) {
+  const t = allTransporters.find(x => x.id === id);
+  if (!t) return;
+  Swal.fire({
+    title: t.transporter_name,
+    html: `<div style="text-align:left;font-size:13px;line-height:1.9;">
+      <div><strong>Contact Person:</strong> ${t.contact_person || '—'}</div>
+      <div><strong>Phone:</strong> ${t.phone || '—'}</div>
+      <div><strong>Vehicle/Truck No.:</strong> ${t.vehicle_number || '—'}</div>
+      <div><strong>Account Holder Name:</strong> ${t.account_holder_name || '—'}</div>
+      <div><strong>Bank:</strong> ${t.bank_name || '—'}</div>
+      <div><strong>Branch:</strong> ${t.branch_name || '—'}</div>
+      <div><strong>Account No.:</strong> ${t.account_number || '—'}</div>
+      <div><strong>IFSC:</strong> ${t.ifsc_code || '—'}</div>
+      ${isRealFileUrl(t.cheque_photo_url) ? `<div style="margin-top:8px;"><a href="javascript:void(0)" onclick="viewAccessoryPhoto('${t.cheque_photo_url}','Cancelled Cheque')" style="color:#1d4ed8;text-decoration:underline;">View Cheque Photo</a></div>` : ''}
+    </div>`,
+    confirmButtonColor: '#1d4ed8',
+    confirmButtonText: 'Close',
+  });
+}
+
+function renderTransportersSection() {
+  renderTransportersTableRows(allTransporters);
+}
+
+function filterTransportersTable(v) {
+  const q = v.toLowerCase();
+  const filtered = allTransporters.filter(x =>
+    x.transporter_name.toLowerCase().includes(q) || (x.contact_person || '').toLowerCase().includes(q) || (x.phone || '').includes(q));
+  renderTransportersTableRows(filtered);
+}
+
+async function submitNewTransporter() {
+  const payload = readFields('#transporterRegModal', {
+    transporter_name: 'tr_transporter_name', contact_person: 'tr_contact_person',
+    phone: 'tr_phone', vehicle_number: 'tr_vehicle_number',
+    account_holder_name: 'tr_account_holder_name', bank_name: 'tr_bank_name', branch_name: 'tr_branch_name',
+    account_number: 'tr_account_number', ifsc_code: 'tr_ifsc_code',
+  });
+  if (!payload.transporter_name) { notify('Transporter Name is required'); return; }
+
+  const chequeFile = document.querySelector('#transporterRegModal [data-field="tr_cheque_photo"]');
+  payload.cheque_photo_url = chequeFile && chequeFile.files.length ? await uploadFile(chequeFile.files[0], payload.transporter_name, 'Cancelled_Cheque') : null;
+  payload.created_by = currentProfile.id;
+
+  const { error } = await sb.from('rewire_transporters').insert(payload);
+  if (error) { notify('Error saving transporter: ' + error.message, { icon: 'error' }); return; }
+
+  notify('Transporter saved.');
+  closeModal('transporterRegModal');
+  document.querySelectorAll('#transporterRegModal input[data-field]').forEach(el => {
+    if (el.type === 'file') el.value = ''; else el.value = '';
+  });
+  await loadTransporters();
+  if (typeof renderTransportersSection === 'function') renderTransportersSection();
+}
+
+const PS_INPUT_MAP = { Add: 'pInputAdd', Edit: 'pInputEdit', Pn: 'pnBroker' };
+
+function renderPartnerList(listId, partners, suffix) {
+  const el = document.getElementById(listId);
+  if (!el) return;
+  suffix = suffix || (listId.includes('Add') ? 'Add' : listId.includes('Edit') ? 'Edit' : listId.replace('pList', ''));
+  if (!partners.length) {
+    el.innerHTML = '<div class="ps-item" style="color:var(--color-text-tertiary);font-size:12px;">No partners yet</div>';
+    return;
+  }
+  el.innerHTML = partners.map(p => `<div class="ps-item" onclick="selectPartner('${suffix}','${p.id}','${p.partner_name.replace(/'/g,"\\'")}')">
+    <div class="ps-item-avatar">${p.partner_name.charAt(0)}</div>
+    <div><div class="ps-item-name">${p.partner_name}</div><div class="ps-item-phone">${p.mobile}${p.account_number ? ' · A/C ' + p.account_number : ''}</div></div>
+    <div class="ps-item-loc"><i class="ti ti-map-pin" style="font-size:11px;" aria-hidden="true"></i>${p.location || ''}</div>
+  </div>`).join('');
+}
+function filterPS(suffix, v) {
+  openPSD('psd' + suffix);
+  const filtered = allPartners.filter(p =>
+    p.partner_name.toLowerCase().includes(v.toLowerCase()) || p.mobile.includes(v));
+  renderPartnerList('pList' + suffix, filtered);
+}
+function selectPartner(suffix, id, name) {
+  selectedPartnerId = id;
+  const inputId = PS_INPUT_MAP[suffix] || ('pInput' + suffix);
+  document.getElementById(inputId).value = name;
+  document.getElementById('psd' + suffix).classList.remove('open');
+  if (suffix === 'Pn') showPnBrokerBankDetails(id);
+}
+
+// Read-only reference — Price Negotiation's Broker field just picked a
+// partner, so pull their bank details straight from the already-cached
+// Partners directory (no extra query) and show them in the small
+// read-only boxes below the Broker field.
+function showPnBrokerBankDetails(partnerId) {
+  const wrap = document.getElementById('pnBrokerBankWrap');
+  if (!wrap) return;
+  const partner = allPartners.find(p => p.id === partnerId);
+  if (!partner) { wrap.style.display = 'none'; return; }
+  document.getElementById('pnBrokerAccountHolder').value = partner.account_holder_name || '—';
+  document.getElementById('pnBrokerBankName').value = partner.bank_name || '—';
+  document.getElementById('pnBrokerBranchName').value = partner.branch_name || '—';
+  document.getElementById('pnBrokerAccountNumber').value = partner.account_number || '—';
+  document.getElementById('pnBrokerIfsc').value = partner.ifsc_code || '—';
+  wrap.style.display = '';
+}
+function renderPartnersTable(partners) {
+  const tbody = document.getElementById('tbodyPartners');
+  const count = document.getElementById('countPartners');
+  if (count) count.textContent = partners.length + ' partners';
+  if (!tbody) return;
+  if (!partners.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--color-text-tertiary);padding:24px;">No partners yet — click "Add Partner" to register one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = partners.map(p => `<tr>
+    <td style="font-weight:500;">${p.partner_name}</td>
+    <td>${p.mobile}</td>
+    <td>${p.location || '—'}</td>
+    <td>${p.pan_number || '—'}</td>
+    <td>${p.bank_name || '—'}</td>
+    <td><span class="badge ${p.kyc_status === 'Verified' ? 'badge-q' : 'badge-na'}">${p.kyc_status}</span></td>
+    <td>${p.created_at ? new Date(p.created_at).toLocaleDateString() : '—'}</td>
+    <td><button class="ab ab-view" onclick="viewPartner('${p.id}')"><i class="ti ti-eye" style="font-size:11px;" aria-hidden="true"></i> View</button></td>
+  </tr>`).join('');
+}
+
+function filterPartnersTable(v) {
+  const q = v.toLowerCase();
+  const filtered = allPartners.filter(p =>
+    p.partner_name.toLowerCase().includes(q) || p.mobile.includes(q) || (p.location || '').toLowerCase().includes(q));
+  renderPartnersTable(filtered);
+}
+// Renders one row in the "Attached Documents" section of the Partner
+// View popup — a clickable "View" link (reuses viewAccessoryPhoto, which
+// already handles both images and PDFs, falling back to opening the raw
+// Drive URL in a new tab if it can't preview it) or "Not uploaded" if
+// that document was never attached.
+function docLink(label, url) {
+  return `<div class="vd-row"><span class="vd-label">${label}</span>${isRealFileUrl(url)
+    ? `<a href="javascript:void(0)" onclick="viewAccessoryPhoto('${url}','${label}')" style="color:#1d4ed8;text-decoration:underline;font-size:12px;">View</a>`
+    : '<span class="vd-value">Not uploaded</span>'}</div>`;
+}
+
+function viewPartner(id) {
+  const p = allPartners.find(x => x.id === id);
+  if (!p) return;
+  const isAdmin = currentProfile && currentProfile.role === 'Admin';
+  document.getElementById('vpName').textContent = p.partner_name;
+  // `upper` (5th arg) auto-uppercases PAN/GST/bank-detail fields as
+  // Admin edits them inline here, matching the same behavior on the
+  // Register New Partner form these values were originally entered on.
+  const field = (label, key, value, upper) => isAdmin
+    ? `<div class="vd-row"><span class="vd-label">${label}</span><input id="vpEdit_${key}" value="${value || ''}" ${upper ? `oninput="this.value=this.value.toUpperCase()"` : ''} style="border:0.5px solid var(--color-border-secondary);border-radius:5px;padding:4px 8px;font-size:12px;flex:1;" /></div>`
+    : `<div class="vd-row"><span class="vd-label">${label}</span><span class="vd-value">${value || '—'}</span></div>`;
+
+  document.getElementById('vpBody').innerHTML = `
+    <div class="vd-section">Basic Information</div>
+    <div class="vd-card">
+      ${field('Mobile', 'mobile', p.mobile)}
+      ${field('Email', 'email', p.email)}
+      ${field('Location', 'location', p.location)}
+    </div>
+    <div class="vd-section">KYC &amp; Tax</div>
+    <div class="vd-card">
+      ${field('PAN Number', 'pan_number', p.pan_number, true)}
+      ${field('GST Number', 'gst_number', p.gst_number, true)}
+    </div>
+    <div class="vd-section">Bank Details</div>
+    <div class="vd-card">
+      ${field('Account Holder Name', 'account_holder_name', p.account_holder_name, true)}
+      ${field('Bank Name', 'bank_name', p.bank_name, true)}
+      ${field('Branch', 'branch_name', p.branch_name, true)}
+      ${field('Account No.', 'account_number', p.account_number)}
+      ${field('IFSC', 'ifsc_code', p.ifsc_code, true)}
+      ${isAdmin ? field('KYC Status', 'kyc_status', p.kyc_status) : ''}
+    </div>
+    <div class="vd-section">Attached Documents</div>
+    <div class="vd-card">
+      ${docLink('PAN Card', p.pan_card_url)}
+      ${docLink('GST Certificate', p.gst_certificate_url)}
+      ${docLink('Cancelled Cheque', p.cancelled_cheque_url)}
+    </div>
+    ${isAdmin ? `<button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:8px;" onclick="withLoading(this, () => savePartnerEdit('${p.id}'))"><i class="ti ti-device-floppy" style="font-size:13px;"></i> Save Changes</button>` : ''}`;
+  openModal('viewPartnerModal');
+}
+
+// Account Number must be unique across partners — Mobile is deliberately
+// NOT checked here, since the same phone number can legitimately belong
+// to more than one partner account (e.g. family members sharing a
+// number); a bank account number, on the other hand, belongs to exactly
+// one person, so that's the real duplicate signal. excludeId lets an
+// edit-save skip matching against the partner's own existing row.
+function findDuplicatePartnerByAccountNumber(accountNumber, excludeId) {
+  const val = (accountNumber || '').trim().toLowerCase();
+  if (!val) return null; // blank account number — nothing to compare
+  return allPartners.find(p => p.id !== excludeId && (p.account_number || '').trim().toLowerCase() === val) || null;
+}
+
+async function savePartnerEdit(id) {
+  const keys = ['mobile','email','location','pan_number','gst_number','account_holder_name','bank_name','branch_name','account_number','ifsc_code','kyc_status'];
+  const payload = {};
+  keys.forEach(k => { const el = document.getElementById('vpEdit_' + k); if (el) payload[k] = typeof el.value === 'string' ? el.value.trim() : el.value; });
+
+  const dupPartnerEdit = findDuplicatePartnerByAccountNumber(payload.account_number, id);
+  if (dupPartnerEdit) {
+    notify(`This Account Number is already registered under "${dupPartnerEdit.partner_name}".`, { icon: 'error', title: 'Duplicate Account Number' });
+    return;
+  }
+
+  const { error } = await sb.from('rewire_partners').update(payload).eq('id', id);
+  if (error) { notify('Error updating partner: ' + error.message, { icon: 'error' }); return; }
+  notify('Partner updated.');
+  closeModal('viewPartnerModal');
+  await loadPartners();
+}
+async function submitNewPartner() {
+  const payload = readFields('#partnerRegModal', {
+    partner_name: 'pr_partner_name', mobile: 'pr_mobile', email: 'pr_email', location: 'pr_location',
+    pan_number: 'pr_pan_number', gst_number: 'pr_gst_number', account_holder_name: 'pr_account_holder_name', bank_name: 'pr_bank_name',
+    branch_name: 'pr_branch_name', account_number: 'pr_account_number', ifsc_code: 'pr_ifsc_code',
+  });
+  // Every field is mandatory except GST Number / Upload GST Certificate —
+  // not every partner has a GST registration, same exception applied to
+  // Bank KYC's GST fields.
+  if (!payload.partner_name) { notify('Partner Name is required.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!payload.mobile || payload.mobile.length !== 10) {
+    notify('Mobile Number must be exactly 10 digits.', { icon: 'error', title: 'Invalid Mobile' });
+    return;
+  }
+  const prMissing = findMissingRequiredField('#partnerRegModal', [
+    { selector: '[data-field="pr_email"]', label: 'Email ID' },
+    { selector: '[data-field="pr_location"]', label: 'Location' },
+    { selector: '[data-field="pr_pan_number"]', label: 'PAN Number' },
+    { selector: '[data-field="pr_account_holder_name"]', label: 'Account Holder Name' },
+    { selector: '[data-field="pr_bank_name"]', label: 'Bank Name' },
+    { selector: '[data-field="pr_branch_name"]', label: 'Branch Name' },
+    { selector: '[data-field="pr_account_number"]', label: 'Account Number' },
+    { selector: '[data-field="pr_ifsc_code"]', label: 'IFSC Code' },
+  ]);
+  if (prMissing) { notify(prMissing + ' is required.', { icon: 'error', title: 'Missing field' }); return; }
+
+  const panFile = document.querySelector('#partnerRegModal [data-field="pr_pan_card"]');
+  const gstFile = document.querySelector('#partnerRegModal [data-field="pr_gst_certificate"]');
+  const chequeFile = document.querySelector('#partnerRegModal [data-field="pr_cancelled_cheque"]');
+  if (!panFile || !panFile.files.length) { notify('Upload PAN Card is required.', { icon: 'error', title: 'Missing field' }); return; }
+  if (!chequeFile || !chequeFile.files.length) { notify('Upload Cancelled Cheque is required.', { icon: 'error', title: 'Missing field' }); return; }
+
+  const dupPartnerNew = findDuplicatePartnerByAccountNumber(payload.account_number, null);
+  if (dupPartnerNew) {
+    notify(`This Account Number is already registered under "${dupPartnerNew.partner_name}".`, { icon: 'error', title: 'Duplicate Account Number' });
+    return;
+  }
+  const folder = payload.partner_name; // one Drive folder per partner
+  payload.pan_card_url = panFile && panFile.files.length ? await uploadFile(panFile.files[0], folder, 'PAN_Card') : null;
+  payload.gst_certificate_url = gstFile && gstFile.files.length ? await uploadFile(gstFile.files[0], folder, 'GST_Certificate') : null;
+  payload.cancelled_cheque_url = chequeFile && chequeFile.files.length ? await uploadFile(chequeFile.files[0], folder, 'Cancelled_Cheque') : null;
+
+  payload.created_by = currentProfile.id;
+
+  const { error } = await sb.from('rewire_partners').insert(payload);
+  if (error) { notify('Error saving partner: ' + error.message); return; }
+
+  notify('Partner registered.');
+  closeModal('partnerRegModal');
+  document.querySelectorAll('#partnerRegModal input[data-field]').forEach(el => {
+    if (el.type === 'file') el.value = ''; else el.value = '';
+  });
+  await loadPartners();
+}
+
+// ------------------------------------------------------------
+// PE / MANAGER dropdowns for Lead Entry
+// ------------------------------------------------------------
+async function loadPeAndManagerOptions() {
+  const { data, error } = await sb.from('rewire_user_profiles').select('id, name, role, manager_id').eq('active', true);
+  if (error) { console.error(error); return; }
+  const pes = data.filter(u => u.role === 'PE');
+  // A Manager entering a lead themselves needs their own name in the
+  // "Select PE" list too — they aren't role PE, so the plain filter above
+  // never includes them. Added only into this dropdown's own option list
+  // (and mirrored into allPEs so pe_id -> name lookups elsewhere, e.g. lead
+  // cards, resolve correctly instead of showing blank) — real PE-only
+  // filters/reports that query the DB by role are unaffected.
+  if (currentProfile && currentProfile.role === 'Manager') {
+    const selfAsPe = data.find(u => u.id === currentProfile.id);
+    if (selfAsPe && !pes.some(p => p.id === selfAsPe.id)) pes.push(selfAsPe);
+  }
+  const mgrs = data.filter(u => u.role === 'Manager');
+  allManagers = mgrs;
+  allPEs = pes; // now carries manager_id too, so a PE's manager can be looked up when a different PE is picked (see updateManagerForSelectedPE)
+  allActiveUsers = data.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const peSel = document.getElementById('peAdd');
+  const mgrSel = document.getElementById('mgrAdd');
+  if (peSel) peSel.innerHTML = '<option value="">Select PE</option>' + pes.map(p => `<option value="${p.id}">${p.name}${p.role === 'Manager' ? ' (You)' : ''}</option>`).join('');
+  if (mgrSel) mgrSel.innerHTML = '<option value="">Select Manager</option>' + mgrs.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
+  if (peSel) peSel.onchange = () => { selectedPEId = peSel.value; updateManagerForSelectedPE(); };
+  if (mgrSel) mgrSel.onchange = () => selectedManagerId = mgrSel.value;
+}
+
+// Keeps the Manager field in sync with whichever PE is currently selected
+// in the peAdd dropdown — a PE can pick a colleague's name to enter a lead
+// on their behalf, and the Manager shown must be THAT PE's manager, not
+// the logged-in PE's own manager.
+// For PE role this fills the read-only mgrAddDisplay field (they don't
+// pick their own manager). For Manager/Admin — who get the normal mgrAdd
+// <select> instead — this used to do nothing at all, so picking a PE never
+// pre-filled Manager and it had to be looked up and set by hand every
+// single time. Now it pre-selects the matching option in that dropdown
+// too, while leaving it a normal, still-editable select so a genuine
+// exception (lead handled by a different manager) can still be picked.
+function updateManagerForSelectedPE() {
+  const pe = allPEs.find(p => p.id === selectedPEId);
+  // A Manager entering a lead as their own PE (the "(You)" option added
+  // in loadPeAndManagerOptions above) IS the manager for that lead too —
+  // there's nobody else to resolve, and pe.manager_id is always null for
+  // a Manager (they don't report to another Manager). Previously that
+  // fell straight through to the normal PE->Manager lookup below, which
+  // found nothing and left Manager as null/"Not assigned" every time a
+  // Manager self-handled a lead — this is exactly what produced 336 real
+  // Purchased leads with manager_id null (they landed in the Dashboard's
+  // Purchase Analytics "Unassigned" bucket instead of under that
+  // Manager's own name; fixed with a one-time SQL backfill, Sept 2026).
+  // Self-reference here going forward so it never recurs.
+  const mgr = pe
+    ? (pe.role === 'Manager' ? pe : allManagers.find(m => m.id === pe.manager_id))
+    : null;
+  // Only ever write an ID that actually resolved to a real Manager-role
+  // user — previously this trusted pe.manager_id blindly, so a stale
+  // mapping (e.g. pointing at someone whose role was later changed away
+  // from Manager) got silently written into the new lead even while the
+  // display correctly showed "Not assigned".
+  selectedManagerId = mgr ? mgr.id : null;
+
+  const mgrDisplay = document.getElementById('mgrAddDisplay');
+  if (mgrDisplay && mgrDisplay.style.display !== 'none') {
+    mgrDisplay.value = mgr ? mgr.name : 'Not assigned';
+    return;
+  }
+  const mgrSel = document.getElementById('mgrAdd');
+  if (mgrSel) mgrSel.value = selectedManagerId || '';
+}
+
+// ------------------------------------------------------------
+// SHARED TABLE FILTER BAR — PE / Manager / Date range, reused across
+// Purchased, Payments, Omini Pay, Commission, Crane Charges, Accessories
+// Check. Each table gets its own state under tableFilterState[prefix] and
+// its own re-render callback under tableFilterCallbacks[prefix] — Apply/
+// Clear just update the state then call that table's own render function
+// again, same as a search box triggering a re-render.
+// ------------------------------------------------------------
+let tableFilterState = {};
+let tableFilterCallbacks = {};
+
+// Call once from each table's render function, passing that table's own
+// re-render function as the callback. Safe to call every render — it just
+// repopulates the PE/Manager options (in case allPEs/allManagers weren't
+// ready yet the first time) and re-applies whatever's already selected, so
+// it never resets the user's filter mid-use.
+function initTableFilterBar(prefix, renderCallback) {
+  tableFilterCallbacks[prefix] = renderCallback;
+  if (!tableFilterState[prefix]) tableFilterState[prefix] = { pe: '', manager: '', from: '', to: '' };
+  const st = tableFilterState[prefix];
+  const peSel = document.getElementById(prefix + 'FilterPe');
+  const mgrSel = document.getElementById(prefix + 'FilterMgr');
+  if (peSel && peSel.options.length <= 1) {
+    peSel.innerHTML = '<option value="">All PE</option>' + allPEs.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+  }
+  if (mgrSel && mgrSel.options.length <= 1) {
+    mgrSel.innerHTML = '<option value="">All Manager</option>' + allManagers.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
+  }
+  if (peSel) peSel.value = st.pe;
+  if (mgrSel) mgrSel.value = st.manager;
+  const fromEl = document.getElementById(prefix + 'FilterFrom');
+  const toEl = document.getElementById(prefix + 'FilterTo');
+  if (fromEl) fromEl.value = st.from;
+  if (toEl) toEl.value = st.to;
+}
+
+function applyTableFilter(prefix) {
+  const st = tableFilterState[prefix] || (tableFilterState[prefix] = { pe: '', manager: '', from: '', to: '' });
+  const peEl = document.getElementById(prefix + 'FilterPe');
+  const mgrEl = document.getElementById(prefix + 'FilterMgr');
+  const fromEl = document.getElementById(prefix + 'FilterFrom');
+  const toEl = document.getElementById(prefix + 'FilterTo');
+  st.pe = peEl ? peEl.value : '';
+  st.manager = mgrEl ? mgrEl.value : '';
+  st.from = fromEl ? fromEl.value : '';
+  st.to = toEl ? toEl.value : '';
+  if (tableFilterCallbacks[prefix]) tableFilterCallbacks[prefix]();
+}
+
+function clearTableFilter(prefix) {
+  tableFilterState[prefix] = { pe: '', manager: '', from: '', to: '' };
+  ['FilterPe', 'FilterMgr', 'FilterFrom', 'FilterTo'].forEach(suffix => {
+    const el = document.getElementById(prefix + suffix);
+    if (el) el.value = '';
+  });
+  // Also reset this table's Excel-style column-header filters (Option A) —
+  // the old PE/Manager <select> dropdowns above are gone from most tables
+  // now, but "Clear" should still reset whatever filtering is active,
+  // including a column filter someone set on PE/Manager/anything else.
+  const table = document.querySelector('table.crm-table[data-filter-prefix="' + prefix + '"]');
+  if (table) clearColumnFiltersForTable(table);
+  if (tableFilterCallbacks[prefix]) tableFilterCallbacks[prefix]();
+}
+
+// Client-side filter for tables that fetch their full result set in one go
+// (no server pagination) — Payments/Omini Pay/Commission/Crane Charges/
+// Accessories Check all work this way already. getPeId/getMgrId/getDateStr
+// are small accessor functions since each table's row shape is different
+// (some have pe_id directly, some have it nested under a joined lead).
+function filterRowsByTableFilter(rows, prefix, getPeId, getMgrId, getDateStr) {
+  const st = tableFilterState[prefix];
+  if (!st || (!st.pe && !st.manager && !st.from && !st.to)) return rows;
+  return rows.filter(r => {
+    if (st.pe && getPeId(r) !== st.pe) return false;
+    if (st.manager && getMgrId(r) !== st.manager) return false;
+    if (st.from || st.to) {
+      const d = getDateStr(r); // expects 'YYYY-MM-DD' or null
+      if (!d) return false;
+      if (st.from && d < st.from) return false;
+      if (st.to && d > st.to) return false;
+    }
+    return true;
+  });
+}
+
+// ------------------------------------------------------------
+// FILE UPLOAD HELPER — uploads to Google Drive (via Code.gs), returns
+// the file's shareable view URL, which we store as a link in Supabase.
+// folderName = vehicle number (or partner name) so all files for that
+// vehicle/partner land in the same Drive folder across every stage.
+// ------------------------------------------------------------
+// Downscales + re-compresses photos client-side before upload (phone camera
+// shots are often 3-8MB; that's what was making every upload form slow —
+// the base64 payload has to cross the google.script.run bridge, which is
+// slow for big files). Non-image files (PDF, etc.) pass through untouched.
+function compressImage(file, maxDimension, quality) {
+  return new Promise((resolve) => {
+    if (!file.type.startsWith('image/') || file.type === 'image/gif') { resolve(file); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) { height = Math.round(height * maxDimension / width); width = maxDimension; }
+          else { width = Math.round(width * maxDimension / height); height = maxDimension; }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        canvas.toBlob((blob) => {
+          if (!blob || blob.size >= file.size) { resolve(file); return; } // never upsize a small file
+          resolve(new File([blob], file.name, { type: 'image/jpeg' }));
+        }, 'image/jpeg', quality);
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target.result;
+    };
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
+  });
+}
+
+// Uploads: max 2 at a time + up to 3 tries each. The Delivery form fires up to 11 uploads at once and
+// Apps Script/Drive rejected some of them; the failed ones came back null and were silently dropped
+// (L7103589: only Battery + Delivery photo got saved) - Ramvir, Oct 2026.
+let _upActive = 0; const _upQueue = [];
+function _upAcquire() { return new Promise(r => { if (_upActive < 2) { _upActive++; r(); } else _upQueue.push(r); }); }
+function _upRelease() { const n = _upQueue.shift(); if (n) n(); else _upActive--; }
+function _uploadFileOnce(file, folderName, fileLabel) {
+  return compressImage(file, 1600, 0.72).then((upFile) => new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = function () {
+      const base64 = reader.result.split(',')[1];
+      google.script.run
+        .withSuccessHandler((url) => resolve({ url: url || null, err: url ? null : 'No file URL returned' }))
+        .withFailureHandler((err) => resolve({ url: null, err: (err && err.message) || String(err) }))
+        .uploadFileToDrive(base64, `${fileLabel}_${Date.now()}_${file.name}`, upFile.type, folderName);
+    };
+    reader.onerror = () => resolve({ url: null, err: 'Failed to read file' });
+    reader.readAsDataURL(upFile);
+  }));
+}
+async function uploadFile(file, folderName, fileLabel) {
+  await _upAcquire();
+  try {
+    let last = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const r = await _uploadFileOnce(file, folderName, fileLabel);
+      if (r.url) return r.url;
+      last = r.err;
+      await new Promise(res => setTimeout(res, 900 * attempt));
+    }
+    notify('Upload failed (' + (fileLabel || 'file') + '): ' + last, { icon: 'error' });
+    return null;
+  } finally { _upRelease(); }
+}
+
+// The Drive folder for a lead's uploads is its vehicle number (once known
+// from Valuation) — falls back to the Lead No before that's been entered.
+function getVehicleFolderName() {
+  const lead = findLeadInAnyPage(activeLeadId);
+  if (lead && lead.val_vehicle_number) return lead.val_vehicle_number;
+  const liveVal = document.querySelector('#valModal [data-field="vehicle_number"]');
+  if (liveVal && liveVal.value) return liveVal.value;
+  return activeLeadNo || 'Unsorted';
+}
+
+function readFields(scopeSelector, fieldMap) {
+  const out = {};
+  for (const [dbCol, selector] of Object.entries(fieldMap)) {
+    const el = document.querySelector(`${scopeSelector} [data-field="${selector}"]`);
+    if (!el) { out[dbCol] = null; continue; }
+    if (el.type === 'file') { out[dbCol] = null; continue; } // files handled separately
+    // Trim so stray leading/trailing spaces (common on mobile keyboards /
+    // copy-paste) never reach the database — e.g. "Ramesh " and "Ramesh"
+    // should always be treated and stored as the same name.
+    const v = typeof el.value === 'string' ? el.value.trim() : el.value;
+    out[dbCol] = v || null;
+  }
+  return out;
+}
+
+// Reverse of readFields() — given the same {dbCol: selector} map, pushes
+// saved values from a lead row INTO the matching [data-field] inputs.
+// Used when reopening an already-completed stage form for "one stage
+// back" editing, so existing data shows up instead of a blank form.
+function writeFields(scopeSelector, fieldMap, data) {
+  if (!data) return;
+  for (const [dbCol, selector] of Object.entries(fieldMap)) {
+    const el = document.querySelector(`${scopeSelector} [data-field="${selector}"]`);
+    if (!el || el.type === 'file') continue; // file inputs can't be repopulated
+    el.value = data[dbCol] != null ? data[dbCol] : '';
+  }
+}
+
+// Generic "all fields mandatory" checker for stage forms (Valuation, Bank
+// KYC, Upload Delivery). Given a scope selector and a list of
+// {selector, label} entries (selector = a CSS selector for the field,
+// resolved first inside scope then document-wide for fields addressed by
+// id), returns the label of the first missing/empty field, or null if
+// everything is filled in. A field is skipped (not required right now) if
+// it — or an ancestor — is currently display:none (conditional sections
+// like the Cylinder Photo field) or the element itself is disabled
+// (e.g. Price-Negotiation-style gated dropdowns). Plain <input>/<select>/
+// <textarea> only — file inputs need per-form existing-URL fallback
+// handling and are checked separately where this is called.
+function findMissingRequiredField(scopeSelector, fields) {
+  for (const f of fields) {
+    const el = document.querySelector(`${scopeSelector} ${f.selector}`) || document.querySelector(f.selector);
+    if (!el) continue;
+    if (el.disabled) continue;
+    if (el.offsetParent === null) continue; // hidden via display:none somewhere up the tree
+    const val = (el.value || '').toString().trim();
+    if (!val) return f.label;
+  }
+  return null;
+}
+
+// Resets every input/select/textarea inside a modal to blank/default.
+// Called before a form modal is (re)opened so stale values left over
+// from whoever/whichever-lead last used this same modal never carry
+// into the next lead's form.
+function clearModalFields(scopeSelector) {
+  document.querySelectorAll(`${scopeSelector} input, ${scopeSelector} select, ${scopeSelector} textarea`).forEach(el => {
+    if (el.type === 'file') { el.value = ''; return; }
+    if (el.tagName === 'SELECT') { el.selectedIndex = 0; return; }
+    el.value = '';
+  });
+  document.querySelectorAll(`${scopeSelector} .status-dep`).forEach(el => el.classList.remove('show'));
+}
+
+
+// ------------------------------------------------------------
+// LEAD ENTRY
+// ------------------------------------------------------------
+// Wipes the Add Lead form back to blank — called both after a
+// successful submit and whenever the modal is opened, so a half-filled
+// previous entry (or one left over from Cancel) never shows again.
+function resetAddLeadForm() {
+  clearModalFields('#addModal');
+  selectedPartnerId = null;
+  selectedPEId = null;
+  selectedManagerId = null;
+  if (typeof handleLT === 'function') handleLT('Add', '');
+  const psd = document.getElementById('psdAdd');
+  if (psd) psd.classList.remove('open');
+  const pInput = document.getElementById('pInputAdd');
+  if (pInput) pInput.value = '';
+
+  // Default PE = the logged-in user, if they're a PE — still changeable
+  // via the dropdown (e.g. covering for a colleague). Manager, for a PE,
+  // is NOT a dropdown at all — it's fixed to that PE's own manager
+  // (rewire_user_profiles.manager_id) and shown as a plain read-only
+  // field, since a PE doesn't pick their own manager. Non-PE roles
+  // (Manager/Admin adding a lead) still get the normal select.
+  const mgrSel = document.getElementById('mgrAdd');
+  const mgrDisplay = document.getElementById('mgrAddDisplay');
+  if (currentProfile && currentProfile.role === 'PE') {
+    const peSel = document.getElementById('peAdd');
+    if (peSel) { peSel.value = currentProfile.id; selectedPEId = currentProfile.id; }
+    if (mgrSel) mgrSel.style.display = 'none';
+    if (mgrDisplay) mgrDisplay.style.display = '';
+    updateManagerForSelectedPE(); // derives Manager from whichever PE ends up selected — see function for why
+  } else {
+    if (mgrSel) mgrSel.style.display = '';
+    if (mgrDisplay) mgrDisplay.style.display = 'none';
+  }
+}
+
+async function submitNewLead() {
+  if (!currentProfile) { notify('Please log in first'); return; }
+  // Catches an already-dead session BEFORE the user fills the whole form
+  // and only finds out at the very end via a confusing RLS error (see the
+  // insert's own error handling below for the full explanation).
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) {
+    notify('Your login session has expired. Please refresh the page and log in again before adding this lead.', { icon: 'error', title: 'Session Expired — Please Re-login' });
+    return;
+  }
+
+  const payload = readFields('#addModal', {
+    customer_name: 'customer_name', phone: 'phone', email: 'email',
+    address: 'address', city: 'city', lead_source: 'lead_source',
+    company_dealership_name: 'company_dealership_name',
+  });
+  payload.lead_type   = document.getElementById('ltAdd').value;
+  payload.partner_id  = payload.lead_type === 'Partner' ? selectedPartnerId : null;
+  // Every new lead starts at Need Analysis — the PE (or Manager/Admin)
+  // later qualifies it or marks it Lost via Edit Lead, so there's no
+  // Lead Status field on this form anymore.
+  payload.lead_status = 'Need Analysis';
+  payload.sub_status  = null;
+  payload.pe_id       = selectedPEId || (currentProfile.role === 'PE' ? currentProfile.id : null);
+  payload.manager_id  = selectedManagerId || null;
+  payload.created_by  = currentProfile.id;
+
+  const required = ['customer_name','phone','address','city','lead_source','lead_type'];
+  for (const f of required) {
+    if (!payload[f]) { notify(`Please fill: ${f.replace('_',' ')}`); return; }
+  }
+  // PE and Manager must both be set before a lead can be saved — previously
+  // only enforced implicitly (a PE always gets themselves + their derived
+  // Manager auto-filled, so this rarely bit that role), but a Manager/Admin
+  // adding a lead on someone's behalf could leave both blank with no error,
+  // silently creating an orphaned lead nobody's dashboard would show.
+  if (!payload.pe_id) { notify('Please select a PE (Sales Executive).', { icon: 'error', title: 'Missing field' }); return; }
+  if (!payload.manager_id) { notify('Please select/assign a Manager for this lead.', { icon: 'error', title: 'Missing field' }); return; }
+  if (payload.city && !isValidMasterValue('location', payload.city)) {
+    notify('"' + payload.city + '" is not in the Location master list. Ask Admin to add it in Settings → Master Data, or pick an existing option.', { icon: 'error', title: 'Invalid City' });
+    return;
+  }
+  if (payload.city) payload.city = normalizeMasterValue('location', payload.city);
+  // Company/Dealership Name is OPTIONAL — only validated against the
+  // master list when the user actually typed something in.
+  if (payload.company_dealership_name && !isValidMasterValue('company_dealership', payload.company_dealership_name)) {
+    notify('"' + payload.company_dealership_name + '" is not in the Company/Dealership master list. Ask Admin to add it in Settings → Master Data, or pick an existing option, or leave this field blank.', { icon: 'error', title: 'Invalid Company/Dealership' });
+    return;
+  }
+  payload.company_dealership_name = payload.company_dealership_name ? normalizeMasterValue('company_dealership', payload.company_dealership_name) : null;
+
+  // Duplicate-phone SOFT warning (Ramvir, Sept 2026) — downgraded from a
+  // hard block. One phone number legitimately sits on multiple active
+  // leads in a bulk deal (same customer, several vehicles), so phone alone
+  // can no longer refuse the save outright. Vehicle Number is the real
+  // duplicate/fraud guard (see the hard block in JS-Pipeline.html's
+  // Valuation submit — a vehicle number is genuinely 1:1 with a lead) and
+  // stays a hard block, unchanged. This just warns the PE and lets them
+  // confirm it's intentional (a new vehicle for a known customer) rather
+  // than a genuine accidental re-entry.
+  const { data: dupPhoneLeads, error: dupPhoneErr } = await sb.from('rewire_master_data')
+    .select('lead_no, ud_status, ha_status, overall_status')
+    .eq('phone', payload.phone);
+  if (dupPhoneErr) { notify('Could not check for duplicate phone number: ' + dupPhoneErr.message, { icon: 'error' }); return; }
+  const activePhoneLeads = (dupPhoneLeads || []).filter(l => {
+    const isPurchased = l.ud_status === 'Complete' && l.ha_status === 'Approved';
+    const isLost = l.overall_status === 'Closed Lost';
+    return !isPurchased && !isLost;
+  });
+  if (activePhoneLeads.length) {
+    const leadList = activePhoneLeads.map(l => l.lead_no).join(', ');
+    const ok = await confirmDialog(`This phone number is already on ${activePhoneLeads.length > 1 ? 'active leads' : 'an active lead'} (${leadList}). If this is the same customer with another vehicle (bulk deal), continue. Otherwise cancel and double-check the number.`);
+    if (!ok) return;
+  }
+
+  // Row-level-security-policy INSERT failure here almost never means the
+  // user's ROLE is disallowed (PE/Manager/Admin/Back Office Head can all
+  // insert per the DB policy) — it means the browser's Supabase session
+  // itself was invalid at the moment of this request (expired/failed
+  // silent token refresh, or the shared login session got cleared by
+  // signing out in another tab of the same browser). auth.uid() then
+  // reads as NULL server-side, so my_role() returns NULL and matches
+  // nothing. Translating the raw Postgres error into something actionable
+  // (Ramvir, Sept 2026 — traced from Manager Aditya Agarwal's "Error
+  // saving lead: new row violates row-level security policy" report; his
+  // profile/role were confirmed correct in the DB, so it wasn't a
+  // permissions problem).
+  const { data, error } = await sb.from('rewire_master_data').insert(payload).select().single();
+  if (error) {
+    if (error.message && error.message.toLowerCase().includes('row-level security')) {
+      notify('Your login session has expired or is no longer valid, so the save was rejected — not a permissions problem. Please refresh the page (or log out and log back in) and try again.', { icon: 'error', title: 'Session Expired — Please Re-login' });
+    } else {
+      notify('Error saving lead: ' + error.message);
+    }
+    return;
+  }
+
+  notify(`Lead saved: ${data.lead_no}`);
+  // WhatsApp "your request has been registered" confirmation to the
+  // customer (WhatsApp.gs, customer_lead_registration template) --
+  // fire-and-forget: a WhatsApp failure (bad number, template not yet
+  // approved, etc.) must never block or roll back the lead that's
+  // already saved, so this only logs to console on failure, no notify().
+  if (payload.phone && typeof google !== 'undefined' && google.script && google.script.run) {
+    google.script.run
+      .withFailureHandler((err) => console.error('WhatsApp lead-confirmation send failed:', err))
+      .notifyCustomerLeadCreated(payload.phone, payload.customer_name);
+  }
+  closeModal('addModal');
+  resetAddLeadForm();
+  await refreshLeadsTable();
+}
+
+
+</script>

@@ -1,0 +1,1703 @@
+<script>
+// WIRING: stage navigation (setStage/openStageForm), View Lead Details + Edit Lead rendering, permissions matrix, dropdown-close handlers. This is App.html's own inline script (not part of the JS module chain below it).
+let curStage = 1;
+let selectedPartnerId = null, selectedPEId = null, selectedManagerId = null;
+let currentSectionName = 'dashboard'; // tracks whichever sidebar section is on screen, so the topbar Refresh button knows what to re-load
+
+const SM = {
+  'Need Analysis': { l:'Sub-Status', o:['Need Analysis'] },
+  'Qualified': { l:'Sub-Status', o:['Qualified'] },
+  'CLR': { l:'Reason', o:['Call Not Connected','Customer Not Interested','Already Sold','Out of Territory'] },
+  'CLC': { l:'Competitor', o:['Local Scraper','Mahindra CERO','MSTI','Plan Cancelled','Wortech'] },
+};
+
+// Valuation Verify removed from the pipeline; Upload Delivery now comes
+// right after Bank KYC (PE enters delivery), Verification & Zoho (Back
+// Office) moves to after Delivery — indices below match that new order.
+const STAGE_MODALS = [null,'valModal','pnModal','bkModal','udModal','vzModal','maModal','accessoriesModal','haModal','rcModal','releaseModal'];
+const STAGE_LABELS = [null,'Valuation','Price Negotiation','Bank KYC','Upload Delivery','Verification & Zoho','Manager Approval','Accessories Check','Head Approval','RC Tracking','Payment Release','Accessories Review'];
+// index 11 ('Accessories Review') — Manager's review step for leads whose
+// Accessories Check deduction was > 0 (Ramvir, Sept 2026). Sits outside the
+// numbering too, same reasoning as index 10 (Payment Release): a lead
+// reaches it independent of current_stage. Not in STAGE_MODALS since its
+// card doesn't use openStageForm's dispatcher — it opens accReviewModal
+// directly via openAccessoriesReview() (see renderQualTable, JS-Dashboard.html).
+// index 10 ('releaseModal'/'Payment Release') is the new early Head sign-off
+// for Advance Payment / Omini Pay leads only — see loadQualTab (JS-
+// Dashboard.html) and supabase-batch29-payment-type-flow-redesign.sql.
+// It sits outside the original 1-9 numbering deliberately, so nothing
+// about the existing Post Delivery flow's stage numbers had to change.
+
+function handleLT(suffix, v){
+  const fi = document.getElementById('pf'+suffix);
+  if (fi) fi.style.display = v === 'Partner' ? '' : 'none';
+  // Company/Dealership Name only makes sense for Partner-sourced leads —
+  // show/hide it in lockstep with Partner Name, and clear any stray value
+  // left over from before the user switched Lead Type back to Direct.
+  const cd = document.getElementById('cd'+suffix);
+  if (cd) {
+    cd.style.display = v === 'Partner' ? '' : 'none';
+    if (v !== 'Partner') {
+      const cdInput = cd.querySelector('input[data-field]');
+      if (cdInput) cdInput.value = '';
+    }
+  }
+}
+function handleST(suffix, v){
+  const fi = document.getElementById('sd'+suffix);
+  const sel = document.getElementById('sdSel'+suffix);
+  const lbl = document.getElementById('sdLbl'+suffix);
+  if (!fi) return;
+  if (SM[v]) {
+    lbl.textContent = SM[v].l;
+    // When there's only one possible Sub-Status for this Status (Need
+    // Analysis -> 'Need Analysis', Qualified -> 'Qualified'), auto-select
+    // it instead of defaulting to the blank "Select…" option — otherwise
+    // sub_status silently saves as blank even though there was only ever
+    // one correct value, which is exactly what was happening every time a
+    // lead got marked Qualified through this form.
+    if (SM[v].o.length === 1) {
+      sel.innerHTML = `<option value="${SM[v].o[0]}" selected>${SM[v].o[0]}</option>`;
+    } else {
+      sel.innerHTML = '<option value="">Select…</option>' + SM[v].o.map(o => `<option>${o}</option>`).join('');
+    }
+    fi.classList.add('show');
+  } else fi.classList.remove('show');
+}
+function handleRCType(v){
+  const n = document.getElementById('rcPhysicalNote');
+  if (n) n.style.display = v === 'Physical RC' ? 'flex' : 'none';
+}
+
+function handleRcPeStatus(v){
+  const el = document.getElementById('rcPeCourierFields');
+  el.style.display = (v === 'Send to City Office' || v === 'Send to Plant') ? '' : 'none';
+  if (el.style.display !== 'none') {
+    const modeSel = document.getElementById('rcDispatchMode');
+    if (modeSel) handleRcDispatchMode(modeSel.value);
+  }
+}
+
+// Toggles between the Courier fields (Courier Name/POD No./Courier Date/
+// POD Image) and the By Hand field (just Carried By — no photo/signature,
+// per Ramvir) depending on the Dispatch Mode picked.
+function handleRcDispatchMode(v){
+  const courierEl = document.getElementById('rcCourierModeFields');
+  const handEl = document.getElementById('rcByHandFields');
+  if (!courierEl || !handEl) return;
+  const personMode = (v === 'By Hand' || v === 'Driver' || v === 'Crane');
+  const lbl = document.getElementById('rcCarriedByLabel');
+  if (lbl) lbl.textContent = v === 'Driver' ? 'Driver Name' : (v === 'Crane' ? 'Crane Company / Operator' : 'Carried By (Name)');
+  courierEl.style.display = personMode ? 'none' : 'contents';
+  // 'contents' (not '') — the wrapper itself isn't a grid, so without this
+  // its fg-full children only ever got as wide as ONE cell of the OUTER
+  // grid (a narrow single column) instead of spanning the full row —
+  // that's what was making Carried By/Date look tiny.
+  handEl.style.display = personMode ? 'contents' : 'none';
+}
+
+function handleCylinderType(v){
+  document.getElementById('udCylinderPhotoField').style.display = (v === 'CNG' || v === 'LPG') ? '' : 'none';
+}
+
+// Upload Delivery — each accessory photo upload is shown (and, per
+// findMissingUdPhoto below, only required) when its own accessory field
+// says the vehicle actually has that item, same pattern as Cylinder Type.
+function handleUdSpareWheel(v){
+  document.getElementById('udSpareWheelPhotoField').style.display = (v === 'Yes') ? '' : 'none';
+}
+function handleUdStereo(v){
+  document.getElementById('udStereoPhotoField').style.display = (v === 'Yes') ? '' : 'none';
+}
+function handleUdSpeakers(v){
+  document.getElementById('udSpeakersPhotoField').style.display = (parseInt(v, 10) > 0) ? '' : 'none';
+}
+function handleUdToolKitGroup(){
+  const vals = ['ud_tool_kit', 'ud_jack', 'ud_rod', 'ud_pana'].map(f => {
+    const el = document.querySelector(`#udModal [data-field="${f}"]`);
+    return el ? el.value : '';
+  });
+  document.getElementById('udToolKitPhotoField').style.display = vals.some(v => v === 'Yes') ? '' : 'none';
+}
+function handleUdBattery(v){
+  document.getElementById('udBatteryPhotoField').style.display = (v === 'Yes') ? '' : 'none';
+}
+function handleUdAlloyWheel(v){
+  document.getElementById('udAlloyWheelPhotoField').style.display = (parseInt(v, 10) > 0) ? '' : 'none';
+}
+
+// Bank KYC is now the ONLY place the customer's bank details get collected
+// (PN's old "Customer Account Details" section was removed — see
+// Modals-Pipeline.html/JS-Pipeline.html). The 5 text fields + Cheque Photo
+// stay open/editable here always; no locking. Pre-filled from kyc_* only
+// as a courtesy for legacy leads that still have values saved from the
+// old PN flow — still freely editable, same as everything else on this form.
+const BK_BANK_FIELDS = ['account_holder_name', 'bank_name', 'branch_name', 'account_number', 'ifsc_code'];
+
+// Bank Details section (the 5 fields above + Cheque Photo) is only needed
+// when the customer is actually being paid something directly: Customer
+// Offer amount > 0 and not routed via Omini Pay. If PN never needed it
+// (e.g. pn_customer_payment = 0), Bank KYC shouldn't demand it either.
+function bkBankDetailsNeeded(lead) {
+  return !!(lead && (parseFloat(lead.pn_customer_payment) || 0) > 0 && lead.pn_payment_type !== 'Omini Pay');
+}
+function handleBkBankLock(lead) {
+  const section = document.getElementById('bkBankSection');
+  const needed = bkBankDetailsNeeded(lead);
+  if (section) section.style.display = needed ? '' : 'none';
+  const note = document.getElementById('bkBankLockedNote');
+  if (note) note.style.display = 'none'; // no locking any more — note retired
+  const chequeWrap = document.querySelector('#bkModal [data-field="cheque_doc"]');
+  BK_BANK_FIELDS.forEach(f => {
+    const el = document.querySelector(`#bkModal [data-field="${f}"]`);
+    if (el) { el.disabled = false; if (!needed) el.value = ''; }
+  });
+  if (!needed) {
+    if (chequeWrap) chequeWrap.value = '';
+  }
+}
+
+// Same rule, mirrored onto Verification & Zoho: if Bank KYC never needed
+// (and so never collected) bank details for this lead, VZ shouldn't show
+// them either — there's nothing real for Back Office to "check against the
+// cheque copy" in that case.
+function handleVzBankLock(lead) {
+  const section = document.getElementById('vzBankSection');
+  const needed = bkBankDetailsNeeded(lead);
+  if (section) section.style.display = needed ? '' : 'none';
+  if (!needed) {
+    BK_BANK_FIELDS.forEach(f => {
+      const el = document.querySelector(`#vzModal [data-field="${f}"]`);
+      if (el) el.value = '';
+    });
+    const chequeWrap = document.getElementById('vzChequeLinkWrap');
+    if (chequeWrap) chequeWrap.style.display = 'none';
+  }
+}
+
+function calcUdTotal(){
+  const cust = parseFloat(document.getElementById('udCustomerPayment').value) || 0;
+  const broker = parseFloat(document.getElementById('udBrokerPayment').value) || 0;
+  const trader = parseFloat(document.getElementById('udTraderPayment').value) || 0;
+  const cash = parseFloat(document.getElementById('udCashCommission').value) || 0;
+  const gst = parseFloat(document.getElementById('udGstAmount').value) || 0;
+  document.getElementById('udTotalOfferPrice').value = cust + broker + trader + cash + gst;
+}
+
+// Upload Delivery's own copy of Vehicle Rate per KG — same pure display
+// formula as PN's calcPnVehicleRate(), recomputed live, never stored.
+function calcUdVehicleRate() {
+  const amount = parseFloat(document.getElementById('udVehicleAmount').value) || 0;
+  const weight = parseFloat(document.getElementById('udVehicleWeight').value) || 0;
+  document.getElementById('udVehicleRatePerKg').value = weight > 0 ? (amount / weight).toFixed(2) : '';
+}
+
+function setStage(idx){
+  if (idx === 0) return;
+  curStage = idx;
+  // Payment Release (10) sits outside the linear 1-8 stepper (it's a
+  // parallel step for Advance Payment/Omini Pay, between Manager Approval
+  // and Delivery/Accessories Check) — mark it and everything through
+  // Manager Approval as done, rather than running the normal i<idx
+  // arithmetic which would (wrongly) mark every stage 1-8 as done.
+  // idx 11 (Accessories Review) sits after Accessories Check (7) but before
+  // Head Approval (8) in visual order, same "parallel step" treatment as
+  // Payment Release (10) — 7.5 marks sp1-sp7 done without wrongly marking
+  // sp8 (Head Approval) done too.
+  const stepperIdx = idx === 10 ? 6.5 : idx === 11 ? 7.5 : idx;
+  for (let i = 1; i <= 8; i++) {
+    const el = document.getElementById('sp'+i);
+    if (el) { el.classList.remove('active','done'); if (i < stepperIdx) el.classList.add('done'); else if (i === idx) el.classList.add('active'); }
+  }
+  const sp10el = document.getElementById('sp10');
+  if (sp10el) { sp10el.classList.remove('active','done'); if (idx === 10) sp10el.classList.add('active'); }
+  const sp11el = document.getElementById('sp11');
+  if (sp11el) { sp11el.classList.remove('active','done'); if (idx === 11) sp11el.classList.add('active'); }
+  const lbl = document.getElementById('stage-label');
+  if (lbl) lbl.textContent = (STAGE_LABELS[idx] || '') + ' Stage';
+  const head = document.getElementById('action-col-head');
+  if (head) head.textContent = (STAGE_LABELS[idx] || '') + ' Form';
+  if (typeof loadQualTab === 'function') loadQualTab(0);
+}
+// PE-facing stage forms eligible for "one stage back" re-editing.
+// STAGE_MODALS index: 1=Valuation, 2=Price Negotiation, 3=Bank KYC, 4=Upload Delivery.
+// A lead is "due" for stage idx when lead.current_stage === idx - 1, and
+// has "just completed" stage idx (one-stage-back, still editable) when
+// lead.current_stage === idx. Admin can always reopen these 4 stages
+// regardless of how far the lead has since progressed; everyone else
+// loses access once Manager Approval is done (current_stage >= 6) —
+// same cutoff canEditLeadDetails() already uses.
+const PE_STAGE_BACK_INDICES = [1, 2, 3, 4];
+// idx -> its "Edit —" gate key (Ramvir, Sept 2026 — Access Control tab
+// now genuinely controls whether PE/Manager can actually fill these 4
+// stage forms, not just see them; see PERMISSION_GATE_REGISTRY,
+// JS-Core.html, for why this is capped to PE/Manager only — the database
+// itself won't honor any other role here regardless of this checkbox).
+const EDIT_GATE_BY_STAGE_IDX = { 1: 'edit-valuation', 2: 'edit-pn', 3: 'edit-bankkyc', 4: 'edit-delivery' };
+
+function canEditStageForm(lead, idx) {
+  if (!currentProfile || !lead) return false;
+  if (currentProfile.role === 'Admin') return true;
+  // Checked FIRST, ahead of every existing rule below — an explicit "no"
+  // here means no amount of stage-depth logic afterward can override it.
+  // Everyone who already had edit rights (PE/Manager) keeps them exactly
+  // as before, since both are seeded with all 4 keys by default — this
+  // only changes behavior once an Admin actually unchecks one in Access
+  // Control.
+  const editGate = EDIT_GATE_BY_STAGE_IDX[idx];
+  if (editGate && typeof hasGateAccess === 'function' && !hasGateAccess(editGate)) return false;
+  // Upload Delivery (4) for Advance Payment/Omini Pay/Instant Payments —
+  // decoupled from current_stage entirely (see loadQualTab/batch29): PE
+  // can fill it any time after Bank KYC is done, right up until it's
+  // actually completed, regardless of how far VZ/Manager Approval/Payment
+  // Release have progressed in parallel.
+  if (idx === 4 && isAltFlowPaymentType(lead.pn_payment_type)) {
+    // Manager override, same "always the intent" rule the other 3 stage
+    // forms get below (reopen anything up until Manager Approval) — this
+    // branch used to return before ever reaching that check, so Manager
+    // was blocked outright the moment ud_status hit Complete, with no way
+    // back in even to fix something before approving. Reported on
+    // L7102775 (Omini Pay, ma_status still Pending, ud_status Complete —
+    // Manager couldn't reopen Upload Delivery at all).
+    if (currentProfile.role === 'Manager') {
+      return lead.overall_status === 'Active' && lead.current_stage < 6;
+    }
+    return lead.overall_status === 'Active' && lead.kyc_status === 'Complete' && lead.ud_status !== 'Complete';
+  }
+  if (PE_STAGE_BACK_INDICES.indexOf(idx) === -1) return true; // untouched stages — unchanged behaviour
+  if (lead.overall_status !== 'Active') return false; // Closed Lost — Admin only
+  if (lead.current_stage >= 6) return false; // Manager Approved onward — Admin only
+  // Manager gets to reopen ANY of the 4 PE-facing stage forms (not just
+  // the immediately-previous one) right up until they approve — this was
+  // always the intent (Manager reviews the whole lead before approving,
+  // same cutoff canEditLeadDetails() uses), unlike PE who only ever gets
+  // the one-step-back stage via the Qualified Pipeline card's Edit button.
+  if (currentProfile.role === 'Manager') return true;
+  return idx === lead.current_stage || idx === lead.current_stage + 1;
+}
+
+
+const VAL_FIELD_MAP = {
+  val_vehicle_type: 'vehicle_type', val_vehicle_number: 'vehicle_number',
+  val_make: 'make', val_model_variant: 'model_variant',
+  val_registration_year: 'registration_year', val_kerb_weight_kg: 'kerb_weight',
+  val_engine_no: 'engine_no', val_chassis_no: 'chassis_no',
+  val_fuel_type: 'fuel_type', val_spare_wheel: 'spare_wheel', val_stereo: 'stereo',
+  val_speakers: 'speakers', val_tool_kit: 'tool_kit', val_battery: 'battery',
+  val_vehicle_operational: 'vehicle_operational', val_vehicle_accidental: 'vehicle_accidental',
+  val_alloy_wheel: 'alloy_wheel', val_remarks: 'remarks',
+};
+// 'email' (no kyc_ prefix — writes back to the same lead-level `email`
+// column captured at New Lead Entry, not a separate kyc_email column) was
+// added so Bank KYC prefills the New Lead Entry email and lets Back
+// Office correct it here if it was wrong/missing — writeFields()/
+// readFields() don't care that this one key doesn't share the others'
+// prefix, they just read/write whatever DB column each key names. Also
+// used (harmlessly) for VZ modal prefill via this same map — VZ's form
+// has no [data-field="customer_email"] element, so writeFields() just
+// skips it there (see its `if (!el...) continue`).
+const BK_FIELD_MAP = {
+  kyc_aadhar_number: 'aadhar_number', kyc_aadhar_linked_phone: 'aadhar_linked_phone',
+  kyc_pan_number: 'pan_number', kyc_gst_number: 'gst_number',
+  kyc_account_holder_name: 'account_holder_name', kyc_bank_name: 'bank_name', kyc_branch_name: 'branch_name',
+  kyc_account_number: 'account_number', kyc_ifsc_code: 'ifsc_code',
+  email: 'customer_email',
+};
+const UD_FIELD_MAP = {
+  ud_fuel_type: 'ud_fuel_type', ud_spare_wheel: 'ud_spare_wheel', ud_stereo: 'ud_stereo', ud_speakers: 'ud_speakers',
+  ud_tool_kit: 'ud_tool_kit', ud_jack: 'ud_jack', ud_rod: 'ud_rod', ud_pana: 'ud_pana',
+  ud_battery: 'ud_battery',
+  ud_vehicle_operational: 'ud_vehicle_operational', ud_vehicle_accidental: 'ud_vehicle_accidental', ud_alloy_wheel: 'ud_alloy_wheel',
+  ud_upi_number: 'ud_upi_number', ud_upi_amount: 'ud_upi_amount', ud_delivery_remark: 'ud_delivery_remark',
+};
+
+async function openStageForm(leadId, leadNo, idx){
+  let lead = findLeadInAnyPage(leadId);
+  if (!lead) {
+    // Not in any currently-loaded page cache — happens when Admin opens
+    // the "Edit" link from View Lead Details for a lead that's since
+    // moved on to a stage/tab that isn't loaded right now. Fetch it directly.
+    const { data, error } = await sb.from('rewire_master_data').select('*').eq('id', leadId).single();
+    if (!error && data) lead = data;
+  }
+  if (!canEditStageForm(lead, idx)) {
+    notify('You do not have edit access for this stage of the lead.', { icon: 'info', title: 'View only' });
+    return;
+  }
+  activeLeadId = leadId;
+  activeLeadNo = leadNo;
+  const m = STAGE_MODALS[idx];
+  // Wipe whatever's left over from the last lead opened in this same
+  // modal before filling it in fresh — otherwise stale values from a
+  // previous lead can bleed through into this one.
+  if (m && typeof clearModalFields === 'function') clearModalFields('#' + m);
+  if (m === 'pnModal') {
+    handlePnStatus(''); handlePnDealType(''); handlePnPaymentType(''); document.getElementById('pnCommissionPersons').innerHTML = '';
+    // Vehicle Weight prefills from Valuation even on a genuinely fresh PN
+    // entry (not just re-edit) — Vehicle Amount/COD Amount/Rate per KG stay
+    // blank until the PE fills them in, same as every other manual field here.
+    document.getElementById('pnVehicleWeight').value = lead ? (lead.val_kerb_weight_kg || '') : '';
+  }
+  if (m === 'valModal') handleValStatus('');
+  if (m === 'bkModal') handleBkStatus('');
+  if (m === 'udModal') handleUdStatus('');
+  const subEls = ['valModalSub','pnModalSub','bkModalSub','vzModalSub','udModalSub','maModalSub','accessoriesModalSub','haModalSub','rcModalSub','releaseModalSub'];
+  subEls.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = leadNo; });
+  if (m === 'maModal' && currentProfile) document.getElementById('maManagerName').value = currentProfile.name;
+  if (m === 'haModal' && currentProfile) document.getElementById('haHeadName').value = currentProfile.name;
+  if (m === 'releaseModal' && currentProfile) document.getElementById('releaseHeadName').value = currentProfile.name;
+  // Vehicle Rate Calculation — read-only reference shown on Manager
+  // Approval / Payment Release / Head Approval. Prefers Upload Delivery's
+  // own ud_* figures (the final, corrected numbers) and falls back to
+  // Price Negotiation's pn_* estimate if Delivery hasn't set them (e.g.
+  // Advance Payment/Omini Pay/Instant Payments reach Payment Release
+  // before Delivery happens at all).
+  if (m === 'maModal' || m === 'releaseModal' || m === 'haModal') {
+    const { data: vrLead } = await sb.from('rewire_master_data')
+      .select('pn_vehicle_weight_kg, pn_vehicle_amount, pn_cod_amount, ud_vehicle_weight_kg, ud_vehicle_amount, ud_cod_amount, val_kerb_weight_kg')
+      .eq('id', leadId).single();
+    const vrWeight = (vrLead && (vrLead.ud_vehicle_weight_kg || vrLead.pn_vehicle_weight_kg || vrLead.val_kerb_weight_kg)) || 0;
+    const vrAmount = (vrLead && (vrLead.ud_vehicle_amount || vrLead.pn_vehicle_amount)) || 0;
+    const vrCod = (vrLead && (vrLead.ud_cod_amount || vrLead.pn_cod_amount)) || 0;
+    const vrRate = vrWeight > 0 ? (vrAmount / vrWeight).toFixed(2) : '';
+    const prefix = m === 'maModal' ? 'ma' : m === 'releaseModal' ? 'release' : 'ha';
+    const wEl = document.getElementById(prefix + 'VehicleWeight');
+    const aEl = document.getElementById(prefix + 'VehicleAmount');
+    const cEl = document.getElementById(prefix + 'CodAmount');
+    const rEl = document.getElementById(prefix + 'VehicleRatePerKg');
+    if (wEl) wEl.value = vrWeight || '—';
+    if (aEl) aEl.value = vrAmount ? '₹' + vrAmount.toLocaleString('en-IN') : '—';
+    if (cEl) cEl.value = vrCod ? '₹' + vrCod.toLocaleString('en-IN') : '—';
+    if (rEl) rEl.value = vrRate ? '₹' + vrRate : '—';
+  }
+  if (m === 'releaseModal') {
+    // Payment Release — Head sees the deal total before releasing payment
+    // for this Advance Payment/Omini Pay lead (Delivery + Accessories
+    // Check haven't happened yet at this point, so there's no deduction
+    // figure to show here — that comes later at the final Head Approval).
+    const { data: relLead } = await sb.from('rewire_master_data')
+      .select('pn_total_offer_price, pn_payment_type').eq('id', leadId).single();
+    const relTotal = (relLead && relLead.pn_total_offer_price) || 0;
+    const relTotalEl = document.getElementById('releaseDealTotalAmount');
+    if (relTotalEl) relTotalEl.value = relTotal ? '₹' + relTotal.toLocaleString('en-IN') : '—';
+    const relTypeEl = document.getElementById('releasePaymentType');
+    if (relTypeEl) relTypeEl.value = (relLead && relLead.pn_payment_type) || '';
+  }
+  if (m === 'haModal') {
+    // Cached "lead" here can come from a list query that didn't select
+    // every column (e.g. loadQualTab) — fetch the deal-amount fields fresh
+    // and directly so Head always sees the real total + what Accessories
+    // Check actually deducted, not whatever happened to be in the row cache.
+    const { data: haLead } = await sb.from('rewire_master_data')
+      .select(`pn_total_offer_price, accessories_deduction_amount, accessories_deduction_reason,
+        accessories_manager_review_status, accessories_manager_remarks,
+        reviewedBy:rewire_user_profiles!rewire_master_data_accessories_manager_reviewed_by_fkey(name),
+        val_spare_wheel, ud_spare_wheel, val_stereo, ud_stereo, val_tool_kit, ud_tool_kit,
+        val_battery, ud_battery, val_alloy_wheel, ud_alloy_wheel, val_fuel_type, ud_cylinder_type,
+        val_vehicle_operational, ud_vehicle_operational, val_vehicle_accidental, ud_vehicle_accidental`)
+      .eq('id', leadId).single();
+    const dealTotal = (haLead && haLead.pn_total_offer_price) || 0;
+    const accDeduction = (haLead && haLead.accessories_deduction_amount) || 0;
+
+    // Only the Shortage/Excess rows, at the top of the modal — a Head
+    // shouldn't have to open Accessories Check separately just to see
+    // what didn't match; everything that DID match is deliberately left
+    // out here since it's not actionable.
+    const summaryWrap = document.getElementById('haAccessoriesSummaryWrap');
+    const summaryBody = document.getElementById('haAccessoriesSummaryBody');
+    if (haLead && typeof computeAccessoryComparisons === 'function') {
+      const mismatches = computeAccessoryComparisons(haLead).filter(r => r.kind !== 'match');
+      if (mismatches.length) {
+        summaryWrap.style.display = '';
+        summaryBody.innerHTML = mismatches.map(r => `<tr>
+          <td style="font-weight:500;">${r.label}</td>
+          <td>${r.valVal || '—'}</td>
+          <td>${r.udVal || '—'}</td>
+          <td>${accessoryKindBadge(r.kind)}</td>
+        </tr>`).join('');
+      } else {
+        summaryWrap.style.display = 'none';
+        summaryBody.innerHTML = '';
+      }
+    } else {
+      summaryWrap.style.display = 'none';
+    }
+    const haTotalEl = document.getElementById('haDealTotalAmount');
+    haTotalEl.value = dealTotal ? '₹' + dealTotal.toLocaleString('en-IN') : '—';
+    // The displayed value above has a ₹ symbol and thousands commas, so it
+    // can't be parseFloat()'d back into a number (that was the earlier bug —
+    // Net Approved Amount always showed "—" because parseFloat('₹50,000')
+    // is NaN). Keep the real number stashed separately for calcHaNetAmount()
+    // and submitHeadApproval() to read instead of the formatted display text.
+    haTotalEl.dataset.raw = dealTotal;
+    document.getElementById('haAccessoriesDeduction').value = '₹' + accDeduction.toLocaleString('en-IN');
+    const reasonWrap = document.getElementById('haAccessoriesDeductionReasonWrap');
+    if (haLead && haLead.accessories_deduction_reason) {
+      reasonWrap.style.display = '';
+      document.getElementById('haAccessoriesDeductionReason').textContent = haLead.accessories_deduction_reason;
+    } else {
+      reasonWrap.style.display = 'none';
+    }
+    const mgrRemarksWrap = document.getElementById('haAccessoriesManagerRemarksWrap');
+    if (haLead && haLead.accessories_manager_review_status === 'Reviewed' && haLead.accessories_manager_remarks) {
+      mgrRemarksWrap.style.display = '';
+      const reviewerName = (haLead.reviewedBy && haLead.reviewedBy.name) || 'Manager';
+      document.getElementById('haAccessoriesManagerRemarks').textContent = haLead.accessories_manager_remarks + ' — ' + reviewerName;
+    } else {
+      mgrRemarksWrap.style.display = 'none';
+    }
+    const deductEl = document.getElementById('haDeductionAmount');
+    deductEl.value = accDeduction || '';
+    deductEl.dataset.origDeduction = accDeduction || 0;
+    calcHaNetAmount();
+    document.getElementById('haDeductionOverrideNote').style.display = 'none';
+  }
+
+  // "One stage back" re-edit — the stage this idx represents was already
+  // completed (current_stage >= idx), so reopen it pre-filled with the
+  // saved data instead of a blank form.
+  // Upload Delivery (4) for Advance Payment/Omini Pay/Instant Payments is
+  // the one exception: current_stage keeps advancing through VZ/Manager
+  // Approval/Payment Release in parallel for these types (see
+  // loadQualTab/batch29), so current_stage >= 4 does NOT mean Delivery
+  // was actually done — ud_status is the only real signal for that. Using
+  // current_stage here wrongly treated a lead that's still due for
+  // Delivery as a "re-edit" once its current_stage happened to reach 4+
+  // for unrelated reasons, pulling in empty ud_* fields instead of
+  // pre-filling Payment Details from the saved pn_* values.
+  const isReedit = lead && (
+    (idx === 4 && isAltFlowPaymentType(lead.pn_payment_type))
+      ? lead.ud_status === 'Complete'
+      : (PE_STAGE_BACK_INDICES.indexOf(idx) !== -1 && lead.current_stage >= idx)
+  );
+
+  if (m === 'valModal') {
+    document.getElementById('valLeadNo').value = leadNo;
+    document.getElementById('valCustomerName').value = lead ? lead.customer_name || '' : '';
+    document.getElementById('valPhone').value = lead ? lead.phone || '' : '';
+    document.getElementById('valCity').value = lead ? lead.city || '' : '';
+    document.getElementById('valAddress').value = lead ? lead.address || '' : '';
+    if (isReedit) {
+      document.getElementById('valStatus').value = 'Valuation';
+      handleValStatus('Valuation');
+      writeFields('#valModal', VAL_FIELD_MAP, lead);
+      document.getElementById('rcTypeVal').value = lead.val_rc_type || '';
+      handleRCType(lead.val_rc_type || '');
+      markExistingUploads('#valModal', { rc_copy: lead.val_rc_copy_url });
+    }
+    // Condition Checklist (Spare Wheel/Stereo/Speakers/Tool Kit/Battery/
+    // Vehicle Operational/Vehicle Accidental/Alloy Wheel) is what the PE
+    // physically found on the vehicle at Valuation — a Manager REOPENING
+    // an already-completed valuation to fix something else shouldn't also
+    // be able to quietly change what was actually observed. This only
+    // applies to a re-edit (isReedit) — a Manager doing the FRESH/first
+    // fill of a valuation must still be able to enter these fields, same
+    // as the DB now enforces separately (check_master_column_permissions()
+    // — Manager allowed unless old.val_status was already 'Complete').
+    const valChecklistFields = ['spare_wheel', 'stereo', 'speakers', 'tool_kit', 'battery', 'vehicle_operational', 'vehicle_accidental', 'alloy_wheel'];
+    const valManagerReopening = isReedit && currentProfile && currentProfile.role === 'Manager';
+    valChecklistFields.forEach(f => {
+      const el = document.querySelector('#valModal [data-field="' + f + '"]');
+      if (el) el.disabled = valManagerReopening;
+    });
+  }
+  if (m === 'pnModal' && isReedit) {
+    document.getElementById('pnStatus').value = 'Price Negotiation';
+    handlePnStatus('Price Negotiation');
+    document.getElementById('pnDealType').value = lead.pn_deal_type || '';
+    handlePnDealType(lead.pn_deal_type || '');
+    document.getElementById('pnPaymentType').value = lead.pn_payment_type || '';
+    handlePnPaymentType(lead.pn_payment_type || '');
+    document.getElementById('pnBroker').value = lead.pn_partner_name || '';
+    document.getElementById('pnTrader').value = lead.pn_trader_name || '';
+    document.getElementById('pnCustomerPayment').value = lead.pn_customer_payment || '';
+    document.getElementById('pnBrokerPayment').value = lead.pn_broker_payment || '';
+    document.getElementById('pnCodPayment').value = lead.pn_cod_payment || (/^Trader Keeping COD \/ (Broker|Direct) Deal$/.test(lead.pn_deal_type || '') ? 11000 : '');
+    document.getElementById('pnCash').value = lead.pn_cash_commission || '';
+    document.getElementById('pnGstPayTo').value = lead.pn_gst_pay_to || '';
+    document.getElementById('pnGstAmount').value = lead.pn_gst_amount || '';
+    handlePnGstPayTo(lead.pn_gst_pay_to || '');
+    document.getElementById('pnOmniPay').value = lead.pn_omni_payments_by_name || '';
+    document.getElementById('pnOmniPayTo').value = lead.pn_omni_pay_to || '';
+    document.getElementById('pnVehicleParking').value = lead.pn_vehicle_parking || '';
+    document.getElementById('pnTransportationType').value = lead.pn_transportation_type || '';
+    if (typeof refreshSubLocationSelect === 'function') refreshSubLocationSelect('pnVehicleSubParking', lead.pn_vehicle_parking || '', lead.pn_vehicle_sub_parking || '');
+    calcPnTotal();
+    document.getElementById('pnVehicleWeight').value = lead.pn_vehicle_weight_kg || lead.val_kerb_weight_kg || '';
+    document.getElementById('pnVehicleAmount').value = lead.pn_vehicle_amount || '';
+    document.getElementById('pnCodAmount').value = lead.pn_cod_amount || '';
+    calcPnVehicleRate();
+    // Broker bank reference (by name, since we only have pn_partner_name
+    // here, not the partner's id), re-populated so a reopened PN form
+    // looks the same as when it was first saved. Customer's own bank
+    // details are no longer captured on this form at all — see Bank KYC.
+    if (lead.pn_partner_name) {
+      const brokerPartner = allPartners.find(p => p.partner_name.trim().toLowerCase() === lead.pn_partner_name.trim().toLowerCase());
+      if (brokerPartner) showPnBrokerBankDetails(brokerPartner.id);
+    }
+  }
+  if (m === 'bkModal') {
+    // Fresh open too (not just re-edit) — the customer's bank details may
+    // already be sitting in kyc_* from the PN form's Customer Account
+    // Details section, in which case they should show up locked here
+    // rather than asking the PE to type them again from scratch.
+    if (!isReedit && lead) writeFields('#bkModal', BK_FIELD_MAP, lead);
+    handleBkBankLock(lead);
+    // Same "show what's already uploaded on reopen" fix as Upload Delivery
+    // — Aadhar/PAN/GST/Cheque can already be sitting on kyc_*_url even on a
+    // fresh (not-yet-completed) Bank KYC open, same reasoning as the
+    // BK_FIELD_MAP prefill two lines up.
+    markExistingUploads('#bkModal', lead ? {
+      aadhar_doc: lead.kyc_aadhar_url, pan_doc: lead.kyc_pan_url,
+      gst_doc: lead.kyc_gst_url, cheque_doc: lead.kyc_cheque_url,
+    } : {});
+  }
+  if (m === 'bkModal' && isReedit) {
+    document.getElementById('bkStatus').value = 'Bank KYC';
+    handleBkStatus('Bank KYC');
+    writeFields('#bkModal', BK_FIELD_MAP, lead);
+    handleBkBankLock(lead); // re-apply after writeFields, which itself doesn't know about the lock
+  }
+  if (m === 'udModal') {
+    document.getElementById('udCustomerPayment').value = lead ? (lead.pn_customer_payment || '') : '';
+    document.getElementById('udBrokerPayment').value = lead ? (lead.pn_broker_payment || '') : '';
+    // Prefilled from pn_cod_payment ("COD Offer" on the PN form) — that's
+    // the field the live PN form actually writes for Trader-COD deals.
+    // pn_trader_payment is a separate legacy/historical column the current
+    // PN form never sets (see the View Lead Details note near "Trader
+    // Payment" below) so prefilling from it left this blank for every
+    // lead going through the live flow. Stays editable either way.
+    document.getElementById('udTraderPayment').value = lead ? (lead.pn_cod_payment || '') : '';
+    document.getElementById('udCashCommission').value = lead ? (lead.pn_cash_commission || '') : '';
+    document.getElementById('udGstAmount').value = lead ? (lead.pn_gst_amount || '') : '';
+    calcUdTotal();
+    document.getElementById('udVehicleWeight').value = lead ? (lead.pn_vehicle_weight_kg || lead.val_kerb_weight_kg || '') : '';
+    document.getElementById('udVehicleAmount').value = lead ? (lead.pn_vehicle_amount || '') : '';
+    document.getElementById('udCodAmount').value = lead ? (lead.pn_cod_amount || '') : '';
+    calcUdVehicleRate();
+    const omniField = document.getElementById('udOmniPayField');
+    if (lead && lead.pn_payment_type === 'Omini Pay') {
+      omniField.style.display = '';
+      document.getElementById('udOmniPayDoneBy').value = lead.pn_omni_payments_by_name || '';
+    } else {
+      omniField.style.display = 'none';
+    }
+    document.getElementById('udCylinderType').value = 'No';
+    handleCylinderType('No');
+    // Fresh open (not re-edit) — clearModalFields already blanked the
+    // accessory selects, so explicitly hide all the conditional photo
+    // fields too rather than relying on their leftover display state.
+    handleUdSpareWheel('');
+    handleUdStereo('');
+    handleUdSpeakers('');
+    handleUdToolKitGroup();
+    handleUdBattery('');
+    handleUdAlloyWheel('');
+    // Pre-filled from Price Negotiation's own (optional) Location field —
+    // Ramvir, Sept 2026 — since PE/Manager may have already recorded this
+    // there and shouldn't have to re-type it; still fully editable here,
+    // this is a fresh-open default, not a lock.
+    document.getElementById('udVehicleParking').value = (lead && lead.pn_vehicle_parking) || '';
+    if (typeof refreshSubLocationSelect === 'function') refreshSubLocationSelect('udVehicleSubParking', (lead && lead.pn_vehicle_parking) || '', (lead && lead.pn_vehicle_sub_parking) || '');
+    document.getElementById('udTransportationType').value = (lead && lead.pn_transportation_type) || '';
+    document.getElementById('udRcReceivedType').value = '';
+    if (isReedit) {
+      document.getElementById('udStatus').value = 'Upload Delivery';
+      handleUdStatus('Upload Delivery');
+      writeFields('#udModal', UD_FIELD_MAP, lead);
+      document.getElementById('udCylinderType').value = lead.ud_cylinder_type || 'No';
+      handleCylinderType(lead.ud_cylinder_type || 'No');
+      // writeFields only sets .value — it doesn't fire onchange, so the
+      // conditional photo-upload fields need to be re-evaluated by hand
+      // against the values that were just written in.
+      handleUdSpareWheel(lead.ud_spare_wheel || '');
+      handleUdStereo(lead.ud_stereo || '');
+      handleUdSpeakers(lead.ud_speakers || '');
+      handleUdToolKitGroup();
+      handleUdBattery(lead.ud_battery || '');
+      handleUdAlloyWheel(lead.ud_alloy_wheel || '');
+      // Delivery's own saved value wins once it exists; falls back to PN's
+      // Location only if Delivery itself was never filled in yet.
+      document.getElementById('udVehicleParking').value = lead.ud_vehicle_parking || lead.pn_vehicle_parking || '';
+      if (typeof refreshSubLocationSelect === 'function') refreshSubLocationSelect('udVehicleSubParking', lead.ud_vehicle_parking || lead.pn_vehicle_parking || '', lead.ud_vehicle_sub_parking || lead.pn_vehicle_sub_parking || '');
+      document.getElementById('udTransportationType').value = lead.transportation_type || lead.pn_transportation_type || '';
+      document.getElementById('udRcReceivedType').value = lead.ud_rc_received_type || '';
+      document.getElementById('udTotalOfferPrice').value = lead.ud_total_offer_price || '';
+      document.getElementById('udCustomerPayment').value = lead.ud_customer_payment || '';
+      document.getElementById('udBrokerPayment').value = lead.ud_broker_payment || '';
+      document.getElementById('udTraderPayment').value = lead.ud_trader_payment || '';
+      document.getElementById('udCashCommission').value = lead.ud_cash_commission || '';
+      document.getElementById('udGstAmount').value = lead.ud_gst_amount || '';
+      document.getElementById('udVehicleWeight').value = lead.ud_vehicle_weight_kg || lead.pn_vehicle_weight_kg || lead.val_kerb_weight_kg || '';
+      document.getElementById('udVehicleAmount').value = lead.ud_vehicle_amount || lead.pn_vehicle_amount || '';
+      document.getElementById('udCodAmount').value = lead.ud_cod_amount || lead.pn_cod_amount || '';
+      calcUdVehicleRate();
+      showCompletedPaymentNote(leadId); // if Accounts has already completed a Payment or Omini Pay for this lead, surface it here for reference
+    }
+    // Runs on every udModal open, re-edit or fresh — on a genuinely fresh
+    // fill lead.ud_*_url is simply null/undefined (Delivery was never
+    // saved yet), so markExistingUploads() naturally shows nothing; this
+    // also correctly clears any leftover hint text from whichever OTHER
+    // lead was last opened in this same modal.
+    markExistingUploads('#udModal', lead ? {
+      ud_spare_wheel_photo: lead.ud_spare_wheel_photo_url, ud_stereo_photo: lead.ud_stereo_photo_url,
+      ud_speakers_photo: lead.ud_speakers_photo_url, ud_tool_kit_photo: lead.ud_tool_kit_photo_url,
+      ud_battery_photo: lead.ud_battery_photo_url, ud_cylinder_photo: lead.ud_cylinder_photo_url,
+      ud_alloy_wheel_photo: lead.ud_alloy_wheel_photo_url, ud_inventory_slip: lead.ud_inventory_slip_url,
+      ud_delivery_photo: lead.ud_delivery_photo_url, ud_upi_screenshot: lead.ud_upi_screenshot_url,
+      ud_other_screenshot: lead.ud_other_screenshot_url,
+    } : {});
+  }
+  if (m === 'vzModal') {
+    // Bank KYC was filled 2 stages earlier — surface it here (editable,
+    // with the cheque copy for reference) so Back Office can catch and
+    // fix a wrong account number/IFSC before Payments/Omini Pay use it.
+    writeFields('#vzModal', BK_FIELD_MAP, lead || {});
+    handleVzBankLock(lead); // hides the whole Bank Details block when Customer Payment isn't > 0 — re-applied after writeFields, same pattern as handleBkBankLock on Bank KYC
+    const chequeWrap = document.getElementById('vzChequeLinkWrap');
+    const chequeLink = document.getElementById('vzChequeLink');
+    if (bkBankDetailsNeeded(lead) && lead && isRealFileUrl(lead.kyc_cheque_url)) {
+      chequeWrap.style.display = '';
+      chequeLink.setAttribute('onclick', `viewAccessoryPhoto('${lead.kyc_cheque_url}','Cheque Copy')`);
+    } else {
+      chequeWrap.style.display = 'none';
+    }
+    // Form 2A / Authorization Letter live in rewire_verification_zoho, not
+    // on this lead row, so they need their own fetch — same "show what's
+    // already uploaded on reopen" fix as Upload Delivery above.
+    const { data: existingVzForHint } = await sb.from('rewire_verification_zoho')
+      .select('form_2a_url, authorization_letter_url').eq('lead_id', leadId).maybeSingle();
+    markExistingUploads('#vzModal', {
+      form_2a: existingVzForHint ? existingVzForHint.form_2a_url : null,
+      authorization_letter: existingVzForHint ? existingVzForHint.authorization_letter_url : null,
+      vz_cheque_replace: lead ? lead.kyc_cheque_url : null,
+    });
+  }
+  if (m === 'accessoriesModal') {
+    openAccessoriesCheck(leadId, leadNo);
+    return;
+  }
+  if (m) openModal(m);
+}
+
+// Upload Delivery is stage 4, well before Verification & Zoho (5) which is
+// what actually spawns rows in rewire_payments/rewire_omini_pay — so on a
+// FIRST-TIME fill there's never anything completed yet. This only ever
+// finds something on a re-edit (one-stage-back, or Admin reopening later),
+// by which point Accounts may have already completed the real payment.
+// Shown as a read-only reference note — deliberately does NOT overwrite
+// the editable Customer/Broker Payment fields above it, since those are
+// PE's own delivery-time settlement figures and may legitimately differ
+// from what Accounts ultimately paid out.
+async function showCompletedPaymentNote(leadId) {
+  const note = document.getElementById('udPaymentCompletedNote');
+  const textEl = document.getElementById('udPaymentCompletedNoteText');
+  if (!note || !textEl) return;
+  note.style.display = 'none';
+
+  const [{ data: payments }, { data: omini }] = await Promise.all([
+    sb.from('rewire_payments_archive').select('payment_type, amount, utr_no').eq('lead_id', leadId),
+    sb.from('rewire_omini_pay_archive').select('party_type, amount_paid, txn_id, reference_id').eq('lead_id', leadId),
+  ]);
+
+  const parts = [];
+  (payments || []).forEach(p => parts.push(`${p.payment_type} Payment Completed — ₹${p.amount || '—'} (UTR: ${p.utr_no || '—'})`));
+  (omini || []).forEach(o => parts.push(`Omini Pay (${o.party_type}) Completed — ₹${o.amount_paid || '—'} (TXN: ${o.txn_id || '—'}, Ref: ${o.reference_id || '—'})`));
+
+  if (parts.length) {
+    textEl.innerHTML = parts.join('<br>');
+    note.style.display = 'flex';
+  }
+}
+
+// Read-only "Lead No. click" view — Customer Information + full stage-by-
+// stage journey captured so far, styled like a clean detail card.
+async function viewLeadDetails(leadId, fromDeliveryTab){
+  let lead = findLeadInAnyPage(leadId);
+  if (!lead) {
+    const { data, error } = await sb.from('rewire_master_data').select(`
+      *, rewire_partners(partner_name, mobile),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)
+    `).eq('id', leadId).single();
+    if (error || !data) { notify('Could not load lead details.', { icon: 'error' }); return; }
+    lead = data;
+  }
+
+  // Form-2A / Authorization Letter live on rewire_verification_zoho (a
+  // separate table, keyed by lead_id), not on rewire_master_data itself —
+  // so they're never on the cached `lead` object above either way. Fetched
+  // fresh every open, same as the Purchased tab's own lookup for these 2
+  // fields (Ramvir, Sept 2026 — View Lead's Verification & Zoho section
+  // showed only the Status, not the actual documents).
+  let manifestRow = null;
+  if (lead.logistics_manifest_id) {
+    const { data: mf } = await sb.from('rewire_logistics_manifests').select('manifest_no, transport_mode, from_location, to_location, to_sub_location, payment_status').eq('id', lead.logistics_manifest_id).maybeSingle();
+    manifestRow = mf || null;
+  }
+  const { data: vzRow } = await sb.from('rewire_verification_zoho')
+    .select('form_2a_url, authorization_letter_url').eq('lead_id', leadId).maybeSingle();
+
+  document.getElementById('vlLeadNo').textContent = lead.lead_no;
+  document.getElementById('vlCustomerName').textContent = lead.customer_name;
+  document.getElementById('vlEditBtn').setAttribute('onclick', `closeModal('viewLeadModal');openEditLead('${leadId}', ${!!fromDeliveryTab})`);
+  applyEditButtonPermission(lead, !!fromDeliveryTab);
+
+  // 'Purchased' (set by the live app on Head Approval) and 'Completed'
+  // (the historical-import label for the same "deal closed" state) both
+  // mean the purchase is done — badge them the same, or a live-flow
+  // Purchased lead shows the same neutral badge as a still-Active one.
+  const statusBadge = `<span class="badge ${lead.overall_status === 'Closed Lost' ? 'badge-l' : (lead.overall_status === 'Completed' || lead.overall_status === 'Purchased') ? 'badge-q' : 'badge-na'}">${lead.overall_status}</span>`;
+  const row = (label, value) => `<div><div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;font-weight:700;">${label}</div><div style="font-size:13.5px;margin-top:3px;font-weight:500;color:#111827;">${value ?? '—'}</div></div>`;
+  // Same shape as row(), but renders a clickable "View" link that opens
+  // the document/photo (reuses viewAccessoryPhoto's Drive-thumbnail +
+  // fallback handling so it works the same way as Accessories Check).
+  const rowLink = (label, url) => `<div><div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;font-weight:700;">${label}</div><div style="font-size:13.5px;margin-top:3px;font-weight:500;">${isRealFileUrl(url) ? `<a href="javascript:void(0)" onclick="viewAccessoryPhoto('${url}','${label}')" style="color:#1d4ed8;text-decoration:underline;">View</a>` : '<span style="color:#111827;">—</span>'}</div></div>`;
+  // "Edit" link next to a stage section's title — governed entirely by
+  // canEditStageForm(): Admin can always reopen any of the 4 PE-facing
+  // stage forms, no matter how long ago the lead moved past that stage.
+  // Manager can reopen ANY of them (not just the one-step-back stage PE
+  // gets on the Qualified Pipeline card) right up until they approve the
+  // lead (current_stage < 6) — see canEditStageForm's Manager branch.
+  // Everyone else (PE, Head, Back Office, Accounts) only ever reaches
+  // these via the one-stage-back tab flow / their own current stage form.
+  const sectionEditLink = (stageIdx) => (stageIdx && currentProfile && (currentProfile.role === 'Admin' || currentProfile.role === 'Manager') && typeof canEditStageForm === 'function' && canEditStageForm(lead, stageIdx))
+    ? ` <a href="javascript:void(0)" onclick="closeModal('viewLeadModal');openStageForm('${leadId}','${lead.lead_no}',${stageIdx})" style="font-weight:500;font-size:11px;color:#1d4ed8;text-decoration:underline;margin-left:8px;">Edit</a>`
+    : '';
+  const section = (title, rowsHtml, stageIdx, extraHtml) => `
+    <div style="margin-top:18px;">
+      <div style="font-size:12px;font-weight:700;color:#1d4ed8;border-bottom:1px solid var(--color-border-tertiary);padding-bottom:6px;margin-bottom:10px;">${title}${sectionEditLink(stageIdx)}${extraHtml || ''}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">${rowsHtml}</div>
+    </div>`;
+
+  let html = `<div style="display:flex;gap:8px;margin-bottom:14px;">${statusBadge}<span class="badge badge-na">Stage ${lead.current_stage} of 8</span></div>`;
+
+  // Admin-only escape hatch — the section's own Edit link always opens the
+  // generic Customer/Lead Details editor, no matter what stage the lead is
+  // currently at (unlike the header "Edit" button, which routes to whatever
+  // PE-facing stage form is due — see openEditLead). Uses openCustomerInfoEdit
+  // instead of sectionEditLink since this isn't a stage form.
+  const customerInfoEditLink = (currentProfile && currentProfile.role === 'Admin')
+    ? ` <a href="javascript:void(0)" onclick="closeModal('viewLeadModal');openCustomerInfoEdit('${leadId}')" style="font-weight:500;font-size:11px;color:#1d4ed8;text-decoration:underline;margin-left:8px;">Edit</a>`
+    : '';
+  html += section('Customer / Lead Details', [
+    row('Lead No.', lead.lead_no), row('Created At', lead.created_at ? new Date(lead.created_at).toLocaleString() : '—'),
+    row('Customer Name', lead.customer_name), row('Phone', lead.phone),
+    row('City', lead.city), row('Email', lead.email),
+    row('Lead Source', lead.lead_source), row('Lead Type', lead.lead_type),
+    row('Partner', lead.rewire_partners ? lead.rewire_partners.partner_name : '—'),
+    row('Company / Dealership', lead.company_dealership_name || '—'),
+    row('Status', lead.lead_status), row('Sub-Status', lead.sub_status),
+    row('PE', lead.pe ? lead.pe.name : '—'), row('Manager', lead.manager ? lead.manager.name : '—'),
+    row('Last Updated', new Date(lead.last_update).toLocaleString()),
+  ].join(''), null, customerInfoEditLink);
+
+  if (lead.address) html += section('Address', [row('Full Address', lead.address)].join(''));
+
+  if (lead.val_status) html += section('Valuation', [
+    row('Vehicle Type', lead.val_vehicle_type), row('Vehicle', `${lead.val_make || ''} ${lead.val_model_variant || ''}`.trim()),
+    row('Vehicle No.', lead.val_vehicle_number), row('Registration Year', lead.val_registration_year),
+    row('Kerb Weight (Kg)', lead.val_kerb_weight_kg), row('Engine No.', lead.val_engine_no),
+    row('Chassis No.', lead.val_chassis_no), row('RC Type', lead.val_rc_type),
+    row('Fuel Type', lead.val_fuel_type), row('Spare Wheel', lead.val_spare_wheel),
+    row('Stereo', lead.val_stereo), row('Speakers', lead.val_speakers),
+    row('Tool Kit', lead.val_tool_kit), row('Battery', lead.val_battery),
+    row('Vehicle Operational', lead.val_vehicle_operational), row('Vehicle Accidental', lead.val_vehicle_accidental),
+    row('Alloy Wheel', lead.val_alloy_wheel), row('Status', lead.val_status),
+    row('Remarks', lead.val_remarks), rowLink('RC Copy', lead.val_rc_copy_url),
+  ].join(''), 1);
+
+  // Admin-only recovery action — for an Instant Payments lead whose PN
+  // was saved before this email step existed (or where the email
+  // genuinely failed to send), this rebuilds the same email from the
+  // lead's current saved data (Bank KYC for the customer side, the
+  // linked Partner's saved bank details for the broker side) and fires
+  // it again via the same sendInstantPaymentEmail() Apps Script
+  // function — no need to re-open/re-save the PN form (which wouldn't
+  // even re-send it, that's skipped on re-edit on purpose).
+  const resendEmailLink = (lead.pn_payment_type === 'Instant Payments' && currentProfile && currentProfile.role === 'Admin')
+    ? ` <a href="javascript:void(0)" onclick="resendInstantPaymentEmail('${leadId}')" style="font-weight:500;font-size:11px;color:#1d4ed8;text-decoration:underline;margin-left:8px;">Resend Instant Payment Email</a>`
+    : '';
+  if (lead.pn_status) {
+    const pnRatePerKg = (lead.pn_vehicle_amount && lead.pn_vehicle_weight_kg)
+      ? (lead.pn_vehicle_amount / lead.pn_vehicle_weight_kg).toFixed(2) : null;
+    html += section('Price Negotiation', [
+    row('Deal Type', lead.pn_deal_type), row('Payment Type', lead.pn_payment_type),
+    row('Broker', lead.pn_partner_name), row('Trader', lead.pn_trader_name),
+    row('Customer Payment', lead.pn_customer_payment ? '₹' + lead.pn_customer_payment : '—'),
+    row('Broker Payment', lead.pn_broker_payment ? '₹' + lead.pn_broker_payment : '—'),
+    row('COD Payment', lead.pn_cod_payment ? '₹' + lead.pn_cod_payment : '—'),
+    // pn_trader_payment is a real, permission-listed column on this table
+    // (see check_master_column_permissions()'s `pn` field group) but had
+    // no row anywhere in this view — a lead with a genuine value here
+    // (L7102510: ₹11000) showed the amount in the database with no way to
+    // see it on screen at all. Note: the live Price Negotiation form
+    // (Modals-Pipeline.html) has no input for this field either — only
+    // Upload Delivery's separate Trader Payment (ud_trader_payment) is
+    // user-enterable — so any value here is either historical/imported
+    // data or was set some other way outside the current PN form.
+    row('Trader Payment', lead.pn_trader_payment ? '₹' + lead.pn_trader_payment : '—'),
+    row('Cash Commission', lead.pn_cash_commission ? '₹' + lead.pn_cash_commission : '—'),
+    row('GST Pay To', lead.pn_gst_pay_to || '—'),
+    row('GST Amount', lead.pn_gst_amount ? '₹' + lead.pn_gst_amount : '—'),
+    // Vehicle Rate Calculation block — added to the PN form this week
+    // (Vehicle Amount/COD Amount/Vehicle Weight, with Rate per Kg computed
+    // client-side same as the form itself), was missing from this view.
+    row('Vehicle Amount (Incl. Cash Commission)', lead.pn_vehicle_amount ? '₹' + lead.pn_vehicle_amount : '—'),
+    row('COD Amount', lead.pn_cod_amount ? '₹' + lead.pn_cod_amount : '—'),
+    row('Vehicle Weight (Kg)', lead.pn_vehicle_weight_kg || '—'),
+    row('Vehicle Rate per Kg', pnRatePerKg ? '₹' + pnRatePerKg : '—'),
+    row('Total Offer Price', lead.pn_total_offer_price ? '₹' + lead.pn_total_offer_price : '—'),
+    row('Omini Pay To', lead.pn_omni_pay_to), row('Omini Payments By', lead.pn_omni_payments_by_name),
+    row('Transportation Type', lead.pn_transportation_type || '—'),
+    row('Payment Release', lead.payment_release_status || '—'),
+    row('PN Filled On', lead.pn_filled_on ? new Date(lead.pn_filled_on).toLocaleString() : '—'),
+    row('Status', lead.pn_status),
+  ].join(''), 2, resendEmailLink);
+  }
+
+  if (lead.kyc_status) html += section('Bank KYC', [
+    row('Aadhar Number', lead.kyc_aadhar_number), row('Aadhar Linked Phone', lead.kyc_aadhar_linked_phone),
+    row('PAN Number', lead.kyc_pan_number), row('GST Number', lead.kyc_gst_number),
+    row('Account Holder Name', lead.kyc_account_holder_name),
+    row('Bank', lead.kyc_bank_name), row('Branch', lead.kyc_branch_name),
+    row('Account Number', lead.kyc_account_number), row('IFSC Code', lead.kyc_ifsc_code),
+    row('Status', lead.kyc_status),
+    rowLink('Aadhar Doc', lead.kyc_aadhar_url), rowLink('PAN Doc', lead.kyc_pan_url),
+    rowLink('GST Doc', lead.kyc_gst_url), rowLink('Cheque Photo', lead.kyc_cheque_url),
+  ].join(''), 3);
+
+  if (lead.vz_status && lead.vz_status !== 'Pending') html += section('Verification & Zoho', [
+    rowLink('Form 2A', vzRow ? vzRow.form_2a_url : null),
+    rowLink('Authorization Letter', vzRow ? vzRow.authorization_letter_url : null),
+    row('Status', lead.vz_status),
+  ].join(''));
+
+  if (lead.ud_status) html += section('Upload Delivery — Condition Checklist', [
+    row('Fuel Type', lead.ud_fuel_type), row('Spare Wheel', lead.ud_spare_wheel),
+    row('Stereo', lead.ud_stereo), row('Speakers', lead.ud_speakers),
+    row('Tool Kit', lead.ud_tool_kit), row('Jack', lead.ud_jack),
+    row('ROD', lead.ud_rod), row('Pana', lead.ud_pana),
+    row('Battery', lead.ud_battery), row('Cylinder Type', lead.ud_cylinder_type),
+    row('Vehicle Operational', lead.ud_vehicle_operational), row('Vehicle Accidental', lead.ud_vehicle_accidental),
+    row('Alloy Wheel (Count)', lead.ud_alloy_wheel),
+  ].join(''), 4);
+
+  if (lead.ud_status) html += section('Upload Delivery — Photos & Documents', [
+    rowLink('Spare Wheel Photo', lead.ud_spare_wheel_photo_url), rowLink('Stereo Photo', lead.ud_stereo_photo_url),
+    rowLink('Speakers Photo', lead.ud_speakers_photo_url), rowLink('Tool Kit Photo', lead.ud_tool_kit_photo_url),
+    rowLink('Battery Photo', lead.ud_battery_photo_url), rowLink('Cylinder Photo', lead.ud_cylinder_photo_url),
+    rowLink('Alloy Wheel Photo', lead.ud_alloy_wheel_photo_url), rowLink('Inventory Slip', lead.ud_inventory_slip_url),
+    rowLink('Delivery Photo', lead.ud_delivery_photo_url), rowLink('UPI Screenshot', lead.ud_upi_screenshot_url),
+    rowLink('Other Screenshot', lead.ud_other_screenshot_url),
+  ].join(''));
+
+  if (lead.ud_status) {
+    const udRatePerKg = (lead.ud_vehicle_amount && lead.ud_vehicle_weight_kg)
+      ? (lead.ud_vehicle_amount / lead.ud_vehicle_weight_kg).toFixed(2) : null;
+    html += section('Upload Delivery — Payment & Parking', [
+    row('Customer Payment', lead.ud_customer_payment ? '₹' + lead.ud_customer_payment : '—'),
+    row('Broker Payment', lead.ud_broker_payment ? '₹' + lead.ud_broker_payment : '—'),
+    row('Trader Payment', lead.ud_trader_payment ? '₹' + lead.ud_trader_payment : '—'),
+    row('Cash Commission', lead.ud_cash_commission ? '₹' + lead.ud_cash_commission : '—'),
+    row('GST Amount', lead.ud_gst_amount ? '₹' + lead.ud_gst_amount : '—'),
+    // Vehicle Rate Calculation block — added to Upload Delivery this week,
+    // same as PN's, was missing from this view.
+    row('Vehicle Amount', lead.ud_vehicle_amount ? '₹' + lead.ud_vehicle_amount : '—'),
+    row('COD Amount', lead.ud_cod_amount ? '₹' + lead.ud_cod_amount : '—'),
+    row('Vehicle Weight (Kg)', lead.ud_vehicle_weight_kg || '—'),
+    row('Vehicle Rate per Kg', udRatePerKg ? '₹' + udRatePerKg : '—'),
+    row('Total Offer Price (Final)', lead.ud_total_offer_price ? '₹' + lead.ud_total_offer_price : '—'),
+    row('UPI Number', lead.ud_upi_number), row('UPI Amount', lead.ud_upi_amount ? '₹' + lead.ud_upi_amount : '—'),
+    row('Vehicle Parking (Location)', lead.ud_vehicle_parking), row('Sub Location', lead.ud_vehicle_sub_parking || '—'),
+    row('Transportation Type', lead.transportation_type || lead.pn_transportation_type),
+    row('Crane Status', lead.ud_crane_status || '—'),
+    row('Delivery Filled On', lead.ud_filled_on ? new Date(lead.ud_filled_on).toLocaleString() : '—'),
+    row('RC Received with Vehicle', lead.ud_rc_received_type),
+    row('Delivery Remark', lead.ud_delivery_remark), row('Status', lead.ud_status),
+  ].join(''));
+  }
+
+  if (lead.logistics_status) html += section('Logistics', [
+    row('Status', lead.logistics_status), row('Transporter', lead.logistics_transporter_name),
+    row('Vehicle/Truck No.', lead.logistics_transporter_vehicle_no), row('Dispatch Date', lead.logistics_dispatch_date),
+    row('Remarks', lead.logistics_remarks),
+    row('Manifest No.', manifestRow ? manifestRow.manifest_no : '—'),
+    row('Transport Mode', manifestRow ? manifestRow.transport_mode : '—'),
+    row('From → To', manifestRow ? [manifestRow.from_location, [manifestRow.to_location, manifestRow.to_sub_location].filter(Boolean).join(' / ')].filter(Boolean).join(' → ') : '—'),
+    row('Transporter Payment', manifestRow ? manifestRow.payment_status : '—'),
+    row('Sent To', lead.logistics_vehicle_send_to || '—'),
+    row('Received On', lead.logistics_received_on ? new Date(lead.logistics_received_on).toLocaleString() : '—'),
+    row('Unload Location', lead.logistics_unload_location || '—'),
+  ].join(''));
+
+  if (lead.ma_status && lead.ma_status !== 'Pending') html += section('Manager Approval', [row('Status', lead.ma_status)].join(''));
+  if (lead.accessories_check_status && lead.accessories_check_status !== 'Pending') html += section('Accessories Check', [
+    row('Status', lead.accessories_check_status),
+    row('Deduction Amount', lead.accessories_deduction_amount ? '₹' + lead.accessories_deduction_amount : '—'),
+    row('Deduction Reason', lead.accessories_deduction_reason),
+    row('Checker Remarks', lead.accessories_check_remarks || '—'),
+    row('Manager Review', lead.accessories_manager_review_status || '—'),
+    row('Manager Review Remarks', lead.accessories_manager_remarks || '—'),
+  ].join(''));
+  if (lead.ha_status && lead.ha_status !== 'Pending') {
+    const accDeduct = lead.accessories_deduction_amount || 0;
+    const haDeduct = lead.ha_deduction_amount || 0;
+    const overrideNote = (accDeduct !== haDeduct)
+      ? `<span style="color:#d97706;">Accessories Check deducted ₹${accDeduct} — Head approved with ₹${haDeduct} deducted instead.</span>`
+      : null;
+    html += section('Head Approval', [
+      row('Status', lead.ha_status),
+      // Head Approval always runs after Upload Delivery, so the Delivery-
+      // confirmed ud_total_offer_price is the real "Total Deal Amount" by
+      // this point -- pn_total_offer_price is only shown if Delivery
+      // somehow hasn't saved a total yet.
+      row('Total Deal Amount', (lead.ud_total_offer_price || lead.pn_total_offer_price) ? '₹' + (lead.ud_total_offer_price || lead.pn_total_offer_price) : '—'),
+      row('Final Deduction (Head)', lead.ha_deduction_amount != null ? '₹' + lead.ha_deduction_amount : '—'),
+      row('Net Approved Amount', lead.ha_final_amount != null ? '₹' + lead.ha_final_amount : '—'),
+      overrideNote ? row('Note', overrideNote) : '',
+    ].join(''));
+  }
+  if (lead.rc_status && lead.rc_status !== 'Pending') html += section('RC Tracking', [
+    row('Status', lead.rc_status), row('Dispatch Mode', lead.rc_dispatch_mode || '—'),
+    (lead.rc_dispatch_mode === 'By Hand' || lead.rc_dispatch_mode === 'Driver' || lead.rc_dispatch_mode === 'Crane')
+      ? row(lead.rc_dispatch_mode === 'Driver' ? 'Driver' : (lead.rc_dispatch_mode === 'Crane' ? 'Crane' : 'Carried By'), lead.rc_carried_by)
+      : row('Courier Name', lead.rc_courier_name),
+    row('POD No.', (lead.rc_dispatch_mode && lead.rc_dispatch_mode !== 'Courier') ? '—' : lead.rc_pod_no),
+    row('Dispatch Date', lead.rc_dispatch_date),
+    rowLink('POD Image', lead.rc_pod_image_url),
+  ].join(''));
+  if (lead.overall_status === 'Closed Lost') html += section('Lost Details', [row('Lost At Stage', lead.lost_at_stage), row('Reason', lead.lost_reason)].join(''));
+
+  // Payment Details (UTR etc.) — always at the very end, after every stage
+  // section. A lead can have several rows here (Customer/Broker/Trader/GST
+  // — one per payment_type), so this is a small table instead of the 2-col
+  // row() grid every other section uses. Checks BOTH tables — a Completed
+  // payment moves out of the live rewire_payments table into
+  // rewire_payments_archive (see JS-Payments.html's own liveP/archP
+  // pattern), so only checking the live one would silently hide UTR
+  // details for anything already paid — exactly the case someone opening
+  // this section is most likely looking for.
+  const [{ data: livePayments }, { data: archPayments }] = await Promise.all([
+    sb.from('rewire_payments').select('payment_type, amount, status, utr_no, completed_on').eq('lead_id', leadId),
+    sb.from('rewire_payments_archive').select('payment_type, amount, status, utr_no, completed_on').eq('lead_id', leadId),
+  ]);
+  const allPayments = [...(livePayments || []), ...(archPayments || [])];
+  if (allPayments.length) {
+    const payRowsHtml = allPayments.map(p => `
+      <tr style="border-top:1px solid var(--color-border-tertiary);">
+        <td style="padding:7px 10px;font-weight:500;">${p.payment_type || '—'}</td>
+        <td style="padding:7px 10px;">${p.amount != null ? '₹' + p.amount : '—'}</td>
+        <td style="padding:7px 10px;"><span class="badge ${p.status === 'Completed' ? 'badge-q' : 'badge-na'}">${p.status || '—'}</span></td>
+        <td style="padding:7px 10px;">${p.utr_no || '—'}</td>
+        <td style="padding:7px 10px;">${p.completed_on ? new Date(p.completed_on).toLocaleDateString() : '—'}</td>
+      </tr>`).join('');
+    html += `
+    <div style="margin-top:18px;">
+      <div style="font-size:12px;font-weight:700;color:#1d4ed8;border-bottom:1px solid var(--color-border-tertiary);padding-bottom:6px;margin-bottom:10px;">Payment Details</div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead><tr style="text-align:left;color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:.06em;">
+          <th style="padding:4px 10px;">Type</th><th style="padding:4px 10px;">Amount</th><th style="padding:4px 10px;">Status</th><th style="padding:4px 10px;">UTR No.</th><th style="padding:4px 10px;">Completed On</th>
+        </tr></thead>
+        <tbody>${payRowsHtml}</tbody>
+      </table>
+    </div>`;
+  }
+
+  document.getElementById('vlBody').innerHTML = html;
+  openModal('viewLeadModal');
+}
+
+// Assumption (stated so it can be corrected): PE may only edit Lead
+// Details while it's genuinely "their turn" — i.e. Qualified-not-yet-
+// valued, or right after finishing Valuation/Price Negotiation/Bank
+// KYC/Delivery (stages 0,1,3,4,6) — not while waiting on Back Office
+// (2,5) or once it has reached Manager Approval (7+). Manager may edit
+// anything before their own Approval decision (stage < 7). Head never
+// edits lead details here — Head only approves via Head Approval.
+// PE otherwise doesn't get a generic "Edit This Lead" button — this was
+// letting PE reach back and edit customer info from any earlier stage.
+// PE's only chance to correct customer info beyond that is the editable
+// section inside the Valuation form itself (their current, active stage).
+//
+// One deliberate exception: since New Lead Entry no longer asks for Lead
+// Status (every new lead starts at "Need Analysis"), the PE needs some
+// way to qualify their own lead (or mark it Lost) before Valuation even
+// starts — so PE gets edit access ONLY while the lead is still at
+// Need Analysis / stage 0, and openEditLead() below restricts what they
+// see in that case to just the Status field (Qualified / Lost).
+function canEditLeadDetails(lead) {
+  if (!currentProfile) return false;
+  if (currentProfile.role === 'Admin') return true;
+  if (lead.overall_status !== 'Active') return false; // Closed Lost / Completed — Admin only
+  // Manager Approval itself happens at current_stage 5->6, so cutting off
+  // at < 6 (not < 7) means Manager keeps edit access right up through
+  // approving the lead, then loses it — no more generic edit once the
+  // lead has moved on to Accessories Check / Head Approval.
+  if (currentProfile.role === 'Manager') return lead.current_stage < 6; // before/at Manager Approval, not after
+  if (currentProfile.role === 'PE') return lead.current_stage === 0 && lead.lead_status === 'Need Analysis';
+  return false; // Head, Back Office, Accounts — no access to this button
+}
+
+function applyEditButtonPermission(lead, fromDeliveryTab) {
+  const btn = document.getElementById('vlEditBtn');
+  // No quick-edit option here at all — but ONLY when this popup was
+  // opened from the Upload Delivery tab specifically (fromDeliveryTab,
+  // passed in from the card's onclick — see renderQualTable). Bank KYC
+  // corrections at that point belong to Back Office during Verification
+  // & Zoho review, not this popup. (The stage-tab card's own "Edit"
+  // button still covers it, unaffected by this.)
+  //
+  // This can't be inferred from lead data alone (e.g. "kyc done, ud not
+  // done yet") — for Advance Payment/Omini Pay/Instant Payments that
+  // same data is ALSO true the whole time the lead is due for Manager
+  // Approval/Payment Release (Delivery is decoupled, fillable in
+  // parallel), so a data-only check would wrongly hide Edit there too,
+  // blocking Manager from editing before their own approval.
+  if (fromDeliveryTab) { btn.style.display = 'none'; return; }
+  // Mirrors the routing openEditLead() does: if there's a just-completed
+  // PE-facing stage still open for editing, the button IS that stage's
+  // edit action, so its label says so up front instead of the generic
+  // "Edit This Lead" (which only ever meant customer info).
+  const stageIdx = (lead.current_stage >= 1 && lead.current_stage <= 4) ? lead.current_stage : null;
+  const stageEditable = stageIdx && typeof canEditStageForm === 'function' && canEditStageForm(lead, stageIdx);
+  if (stageEditable) {
+    btn.style.display = '';
+    btn.disabled = false;
+    btn.innerHTML = `<i class="ti ti-edit" style="font-size:13px;" aria-hidden="true"></i> Edit — ${STAGE_LABELS[stageIdx]}`;
+  } else if (canEditLeadDetails(lead)) {
+    btn.style.display = '';
+    btn.disabled = false;
+    btn.innerHTML = `<i class="ti ti-edit" style="font-size:13px;" aria-hidden="true"></i> Edit This Lead`;
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
+async function openEditLead(leadId, fromDeliveryTab){
+  let lead = findLeadInAnyPage(leadId);
+  if (!lead) {
+    const { data, error } = await sb.from('rewire_master_data').select(`
+      *, rewire_partners(partner_name, mobile),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)
+    `).eq('id', leadId).single();
+    if (error || !data) { notify('Could not load lead details.', { icon: 'error' }); return; }
+    lead = data;
+  }
+  // Opened specifically from the Upload Delivery tab: no quick-edit here
+  // at all (see applyEditButtonPermission) — the button is already
+  // hidden for that case, this is just a defensive backstop. Every other
+  // caller (Manager Approval/Payment Release cards, the NA/Closed Lost
+  // tables' own Edit buttons, etc.) doesn't pass this flag, so it's
+  // false/undefined there and this never fires.
+  if (fromDeliveryTab) {
+    notify('Bank KYC corrections at this stage are handled during Verification & Zoho review.', { icon: 'info' });
+    viewLeadDetails(leadId);
+    return;
+  }
+  // Once the lead has a just-completed PE-facing stage (Valuation/Price
+  // Negotiation/Bank KYC/Upload Delivery — current_stage 1-4), "Edit This
+  // Lead" should go straight to fixing THAT stage's data, not generic
+  // customer info — customer info doesn't need touching once the
+  // pipeline has moved past Need Analysis. Falls through to the generic
+  // modal only at Need Analysis (current_stage 0, PE qualifying/losing
+  // the lead) or once access to the stage form has expired.
+  if (lead.current_stage >= 1 && lead.current_stage <= 4 && typeof canEditStageForm === 'function' && canEditStageForm(lead, lead.current_stage)) {
+    openStageForm(leadId, lead.lead_no, lead.current_stage);
+    return;
+  }
+  if (!canEditLeadDetails(lead)) {
+    notify('You do not have edit access for this lead at its current stage. Opening read-only view instead.', { icon: 'info', title: 'View only' });
+    viewLeadDetails(leadId);
+    return;
+  }
+  renderCustomerEditModal(leadId, lead);
+}
+
+// Admin-only escape hatch — opens the generic Customer/Lead Details editor
+// directly, bypassing the stage-form auto-routing that openEditLead() does
+// for current_stage 1-4 (see there). Reached via the "Edit" link next to
+// the "Customer / Lead Details" section title in viewLeadDetails(), which
+// only Admin ever sees.
+async function openCustomerInfoEdit(leadId){
+  if (!currentProfile || currentProfile.role !== 'Admin') return;
+  let lead = findLeadInAnyPage(leadId);
+  if (!lead) {
+    const { data, error } = await sb.from('rewire_master_data').select(`
+      *, rewire_partners(partner_name, mobile),
+      pe:rewire_user_profiles!rewire_master_data_pe_id_fkey(name),
+      manager:rewire_user_profiles!rewire_master_data_manager_id_fkey(name)
+    `).eq('id', leadId).single();
+    if (error || !data) { notify('Could not load lead details.', { icon: 'error' }); return; }
+    lead = data;
+  }
+  renderCustomerEditModal(leadId, lead);
+}
+
+// Shared body behind the generic Customer/Lead Details modal — populates
+// #editModal from a lead record. Called both by openEditLead() (once it's
+// decided the generic modal, not a stage form, is the right destination)
+// and by openCustomerInfoEdit() (Admin's direct-access escape hatch).
+async function renderCustomerEditModal(leadId, lead){
+  activeLeadId = leadId;
+  activeLeadNo = lead.lead_no;
+  document.getElementById('editModalSub').textContent = lead.lead_no + ' — ' + lead.customer_name;
+  document.querySelector('#editModal [data-field="e_customer_name"]').value = lead.customer_name || '';
+  document.querySelector('#editModal [data-field="e_phone"]').value = lead.phone || '';
+  document.querySelector('#editModal [data-field="e_email"]').value = lead.email || '';
+  document.querySelector('#editModal [data-field="e_address"]').value = lead.address || '';
+  document.querySelector('#editModal [data-field="e_city"]').value = lead.city || '';
+  document.querySelector('#editModal [data-field="e_lead_source"]').value = lead.lead_source || '';
+
+  // Customer Information belongs to Lead Entry (stage 0) — once Valuation
+  // has started (current_stage > 0), these fields lock even for Manager,
+  // so nobody edits "back stage" data. Only Admin can still edit.
+  const customerInfoLocked = lead.current_stage > 0 && currentProfile.role !== 'Admin';
+  ['e_customer_name','e_phone','e_email','e_address','e_city','e_lead_source'].forEach(f => {
+    document.querySelector(`#editModal [data-field="${f}"]`).disabled = customerInfoLocked;
+  });
+  const custNote = document.getElementById('editCustomerInfoLockedNote');
+  if (custNote) custNote.style.display = customerInfoLocked ? 'flex' : 'none';
+
+  // Only Manager/Admin can reassign the PE; only Admin can change status once Closed Lost
+  const canReassign = currentProfile && (currentProfile.role === 'Manager' || currentProfile.role === 'Admin');
+  document.getElementById('editReassignSection').style.display = canReassign ? '' : 'none';
+  if (canReassign) {
+    const peSel = document.getElementById('editPeId');
+    const { data: pes } = await sb.from('rewire_user_profiles').select('id, name, role').eq('role', 'PE').eq('active', true);
+    const peOptions = pes || [];
+    // A Manager reassigning a lead to themselves needs their own name in
+    // this list too — same gap as the Add Lead "Select PE" dropdown fixed
+    // earlier (loadPeAndManagerOptions in JS-Core.html).
+    if (currentProfile && currentProfile.role === 'Manager' && !peOptions.some(p => p.id === currentProfile.id)) {
+      peOptions.push({ id: currentProfile.id, name: currentProfile.name, role: 'Manager' });
+    }
+    // Defensive: the lead's currently-assigned PE might not satisfy the
+    // role=PE/active=true filter above (deactivated since assignment, or
+    // role changed) — without this the dropdown silently falls back to
+    // "Select PE" even though a PE genuinely is assigned. View Lead
+    // Details still shows their name fine (that's a plain FK join with no
+    // filter), so this mismatch is easy to miss until someone tries to
+    // reassign anything else on the lead and the PE field goes blank.
+    if (lead.pe_id && !peOptions.some(p => p.id === lead.pe_id)) {
+      const currentPeName = lead.pe ? lead.pe.name : null;
+      if (currentPeName) peOptions.push({ id: lead.pe_id, name: currentPeName, role: 'PE', unlisted: true });
+    }
+    peSel.innerHTML = '<option value="">Select PE</option>' + peOptions.map(p => `<option value="${p.id}" ${lead.pe_id === p.id ? 'selected' : ''}>${p.name}${p.role === 'Manager' ? ' (You)' : ''}${p.unlisted ? ' (Inactive)' : ''}</option>`).join('');
+  }
+
+  // Manager reassignment — Admin only. A Manager editing a lead can already
+  // move it between PEs (above); only Admin also gets to move it between
+  // Managers, since that's a bigger org-structure change.
+  const managerField = document.getElementById('editManagerField');
+  const isAdminReassign = currentProfile && currentProfile.role === 'Admin';
+  if (managerField) managerField.style.display = isAdminReassign ? '' : 'none';
+  if (isAdminReassign) {
+    const mgrSel = document.getElementById('editManagerId');
+    const { data: mgrs } = await sb.from('rewire_user_profiles').select('id, name').eq('role', 'Manager').eq('active', true);
+    const mgrOptions = mgrs || [];
+    // Same defensive gap as the PE list above — a manager already assigned
+    // to the lead but since deactivated would otherwise vanish from this
+    // dropdown and silently reset to blank.
+    if (lead.manager_id && !mgrOptions.some(m => m.id === lead.manager_id)) {
+      const currentMgrName = lead.manager ? lead.manager.name : null;
+      if (currentMgrName) mgrOptions.push({ id: lead.manager_id, name: currentMgrName + ' (Inactive)' });
+    }
+    mgrSel.innerHTML = '<option value="">Select Manager</option>' + mgrOptions.map(m => `<option value="${m.id}" ${lead.manager_id === m.id ? 'selected' : ''}>${m.name}</option>`).join('');
+  }
+
+  const wasLost = lead.overall_status === 'Closed Lost';
+  const canEditStatus = !wasLost || (currentProfile && currentProfile.role === 'Admin');
+  document.getElementById('stEdit').disabled = !canEditStatus;
+  document.getElementById('editLockedNote').style.display = (wasLost && !canEditStatus) ? 'flex' : 'none';
+
+  const stSel = document.getElementById('stEdit');
+  // PE only ever reaches this modal at Need Analysis (see canEditLeadDetails)
+  // and should just be qualifying or losing the lead — not picking among
+  // the full Manager/Admin status vocabulary (Need Analysis/CLC etc).
+  // "Lost" here still writes 'CLR' under the hood so the existing
+  // Reason sub-status flow (handleST -> SM['CLR']) keeps working unchanged.
+  if (currentProfile && currentProfile.role === 'PE') {
+    stSel.innerHTML = '<option value="Qualified">Qualified</option><option value="CLR">Lost</option>';
+  } else {
+    stSel.innerHTML = `<option value="Need Analysis">Need Analysis</option><option value="Qualified">Qualified</option>
+      <option value="CLR">Closed Lost with Reason</option><option value="CLC">Closed Lost to Competitor</option>`;
+  }
+  stSel.value = lead.lead_status === 'Closed Lost with Reason' ? 'CLR' : lead.lead_status === 'Closed Lost to Competitor' ? 'CLC' : lead.lead_status;
+  handleST('Edit', stSel.value);
+  if (lead.sub_status) document.getElementById('sdSelEdit').value = lead.sub_status;
+
+  // Read-only journey summary — everything captured across every stage so far
+  const rows = [];
+  rows.push(['Lead No.', lead.lead_no]);
+  rows.push(['PE / Manager', (lead.pe ? lead.pe.name : '—') + ' / ' + (lead.manager ? lead.manager.name : '—')]);
+  rows.push(['Current Stage', lead.current_stage + ' of 8']);
+  if (lead.val_vehicle_number) rows.push(['Vehicle', `${lead.val_make || ''} ${lead.val_model_variant || ''} — ${lead.val_vehicle_number}`.trim()]);
+  if (lead.val_rc_type) rows.push(['RC Type', lead.val_rc_type]);
+  if (lead.val_status) rows.push(['Valuation', lead.val_status]);
+  // Prefer the Delivery-confirmed final price once it exists (Ramvir:
+  // "delivery ke time jo price hoga wahi final hoga") -- pn_total_offer_price
+  // alone is only the original Price Negotiation figure and can be stale.
+  if (lead.ud_total_offer_price || lead.pn_total_offer_price) rows.push(['Offer Price', '₹' + (lead.ud_total_offer_price || lead.pn_total_offer_price)]);
+  if (lead.pn_status) rows.push(['Price Negotiation', lead.pn_status]);
+  if (lead.kyc_status) rows.push(['Bank KYC', lead.kyc_status]);
+  if (lead.vz_status && lead.vz_status !== 'Pending') rows.push(['Verification & Zoho', lead.vz_status]);
+  if (lead.ud_status) rows.push(['Upload Delivery', lead.ud_status]);
+  if (lead.ma_status && lead.ma_status !== 'Pending') rows.push(['Manager Approval', lead.ma_status]);
+  if (lead.ha_status && lead.ha_status !== 'Pending') rows.push(['Head Approval', lead.ha_status]);
+  if (lead.rc_status && lead.rc_status !== 'Pending') rows.push(['RC Tracking', lead.rc_status]);
+
+  document.getElementById('editJourneyBody').innerHTML = rows.map(([label, value]) =>
+    `<div class="vd-row"><span class="vd-label">${label}</span><span class="vd-value">${value}</span></div>`
+  ).join('');
+
+  openModal('editModal');
+}
+
+function showTab(id){
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  const pane = document.getElementById(id);
+  if (pane) pane.classList.add('active');
+  const nav = document.getElementById('tabnav-' + id.replace('tab-',''));
+  if (nav) nav.classList.add('active');
+}
+function toggleMobileSidebar(){
+  document.querySelector('.sidebar').classList.toggle('mobile-open');
+  document.getElementById('sidebarBackdrop').classList.toggle('mobile-open');
+}
+
+function toggleDesktopSidebar(){
+  document.body.classList.toggle('sidebar-hidden');
+  localStorage.setItem('rewire_sidebar_hidden', document.body.classList.contains('sidebar-hidden') ? '1' : '0');
+}
+// Restore sidebar hide/show preference from last visit. If nothing's
+// been saved yet (first-ever visit on this browser) default to hidden on
+// desktop — the sidebar then reveals itself on hover (see the
+// .sidebar-hover-zone rules, Stylesheet.html) instead of permanently
+// eating ~212px of width from things like the Qualified Pipeline's
+// stage-path. Mobile is deliberately left alone here: it already has its
+// own separate hamburger-drawer sidebar, unrelated to this class, and
+// window.innerWidth at page-load time is what a phone actually is (unlike
+// a media query, this runs once in JS so it needs the explicit check).
+const savedSidebarPref = localStorage.getItem('rewire_sidebar_hidden');
+if (savedSidebarPref === '1' || (savedSidebarPref === null && window.innerWidth > 860)) {
+  document.body.classList.add('sidebar-hidden');
+}
+
+// opts.skipRender: true lets a caller switch the visible section WITHOUT
+// showSection also firing that section's own render function — needed by
+// searchAcrossPaymentTabs() (JS-Payments.html), which awaits its own render
+// call right after switching tabs so it can filter the freshly-loaded cache
+// down to just the searched lead. Without this flag, showSection's own
+// internal render call below ran a SECOND, unawaited fetch of the exact
+// same data concurrently — whichever of the two finished last silently
+// overwrote the cache and re-rendered the FULL unfiltered table, undoing
+// the search result the user had just been shown (looked like "search
+// found nothing" even though the row existed). Every other caller of
+// showSection() is unaffected — they don't pass opts, so skipRender is
+// false and behavior is identical to before.
+// ------------------------------------------------------------
+// SIDEBAR ACCORDION GROUPS (Ramvir, Sept 2026) — Operations/Payments/
+// Compliance/Inventory are collapsible so the sidebar isn't permanently
+// full of every item at once. State persists per browser (localStorage);
+// showSection() below auto-expands whichever group contains the section
+// being navigated to, so a badge click / global-search jump / routeTo*()
+// shortcut never lands inside a visually-collapsed group.
+// ------------------------------------------------------------
+const SIDEBAR_COLLAPSIBLE_GROUPS = ['operations', 'payments', 'compliance', 'inventory', 'calling'];
+const SIDEBAR_SECTION_TO_GROUP = {
+  'location-tracking': 'operations', 'logistics': 'operations', 'logistics-payments': 'payments',
+  'transporters': 'operations', 'receivedplant': 'operations', 'rst-pending': 'operations', 'vehicle-disposal': 'operations',
+  'vehicle-disposal-allocated': 'operations',
+  'vehicle-disposal-reserved': 'operations', 'vehicle-disposal-scrapped': 'operations',
+  'payments': 'payments', 'payments-hold': 'payments', 'payments-tobesent': 'payments',
+  'pending-utr': 'payments', 'credit-payment': 'payments', 'payments-archive': 'payments',
+  'ominipay': 'payments', 'ominipay-archive': 'payments', 'commission': 'payments',
+  'commission-archive': 'payments', 'commission-persons': 'payments', 'cranecharges': 'payments',
+  'cranevendors': 'payments', 'incentive': 'payments', 'conveyance': 'payments',
+  'calling-today': 'calling', 'calling-leads': 'calling', 'calling-other': 'calling', 'calling-performance': 'calling',
+  'accessories': 'compliance', 'accessories-review': 'compliance', 'rc-tracking': 'compliance', 'rc-tracking-received': 'compliance',
+  'codcvs': 'compliance', 'cod-trading': 'compliance', 'documents': 'compliance',
+  'material': 'inventory', 'material-sale': 'inventory',
+  'part-sold': 'sold', 'scrap-sold': 'sold',
+};
+function toggleSidebarGroup(name, forceCollapsed) {
+  const body = document.getElementById('sbgroup-' + name);
+  const header = document.querySelector('.sidebar-section-collapsible[data-group="' + name + '"]');
+  if (!body || !header) return;
+  const collapse = (typeof forceCollapsed === 'boolean') ? forceCollapsed : !body.classList.contains('collapsed');
+  body.classList.toggle('collapsed', collapse);
+  header.classList.toggle('is-collapsed', collapse);
+  try {
+    const state = JSON.parse(localStorage.getItem('sidebarGroupState') || '{}');
+    state[name] = collapse;
+    localStorage.setItem('sidebarGroupState', JSON.stringify(state));
+  } catch (e) { /* localStorage unavailable — collapse still works, just not remembered */ }
+}
+function initSidebarGroups() {
+  let state = {};
+  try { state = JSON.parse(localStorage.getItem('sidebarGroupState') || '{}'); } catch (e) {}
+  SIDEBAR_COLLAPSIBLE_GROUPS.forEach(g => {
+    // Default: collapsed on first-ever load (clean look), then whatever
+    // the user last left it as.
+    const collapsed = state.hasOwnProperty(g) ? state[g] : true;
+    toggleSidebarGroup(g, collapsed);
+  });
+  // Whichever group holds the currently-active sidebar item (Dashboard on
+  // first load) should start expanded even if its saved state was collapsed.
+  const activeGroup = SIDEBAR_SECTION_TO_GROUP[currentSectionName];
+  if (activeGroup) toggleSidebarGroup(activeGroup, false);
+}
+
+function showSection(s, opts){
+  opts = opts || {};
+  currentSectionName = s;
+  const grp = SIDEBAR_SECTION_TO_GROUP[s];
+  if (grp && typeof toggleSidebarGroup === 'function') toggleSidebarGroup(grp, false);
+  ['dashboard','leads','partners','purchased','payments','payments-hold','payments-tobesent','pending-utr','credit-payment','payments-archive','ominipay','ominipay-archive','commission','commission-archive','commission-persons','accessories','accessories-review','logistics','logistics-payments','transporters','receivedplant','rst-pending','location-tracking','vehicle-disposal','vehicle-disposal-allocated','vehicle-disposal-reserved','vehicle-disposal-scrapped','rc-tracking','rc-tracking-received','cranecharges','cranevendors','incentive','conveyance','calling-today','calling-leads','calling-other','calling-performance','codcvs','cod-trading','documents','material','material-sale','part-sold','scrap-sold','reports','debit-register','settings'].forEach(name => {
+    const el = document.getElementById('section-' + name);
+    if (el) el.style.display = (s === name) ? 'flex' : 'none';
+  });
+  document.querySelectorAll('.sidebar-item').forEach(el => el.classList.remove('active'));
+  const clicked = document.querySelector(`.sidebar-item[onclick*="showSection('${s}')"]`);
+  if (clicked) clicked.classList.add('active');
+  document.querySelector('.sidebar').classList.remove('mobile-open');
+  document.getElementById('sidebarBackdrop').classList.remove('mobile-open');
+  if (opts.skipRender) return;
+
+  if (s === 'dashboard' && typeof renderDashboard === 'function') renderDashboard();
+  if (s === 'purchased' && typeof renderPurchasedSection === 'function') renderPurchasedSection();
+  if (s === 'payments' && typeof renderPaymentsSection === 'function') renderPaymentsSection();
+  if (s === 'payments-hold' && typeof renderPaymentsHoldSection === 'function') renderPaymentsHoldSection();
+  if (s === 'payments-tobesent' && typeof renderToBeSentSection === 'function') renderToBeSentSection();
+  if (s === 'pending-utr' && typeof renderPendingUtrSection === 'function') renderPendingUtrSection();
+  if (s === 'credit-payment' && typeof renderCreditPaymentSection === 'function') renderCreditPaymentSection();
+  if (s === 'payments-archive' && typeof renderPaymentsArchiveSection === 'function') renderPaymentsArchiveSection();
+  if (s === 'ominipay' && typeof renderOminiPaySection === 'function') renderOminiPaySection();
+  if (s === 'ominipay-archive' && typeof renderOminiPayArchiveSection === 'function') renderOminiPayArchiveSection();
+  if (s === 'commission' && typeof renderCommissionSection === 'function') renderCommissionSection();
+  if (s === 'commission-archive' && typeof renderCommissionArchiveSection === 'function') renderCommissionArchiveSection();
+  if (s === 'commission-persons' && typeof renderCommissionPersonsSection === 'function') renderCommissionPersonsSection();
+  if (s === 'cranevendors' && typeof renderCraneVendorsSection === 'function') renderCraneVendorsSection();
+  if (s === 'accessories' && typeof renderAccessoriesSection === 'function') renderAccessoriesSection();
+  if (s === 'accessories-review' && typeof renderAccessoriesReviewSection === 'function') renderAccessoriesReviewSection();
+  if (s === 'logistics' && typeof renderLogisticsSection === 'function') renderLogisticsSection();
+  if (s === 'logistics-payments' && typeof renderLogisticsPaymentsSection === 'function') renderLogisticsPaymentsSection();
+  if (s === 'transporters' && typeof renderTransportersSection === 'function') renderTransportersSection();
+  if (s === 'receivedplant' && typeof renderVehicleReceivingSection === 'function') renderVehicleReceivingSection();
+  if (s === 'rst-pending' && typeof renderReceivedPlantSection === 'function') renderReceivedPlantSection();
+  if (s === 'location-tracking' && typeof renderLocationTrackingSection === 'function') renderLocationTrackingSection();
+  if (s === 'vehicle-disposal' && typeof renderVehicleDisposalSection === 'function') renderVehicleDisposalSection();
+  if (s === 'vehicle-disposal-allocated' && typeof renderVehicleDisposalAllocatedSection === 'function') renderVehicleDisposalAllocatedSection();
+  if (s === 'vehicle-disposal-reserved' && typeof renderVehicleDisposalReservedSection === 'function') renderVehicleDisposalReservedSection();
+  if (s === 'vehicle-disposal-scrapped' && typeof renderVehicleDisposalScrappedSection === 'function') renderVehicleDisposalScrappedSection();
+  if (s === 'cranecharges' && typeof renderCraneChargesSection === 'function') renderCraneChargesSection();
+  if (s === 'incentive' && typeof renderIncentiveSection === 'function') renderIncentiveSection();
+  if (s === 'conveyance' && typeof renderConveyanceSection === 'function') renderConveyanceSection();
+  if (s === 'calling-today' && typeof renderCallingTodaySection === 'function') renderCallingTodaySection();
+  if (s === 'calling-other' && typeof renderCallingOtherSection === 'function') renderCallingOtherSection();
+  if (s === 'calling-leads' && typeof renderCallingLeadsSection === 'function') renderCallingLeadsSection();
+  if (s === 'calling-performance' && typeof renderCallingPerformanceSection === 'function') renderCallingPerformanceSection();
+  if (s === 'rc-tracking' && typeof renderRcTrackingSection === 'function') renderRcTrackingSection();
+  if (s === 'rc-tracking-received' && typeof renderRcTrackingReceivedSection === 'function') renderRcTrackingReceivedSection();
+  if (s === 'codcvs' && typeof renderCodCvsSection === 'function') renderCodCvsSection();
+  // CoD Trading (Ramvir, Oct 2026 — split out of codcvs) — lands on
+  // whichever tab is currently marked active in the HTML (Purchased/Sold
+  // by default); routeToCodTrading() below is what normally drives this,
+  // this fallback just covers a direct showSection('cod-trading') call.
+  if (s === 'cod-trading') {
+    const activeTab = document.querySelector('#section-cod-trading .tab.active');
+    const tabName = activeTab ? activeTab.id.replace('ctnav-', '') : 'trades';
+    if (typeof showCodTradingTab === 'function') showCodTradingTab(tabName);
+  }
+  if (s === 'documents' && typeof renderDocumentsSection === 'function') renderDocumentsSection();
+  if (s === 'material' && typeof renderMaterialSection === 'function') renderMaterialSection();
+  if (s === 'material-sale' && typeof renderMaterialSaleSection === 'function') renderMaterialSaleSection();
+  if (s === 'part-sold' && typeof renderPartSoldEntryTab === 'function') renderPartSoldEntryTab();
+  if (s === 'scrap-sold' && typeof renderScrapSoldChallanTab === 'function') renderScrapSoldChallanTab();
+  if (s === 'debit-register' && typeof renderDebitRegisterAccessoriesTab === 'function') renderDebitRegisterAccessoriesTab();
+  if (s === 'settings' && typeof renderSettings === 'function') renderSettings();
+  // Reports tab is back to static (export buttons only) — the live
+  // "CVS vs COD — Monthly Summary" widget that used to also render here
+  // was removed per Ramvir's request (Sept 2026); it still lives on
+  // Dashboard's Overview tab as "COD vs CVS — Monthly Summary".
+}
+
+const COD_DATE_LABELS = { COD: 'COD Date', CVS: 'CVS Date', 'DMS/Rewire No.': 'DMS/Rewire Date' };
+function handleCodType(v){
+  document.getElementById('codField').style.display = (v === 'COD') ? '' : 'none';
+  document.getElementById('codFileField').style.display = (v === 'COD') ? '' : 'none';
+  document.getElementById('cvsField').style.display = (v === 'CVS') ? '' : 'none';
+  document.getElementById('cvsFileField').style.display = (v === 'CVS') ? '' : 'none';
+  // CVS also needs Chassis Plate + Engine Plate photos, shown only for CVS.
+  document.getElementById('cvsChassisPlateField').style.display = (v === 'CVS') ? '' : 'none';
+  document.getElementById('cvsEnginePlateField').style.display = (v === 'CVS') ? '' : 'none';
+  document.getElementById('dmsRewireField').style.display = (v === 'DMS/Rewire No.') ? '' : 'none';
+  // Date field stays hidden until a type is picked, and its label changes
+  // to match — "COD Date" / "CVS Date" / "DMS/Rewire Date" — instead of a
+  // generic "Date" that doesn't say which date it actually is.
+  document.getElementById('codDateField').style.display = v ? '' : 'none';
+  document.getElementById('codDateLabel').textContent = COD_DATE_LABELS[v] || 'Date';
+  document.getElementById('codRegInput').value = '';
+  if (typeof filterCodRegOptions === 'function') filterCodRegOptions('');
+}
+
+// Prevents double-submission: disables the button and shows "Submitting…"
+// for the duration of the async call, then restores it.
+async function withLoading(btn, fn) {
+  if (btn.disabled) return;
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.style.opacity = '.7';
+  btn.innerHTML = '<i class="ti ti-loader-2" style="font-size:13px;"></i> Submitting…';
+  try {
+    await fn();
+  } finally {
+    btn.disabled = false;
+    btn.style.opacity = '';
+    btn.innerHTML = original;
+  }
+}
+
+function showSettingsTab(tab){
+  document.querySelectorAll('.settings-pane').forEach(p => p.style.display = 'none');
+  document.querySelectorAll('#section-settings .tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('settpane-' + tab).style.display = '';
+  document.getElementById('settnav-' + tab).classList.add('active');
+  if (tab === 'users' && typeof renderUsersList === 'function') renderUsersList();
+  if (tab === 'permissions') renderPermissionsMatrix();
+  if (tab === 'masterdata' && typeof renderMasterDataSection === 'function') renderMasterDataSection();
+  if (tab === 'bulkupdate' && typeof resetBulkUpdate === 'function') resetBulkUpdate();
+  if (tab === 'healthcheck' && typeof renderHealthCheckPanel === 'function') renderHealthCheckPanel();
+  if (tab === 'access' && typeof loadAndRenderPermissionsEditor === 'function') loadAndRenderPermissionsEditor();
+}
+
+// Dashboard sub-tabs (Ramvir, Sept 2026) — same tabs-row/.tab component as
+// showSettingsTab above, just targeting .dashboard-pane instead of
+// .settings-pane. Nothing needs re-fetching on switch — renderDashboard()
+// already renders every pane's content up front, this just shows/hides.
+function showDashboardTab(tab){
+  document.querySelectorAll('.dashboard-pane').forEach(p => p.style.display = 'none');
+  document.querySelectorAll('#section-dashboard .tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('dashpane-' + tab).style.display = '';
+  document.getElementById('dashnav-' + tab).classList.add('active');
+  // Material tab (Ramvir, Sept 2026) — fetched lazily on first open (and
+  // every re-open) rather than eagerly with the rest of renderDashboard(),
+  // same reasoning as the COD/CVS Trades pane below: most Dashboard visits
+  // land on Overview and never open this tab at all.
+  if (tab === 'material' && typeof renderDashboardMaterialTab === 'function') renderDashboardMaterialTab();
+  // CoD Trading dashboard tab (Ramvir, Oct 2026) — same lazy-render
+  // pattern as Material above: moved out of the eager Overview render in
+  // renderDashboard() (JS-Dashboard.html) into its own sub-tab.
+  if (tab === 'codtrading' && typeof renderCodTradesSummaryWidget === 'function') renderCodTradesSummaryWidget('dashCodTradesSummary');
+}
+
+// COD/CVS (Ramvir, Oct 2026 — simplified) — this section now has exactly
+// one pane (Entries); "COD Purchased / Sold" and "COD Dashboard" moved out
+// to their own "CoD Trading" section/sidebar item (showCodTradingTab /
+// routeToCodTrading below), since sharing one page was causing the two
+// modules to be mixed up. No tab-switcher needed here any more.
+function showCodCvsTab(tab){
+  const pane = document.getElementById('ccpane-' + tab);
+  if (pane) pane.style.display = '';
+  if (tab === 'entries' && typeof renderCodCvsSection === 'function') renderCodCvsSection();
+}
+
+function routeToCodCvs(){
+  showSection('codcvs');
+}
+
+// CoD TRADING sub-tabs (Ramvir, Oct 2026 — split out of COD/CVS into its
+// own section/sidebar item). "Purchased / Sold" (raw Trade History upload
+// + matching) vs "Dashboard" (Dealer master, CoD Orders, Payment Entry +
+// ledger, stock/ageing/summary reports). Same tabs-row/.tab component
+// pattern the old showCodCvsTab used, just scoped to #section-cod-trading
+// and .codtrading-pane so it never touches COD/CVS's own Entries pane.
+function showCodTradingTab(tab){
+  document.querySelectorAll('.codtrading-pane').forEach(p => p.style.display = 'none');
+  document.querySelectorAll('#section-cod-trading .tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('ctpane-' + tab).style.display = '';
+  document.getElementById('ctnav-' + tab).classList.add('active');
+  if (tab === 'trades' && typeof renderCodTradesSection === 'function') renderCodTradesSection();
+  if (tab === 'dashboard' && typeof renderCodDashboardSection === 'function') renderCodDashboardSection();
+}
+
+function routeToCodTrading(){
+  showSection('cod-trading');
+  // First tab this role can see (Access Control gates each sub-tab).
+  const vis = ['trades','dashboard'].find(t => {
+    const el = document.getElementById('ctnav-' + t);
+    return el && el.style.display !== 'none' && (!el.dataset.roleGate || hasGateAccess(el.dataset.roleGate));
+  }) || 'trades';
+  showCodTradingTab(vis);
+}
+
+// Debit Register sub-tabs (Ramvir, Sept 2026) — same tabs-row/.tab pattern
+// as COD/CVS above, targeting .dr-pane instead. Same smart-routing reason:
+// a role could be granted only 'debit-register-plant' (e.g. a role that
+// never touches Accessories Check but does handle plant receiving), so
+// don't hardcode "Accessories Check" as the always-default tab.
+function showDebitRegisterTab(tab){
+  document.querySelectorAll('.dr-pane').forEach(p => p.style.display = 'none');
+  document.querySelectorAll('#section-debit-register .tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('drpane-' + tab).style.display = '';
+  document.getElementById('drnav-' + tab).classList.add('active');
+  if (tab === 'accessories' && typeof renderDebitRegisterAccessoriesTab === 'function') renderDebitRegisterAccessoriesTab();
+  if (tab === 'plant' && typeof renderDebitRegisterPlantTab === 'function') renderDebitRegisterPlantTab();
+  if (tab === 'transporter' && typeof renderDebitRegisterTransporterTab === 'function') renderDebitRegisterTransporterTab();
+}
+// Part Sold sub-tabs (Ramvir, Sept 2026) — same tabs-row/.tab pattern as
+// COD/CVS and Debit Register above, targeting .ps-pane instead. Smart
+// routing lands on whichever tab the role actually has — a role could be
+// granted only 'part-sold-invoice' (Accounts) with none of the others.
+function showPartSoldTab(tab){
+  document.querySelectorAll('.ps-pane').forEach(p => p.style.display = 'none');
+  document.querySelectorAll('#section-part-sold .tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('pspane-' + tab).style.display = '';
+  document.getElementById('psnav-' + tab).classList.add('active');
+  if (tab === 'entry' && typeof renderPartSoldEntryTab === 'function') renderPartSoldEntryTab();
+  if (tab === 'invoice' && typeof renderPartSoldInvoiceTab === 'function') renderPartSoldInvoiceTab();
+  if (tab === 'completed' && typeof renderPartSoldCompletedTab === 'function') renderPartSoldCompletedTab();
+  if (tab === 'stock' && typeof renderPartSoldStockTab === 'function') renderPartSoldStockTab();
+}
+function routeToPartSold(){
+  showSection('part-sold');
+  if (typeof hasGateAccess !== 'function') return;
+  if (hasGateAccess('part-sold-entry')) { showPartSoldTab('entry'); }
+  else if (hasGateAccess('part-sold-invoice')) { showPartSoldTab('invoice'); }
+  else if (hasGateAccess('part-sold-stock')) { showPartSoldTab('stock'); }
+  else { showPartSoldTab('completed'); }
+}
+
+// Scrap Sold sub-tabs (Ramvir, Sept 2026) — same tabs-row/.tab pattern as
+// Part Sold above, targeting .ss-pane instead. Only 2 gates (no Head
+// Approval step here, per his explicit answer) so smart-routing is
+// simpler: challan -> sales -> completed (completed needs no separate
+// gate, visible to anyone with scrap-sold-sales).
+function showScrapSoldTab(tab){
+  document.querySelectorAll('.ss-pane').forEach(p => p.style.display = 'none');
+  document.querySelectorAll('#section-scrap-sold .tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('sspane-' + tab).style.display = '';
+  document.getElementById('ssnav-' + tab).classList.add('active');
+  if (tab === 'challan' && typeof renderScrapSoldChallanTab === 'function') renderScrapSoldChallanTab();
+  if (tab === 'sales' && typeof renderScrapSoldSalesTab === 'function') renderScrapSoldSalesTab();
+  if (tab === 'completed' && typeof renderScrapSoldCompletedTab === 'function') renderScrapSoldCompletedTab();
+}
+function routeToScrapSold(){
+  showSection('scrap-sold');
+  if (typeof hasGateAccess !== 'function') return;
+  if (hasGateAccess('scrap-sold-challan')) { showScrapSoldTab('challan'); }
+  else if (hasGateAccess('scrap-sold-sales')) { showScrapSoldTab('sales'); }
+  else { showScrapSoldTab('completed'); }
+}
+
+function routeToDebitRegister(){
+  showSection('debit-register');
+  if (typeof hasGateAccess !== 'function') return;
+  if (hasGateAccess('debit-register-accessories')) { showDebitRegisterTab('accessories'); }
+  else if (hasGateAccess('debit-register-plant')) { showDebitRegisterTab('plant'); }
+  else if (hasGateAccess('debit-register-transporter')) { showDebitRegisterTab('transporter'); }
+}
+
+// Same idea for RC Tracking — a role with only 'rc-received' (e.g. the new
+// Back Office) should land directly on the "Received" screen, not the
+// default "Pending" one which it now has no access to.
+function routeToRcTracking(){
+  if (typeof hasGateAccess === 'function' && !hasGateAccess('rc-send') && hasGateAccess('rc-received')) {
+    showSection('rc-tracking-received');
+  } else {
+    showSection('rc-tracking');
+  }
+}
+
+// Material sub-tabs (Ramvir, Sept 2026) — "Material Entry" (existing form)
+// vs "Sale" (placeholder, spec pending). Same tabs-row/.tab component as
+// showCodCvsTab above, targeting .material-pane instead.
+// showMaterialTab() removed (Ramvir, Sept 2026) — Material's old "Sale"
+// sub-tab (a placeholder) moved out into its own Sidebar section
+// (section-material-sale) with its own showMaterialSaleTab(), so Material
+// itself no longer has sub-tabs to switch between.
+
+// 3 columns added at the end (Back Office Head, Store, Logistics — Ramvir,
+// Sept 2026): Back Office Head mirrors the existing Back Office column
+// exactly on every row ("same rights as Back Office"); Store and Logistics
+// are 0 on every pre-existing row (none of these stage-editing actions are
+// theirs) except where a real RLS grant says otherwise (View Team/All
+// Leads — both get broad rewire_master_data SELECT; Received at Plant —
+// Logistics also has rewire_vehicle_receipt access). 2 new rows added at
+// the end for the actions that are genuinely theirs and had no existing
+// row to slot into.
+// 11th column added (Warehouse — Ramvir, Sept 2026): 0 on every pre-
+// existing row (none of these lead-pipeline actions are Warehouse's —
+// its only real permission is the new "Vehicle Disposal" row added below,
+// which was itself missing from this matrix entirely even for the roles
+// that already had it).
+const PERMISSIONS_MATRIX = [
+  ['Enter Lead',                 1,1,0,0,0,0,1, 0,0,0, 0],
+  ['View Own Leads',             1,1,0,0,0,0,1, 0,0,0, 0],
+  ['View Team/All Leads',        0,1,1,1,1,1,1, 1,1,1, 1],
+  ['Edit Lead Details',          '~','~',0,0,0,0,1, 0,0,0, 0],
+  ['Reassign PE',                0,1,0,0,0,0,1, 0,0,0, 0],
+  ['Valuation Form',             1,1,0,0,0,0,1, 0,0,0, 0],
+  ['Price Negotiation',          1,1,0,0,0,0,1, 0,0,0, 0],
+  ['Bank KYC Form',              1,1,0,0,0,0,1, 0,0,0, 0],
+  ['Verification & Zoho',        0,0,1,0,0,0,1, 1,0,0, 0],
+  ['Upload Delivery',            1,1,0,0,0,0,1, 0,0,0, 0],
+  ['Manager Approval',           0,1,0,0,0,0,1, 0,0,0, 0],
+  ['Accessories Check',          0,0,1,0,0,0,1, 1,0,0, 0],
+  ['Head Approval',              0,0,0,0,0,1,1, 0,0,0, 0],
+  ['RC Tracking — Dispatch',     1,1,0,0,0,0,1, 0,0,0, 0],
+  ['RC Tracking — Receive',      0,0,1,0,0,0,1, 1,0,0, 0],
+  ['COD / CVS',                  0,0,1,0,0,0,1, 1,0,0, 0],
+  ['Payments (Pending)',         0,0,0,0,1,0,1, 0,0,0, 0],
+  ['Omini Pay',                  0,1,0,1,0,0,1, 0,0,0, 0],
+  ['Received at Plant',          0,0,1,0,0,0,1, 1,0,1, 0],
+  ['Partners — Add/Search',      1,1,0,0,0,0,1, 0,0,0, 0],
+  ['Partners — Edit',            0,0,0,0,0,0,1, 0,0,0, 0],
+  ['Reports / Export',           0,1,0,0,1,1,1, 1,0,0, 0],
+  ['Manage Users',               0,0,0,0,0,0,1, 0,0,0, 0],
+  ['Purchased Tab — View',       0,1,1,1,0,1,1, 1,1,0, 0],
+  ['Logistics — Send to Plant',  0,0,1,1,0,1,1, 1,0,1, 0],
+  ['Location Tracking — Update', 0,0,1,1,0,1,1, 1,0,1, 0],
+  ['Vehicle Disposal',           0,0,1,1,0,1,1, 1,0,0, 1],
+];
+
+function renderPermissionsMatrix(){
+  const cellHtml = (v) => v === 1
+    ? '<i class="ti ti-check" style="color:#059669;font-size:16px;" aria-hidden="true"></i>'
+    : v === '~'
+      ? '<span title="Conditional — depends on stage, see notes below" style="color:#d97706;font-weight:700;">~</span>'
+      : '<i class="ti ti-x" style="color:#d1d5db;font-size:16px;" aria-hidden="true"></i>';
+  document.getElementById('permMatrixBody').innerHTML = PERMISSIONS_MATRIX.map(row => `<tr>
+    <td style="font-weight:500;">${row[0]}</td>
+    ${row.slice(1).map(v => `<td style="text-align:center;">${cellHtml(v)}</td>`).join('')}
+  </tr>`).join('') + `<tr><td colspan="12" style="font-size:11px;color:var(--color-text-tertiary);padding-top:10px;">
+    <strong>~</strong> = conditional: PE can edit only while it's their active stage; Manager can edit anytime before their own Approval.
+  </td></tr>`;
+}
+
+function toggleManagerField(role){
+  const field = document.getElementById('nuManagerField');
+  field.style.display = (role === 'PE') ? '' : 'none';
+  // Email is only mandatory when adding a Manager — used to CC the
+  // "Send for Payment" bank/cashier notification (Bene Emai Id column,
+  // see buildNeftRtgsCsv in JS-Payments.html).
+  const emailField = document.getElementById('nuManagerEmailField');
+  if (emailField) emailField.style.display = (role === 'Manager') ? '' : 'none';
+}
+
+function openModal(id){ document.getElementById(id).style.display = 'flex'; }
+function closeModal(id){ document.getElementById(id).style.display = 'none'; }
+function bdClose(e, id){ if (e.target === document.getElementById(id)) closeModal(id); }
+
+function openPSD(id){ document.getElementById(id).classList.add('open'); }
+function togglePSD(id, e){ e.stopPropagation(); document.getElementById(id).classList.toggle('open'); }
+document.addEventListener('click', function(e){
+  ['psdAdd'].forEach(id => {
+    const d = document.getElementById(id);
+    if (d && !d.parentElement.contains(e.target)) d.classList.remove('open');
+  });
+});
+</script>

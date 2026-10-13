@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<base target="_top">
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>REWIRE DMS — Vehicle Purchase Lead Management</title>
+<!-- PWA "Add to Home Screen" support — see Icons.gs / Code.gs (?page=manifest). -->
+<link rel="manifest" href="<?!= appUrl ?>?page=manifest"/>
+<link rel="icon" href="<?!= getIcon192DataUri() ?>"/>
+<link rel="apple-touch-icon" href="<?!= getIcon192DataUri() ?>"/>
+<meta name="theme-color" content="#1d4ed8"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="REWIRE DMS"/>
+<link href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<!-- Chart.js for the Purchases-tab "Monthly Volume & Net ₹/kg" combo bar+
+     line chart (Ramvir, Sept 2026 — GVUPL-style dashboard). Same jsdelivr
+     CDN already used for every other 3rd-party script above. -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<?!= include('Stylesheet'); ?>
+</head>
+<body>
+
+<div class="crm-shell">
+
+<div class="topbar">
+  <div class="mobile-menu-btn" id="mobileMenuBtn" onclick="toggleMobileSidebar()"><i class="ti ti-menu-2" aria-hidden="true"></i></div>
+  <div class="sidebar-toggle-btn" id="sidebarToggleBtn" onclick="toggleDesktopSidebar()" title="Show/Hide sidebar"><i class="ti ti-layout-sidebar" aria-hidden="true"></i></div>
+  <div class="topbar-brand">
+    <div class="dot"></div>
+    <span>REWIRE DMS</span>
+  </div>
+  <div class="topbar-search">
+    <i class="ti ti-search" aria-hidden="true"></i>
+    <input id="globalSearchInput" placeholder="Search leads, customers, partners…" oninput="onGlobalSearchInput(this.value)" autocomplete="off" />
+    <div id="globalSearchDropdown" style="display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:#fff;border:0.5px solid var(--color-border-tertiary);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.15);max-height:360px;overflow-y:auto;z-index:200;"></div>
+  </div>
+  <div class="topbar-user">
+    <div class="avatar" id="userAvatar">--</div>
+    <span id="userNameLabel">Loading…</span>
+    <button class="btn" id="crmRefreshBtn" style="margin-left:10px;padding:4px 10px;font-size:11px;" onclick="refreshCrmData(this)" title="Refresh CRM data">&#8635; Refresh</button>
+    <button class="btn" style="margin-left:10px;padding:4px 10px;font-size:11px;" onclick="logout()">Logout</button>
+  </div>
+</div>
+<style>
+  #crmRefreshBtn.spinning { opacity:0.6; pointer-events:none; animation: crmRefreshSpin 0.6s linear infinite; display:inline-block; }
+  @keyframes crmRefreshSpin { to { transform: rotate(360deg); } }
+</style>
+
+<div class="main-layout">
+  <div class="sidebar-hover-zone">
+  <div class="sidebar">
+    <div class="sidebar-section">Main</div>
+    <div class="sidebar-item active" onclick="showSection('dashboard')" data-role-gate="dashboard"><i class="ti ti-layout-dashboard" aria-hidden="true"></i> Dashboard</div>
+    <div class="sidebar-item" onclick="showSection('leads')" data-role-gate="leads"><i class="ti ti-users" aria-hidden="true"></i> Leads</div>
+    <div class="sidebar-item" onclick="showSection('partners')" data-role-gate="partners"><i class="ti ti-briefcase" aria-hidden="true"></i> Partners</div>
+    <div class="sidebar-item" onclick="showSection('reports')" data-role-gate="reports"><i class="ti ti-chart-bar" aria-hidden="true"></i> Reports</div>
+    <!-- Debit Register (Ramvir, Sept 2026) — separate from Reports on
+         purpose, own gate ('debit-register'), so it can be granted to
+         PE/Manager without giving them the rest of Reports or the
+         operational Accessories Check / Received at Plant screens. -->
+    <div class="sidebar-item" onclick="routeToDebitRegister()" data-role-gate="debit-register"><i class="ti ti-receipt-refund" aria-hidden="true"></i> Debit Register</div>
+    <!-- Purchased moved here (Ramvir, Sept 2026 sidebar regroup) — kept out
+         of the new Operations group deliberately since it's one of the
+         most-viewed tabs in the whole app; it belongs with Dashboard/Leads/
+         Partners/Reports as a high-traffic "Main" item, not buried inside a
+         grouped section. -->
+    <div class="sidebar-item" onclick="showSection('purchased')" data-role-gate="purchased"><i class="ti ti-car" aria-hidden="true"></i> Purchased</div>
+    <div class="sidebar-section">Pipeline</div>
+    <!-- Split into 3 separate gates (Ramvir, Sept 2026) — was one shared
+         'pipeline-qual' key for all 3 shortcuts, which forced an all-or-
+         nothing choice. Now a role can get just "Qualified" (e.g. Back
+         Office, for the Verification & Zoho step below) without also
+         getting Need Analysis / Closed Lost. 'pipeline-qual' itself stays
+         as the "Qualified" shortcut's own key, unchanged for every role
+         that already had it. -->
+    <div class="sidebar-item" onclick="showTab('tab-na');showSection('leads')" data-role-gate="pipeline-na"><i class="ti ti-circle-dot" aria-hidden="true"></i> Need Analysis <span class="sidebar-badge blue" id="badgeNA">–</span></div>
+    <div class="sidebar-item" onclick="showTab('tab-qual');showSection('leads')" data-role-gate="pipeline-qual"><i class="ti ti-award" aria-hidden="true"></i> Qualified <span class="sidebar-badge blue" id="badgeQual">–</span></div>
+    <div class="sidebar-item" onclick="showTab('tab-lost');showSection('leads')" data-role-gate="pipeline-lost"><i class="ti ti-x" aria-hidden="true"></i> Closed Lost <span class="sidebar-badge" id="badgeLost">–</span></div>
+    <!-- Operations / Payments / Compliance / Inventory (Ramvir, Sept 2026
+         sidebar regroup, v2 — collapsible) — was all one 14-item "Tracking"
+         group, which had gotten tall enough to feel cramped ("tabs upar
+         niche lag rahe hain"). First split into 4 flat groups, but the
+         sidebar still looked "full bhara hua" with everything expanded all
+         the time — so each of these 4 groups is now a collapsible
+         accordion section (header click = toggleSidebarGroup(key), see
+         JS-Wiring.html). Collapsed/expanded state persists per browser via
+         localStorage (initSidebarGroups()/toggleSidebarGroup()), and
+         showSection() auto-expands whichever group contains the section
+         you navigate to, so a role-gated deep link or search-result click
+         never lands inside a group that's visually collapsed. Main/
+         Pipeline/Settings stay flat (few items, always visible — no need
+         to hide the app's core nav). -->
+    <!-- Calling (Ramvir, Oct 2026) — CRE calling module, own file JS-Calling.html -->
+    <div class="sidebar-section sidebar-section-collapsible" data-group="calling" onclick="toggleSidebarGroup('calling')">Calling <i class="ti ti-chevron-down sidebar-caret" aria-hidden="true"></i></div>
+    <div class="sidebar-group-items" id="sbgroup-calling">
+    <div class="sidebar-item" onclick="showSection('calling-today')" data-role-gate="calling-today"><i class="ti ti-phone-call" aria-hidden="true"></i> Today's Calls</div>
+    <div class="sidebar-item" onclick="showSection('calling-leads')" data-role-gate="calling-leads"><i class="ti ti-list-details" aria-hidden="true"></i> Total Leads</div>
+    <div class="sidebar-item" onclick="showSection('calling-other')" data-role-gate="calling-other"><i class="ti ti-notes" aria-hidden="true"></i> Other Leads</div>
+    <div class="sidebar-item" onclick="showSection('calling-performance')" data-role-gate="calling-performance"><i class="ti ti-chart-bar" aria-hidden="true"></i> Performance</div>
+    </div>
+    <div class="sidebar-section sidebar-section-collapsible" data-group="operations" onclick="toggleSidebarGroup('operations')">Operations <i class="ti ti-chevron-down sidebar-caret" aria-hidden="true"></i></div>
+    <div class="sidebar-group-items" id="sbgroup-operations">
+    <div class="sidebar-item" onclick="showSection('location-tracking')" data-role-gate="location-tracking"><i class="ti ti-map-pin" aria-hidden="true"></i> Location Tracking</div>
+    <div class="sidebar-item" onclick="showSection('logistics')" data-role-gate="logistics"><i class="ti ti-truck-delivery" aria-hidden="true"></i> Logistics <span class="sidebar-badge blue" id="badgeLogistics">–</span></div>
+    <div class="sidebar-item" onclick="showSection('receivedplant')" data-role-gate="receivedplant"><i class="ti ti-building-warehouse" aria-hidden="true"></i> Vehicle Receiving <span class="sidebar-badge blue" id="badgePlant">–</span></div>
+    <div class="sidebar-item" onclick="showSection('rst-pending')" data-role-gate="rst-pending"><i class="ti ti-receipt" aria-hidden="true"></i> RST Pending</div>
+    <div class="sidebar-item" onclick="showSection('vehicle-disposal')" data-role-gate="vehicle-disposal"><i class="ti ti-recycle" aria-hidden="true"></i> Vehicle Disposal</div>
+    </div>
+    <!-- Payments — Crane Charges moved in here (Ramvir, Sept 2026): it's
+         fundamentally a charge/amount being tracked and paid, same shape as
+         Commission/Omini Pay, not a physical-movement item like the
+         Operations group above. -->
+    <div class="sidebar-section sidebar-section-collapsible" data-group="payments" onclick="toggleSidebarGroup('payments')">Payments <i class="ti ti-chevron-down sidebar-caret" aria-hidden="true"></i></div>
+    <div class="sidebar-group-items" id="sbgroup-payments">
+    <div class="sidebar-item" onclick="showSection('payments')" data-role-gate="payments"><i class="ti ti-cash" aria-hidden="true"></i> Vehicle Payments <span class="sidebar-badge blue" id="badgePayments">–</span></div>
+    <div class="sidebar-item" onclick="showSection('logistics-payments')" data-role-gate="logistics-payments"><i class="ti ti-truck-delivery" aria-hidden="true"></i> Logistics Payments</div>
+    <div class="sidebar-item" onclick="showSection('ominipay')" data-role-gate="ominipay"><i class="ti ti-credit-card" aria-hidden="true"></i> Omini Pay <span class="sidebar-badge blue" id="badgeOminiPay">–</span></div>
+    <div class="sidebar-item" onclick="showSection('commission')" data-role-gate="commission"><i class="ti ti-users-group" aria-hidden="true"></i> Commission <span class="sidebar-badge blue" id="badgeCommission">–</span></div>
+    <div class="sidebar-item" style="display:none" data-disabled="Crane Charges disabled" onclick="showSection('cranecharges')" data-role-gate="cranecharges"><i class="ti ti-truck" aria-hidden="true"></i> Crane Charges <span class="sidebar-badge blue" id="badgeCrane">–</span></div>
+    <!-- Incentive & Conveyance (Ramvir, Oct 2026) — replace the manual
+         monthly Excel/paper-claim workflows; see JS-Incentive.html and
+         JS-Conveyance.html. -->
+    <div class="sidebar-item" onclick="showSection('incentive')" data-role-gate="incentive"><i class="ti ti-coin" aria-hidden="true"></i> Incentive</div>
+    <div class="sidebar-item" onclick="showSection('conveyance')" data-role-gate="conveyance"><i class="ti ti-route" aria-hidden="true"></i> Conveyance</div>
+    </div>
+    <!-- Compliance (Ramvir, Sept 2026 sidebar regroup) — verification/
+         paperwork items, previously scattered through the single Tracking
+         group. -->
+    <div class="sidebar-section sidebar-section-collapsible" data-group="compliance" onclick="toggleSidebarGroup('compliance')">Compliance <i class="ti ti-chevron-down sidebar-caret" aria-hidden="true"></i></div>
+    <div class="sidebar-group-items" id="sbgroup-compliance">
+    <div class="sidebar-item" onclick="showSection('accessories')" data-role-gate="accessories"><i class="ti ti-list-check" aria-hidden="true"></i> Accessories Check <span class="sidebar-badge blue" id="badgeAccessories">–</span></div>
+    <!-- Accessories Review (Ramvir, Sept 2026) — new step between Accessories
+         Check and Head Approval; Manager reviews & remarks on any lead whose
+         Accessories Check deduction was > 0. See renderAccessoriesReviewSection()
+         (JS-Operations.html). -->
+    <div class="sidebar-item" onclick="showSection('accessories-review')" data-role-gate="accessories-review"><i class="ti ti-message-2" aria-hidden="true"></i> Accessories Review <span class="sidebar-badge blue" id="badgeAccReview">–</span></div>
+    <div class="sidebar-item" onclick="routeToRcTracking()" data-role-gate="rc-tracking"><i class="ti ti-package" aria-hidden="true"></i> RC Tracking <span class="sidebar-badge blue" id="badgeRc">–</span></div>
+    <div class="sidebar-item" onclick="routeToCodCvs()" data-role-gate="codcvs"><i class="ti ti-file-certificate" aria-hidden="true"></i> COD / CVS</div>
+    <!-- CoD Trading (Ramvir, Oct 2026) — split out of "COD / CVS" into its
+         own sidebar item/section. "COD / CVS" above is the RC/CVS
+         paperwork-generation module (rewire_cod_cvs); this is the
+         completely separate Trader-COD dealer TRADING module
+         (rewire_cod_trades/rewire_cod_dealers/rewire_cod_orders/
+         rewire_cod_payments) — buying and selling CoD certificates as a
+         trading business. The two shared one sidebar item/page for a
+         while and that's what caused real confusion (a report named
+         "COD Generated vs Vehicle Purchased" got built against the wrong
+         module's table because of it) — kept fully separate from here on. -->
+    <div class="sidebar-item" onclick="routeToCodTrading()" data-role-gate="cod-trading"><i class="ti ti-arrows-exchange" aria-hidden="true"></i> CoD Trading</div>
+    <div class="sidebar-item" onclick="showSection('documents')" data-role-gate="documents"><i class="ti ti-files" aria-hidden="true"></i> Documents Management <span class="sidebar-badge blue" id="badgeDocuments">–</span></div>
+    </div>
+    <!-- Inventory (Ramvir, Sept 2026 sidebar regroup) — Material + the new
+         Sale section (moved out of Material's own placeholder "Sale"
+         sub-tab, see renderMaterialSaleSection(), JS-Tracking.html). -->
+    <div class="sidebar-section sidebar-section-collapsible" data-group="inventory" onclick="toggleSidebarGroup('inventory')">Inventory <i class="ti ti-chevron-down sidebar-caret" aria-hidden="true"></i></div>
+    <div class="sidebar-group-items" id="sbgroup-inventory">
+    <div class="sidebar-item" onclick="showSection('material')" data-role-gate="material"><i class="ti ti-tools" aria-hidden="true"></i> Material <span class="sidebar-badge blue" id="badgeMaterial">–</span></div>
+    <div class="sidebar-item" onclick="showSection('material-sale')" data-role-gate="material"><i class="ti ti-shopping-cart" aria-hidden="true"></i> Stock <span class="sidebar-badge blue" id="badgeMaterialSale">–</span></div>
+    </div>
+    <!-- Sold (Ramvir, Sept 2026) — Part Sold moved out of Inventory into its
+         own group per his request, alongside the new Scrap Sold; see
+         routeToPartSold()/showPartSoldTab() and
+         routeToScrapSold()/showScrapSoldTab() (JS-Wiring.html). -->
+    <div class="sidebar-section sidebar-section-collapsible" data-group="sold" onclick="toggleSidebarGroup('sold')">Sold <i class="ti ti-chevron-down sidebar-caret" aria-hidden="true"></i></div>
+    <div class="sidebar-group-items" id="sbgroup-sold">
+    <div class="sidebar-item" onclick="routeToPartSold()" data-role-gate="part-sold"><i class="ti ti-package-export" aria-hidden="true"></i> Part Sold <span class="sidebar-badge blue" id="badgePartSoldApproval">–</span></div>
+    <div class="sidebar-item" onclick="routeToScrapSold()" data-role-gate="scrap-sold"><i class="ti ti-recycle" aria-hidden="true"></i> Scrap Sold</div>
+    </div>
+    <div class="sidebar-section">Settings</div>
+    <div class="sidebar-item" onclick="showSection('settings')"><i class="ti ti-settings" aria-hidden="true"></i> Settings</div>
+  </div>
+  </div>
+  <div class="sidebar-backdrop" id="sidebarBackdrop" onclick="toggleMobileSidebar()"></div>
+
+  <div class="page-body">
+<?!= include('Sections'); ?>
+  </div>
+</div>
+</div>
+
+<?!= include('Modals-General'); ?>
+<?!= include('Modals-Pipeline'); ?>
+<?!= include('JS-Wiring'); ?>
+
+<!-- Supabase integration — auth check, data read/write, RLS-backed -->
+<script>const APP_URL = '<?= appUrl ?>';</script>
+<?!= include('JS-Core'); ?>
+<?!= include('JS-Pipeline'); ?>
+<?!= include('JS-Dashboard'); ?>
+<?!= include('JS-Tracking'); ?>
+<?!= include('JS-Payments'); ?>
+<?!= include('JS-Operations'); ?>
+<?!= include('JS-Incentive'); ?>
+<?!= include('JS-Conveyance'); ?>
+<?!= include('JS-Calling'); ?>
+<?!= include('JS-Logistics'); ?>
+<!-- CoD Trading (Ramvir, Oct 2026) — split out of JS-Tracking.html into
+     its own file, same pattern as JS-Incentive.html/JS-Conveyance.html,
+     since it's a fully separate business module (buy/sell CoD
+     certificates) from COD/CVS entry. -->
+<?!= include('JS-CodTrading'); ?>
+<?!= include('JS-TableExport'); ?>
+
+</body>
+</html>
